@@ -21,7 +21,9 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <vector>
 #include "threadpool.h"
+
 
 // The pyedt namespace contains the primary implementation,
 // but users will probably want to use the edt namespace (bottom)
@@ -30,6 +32,23 @@
 // in the Cython wrapper.
 
 namespace pyedt {
+    
+// --- Feature-transform forward declarations (2D/3D) ---
+template <typename T>
+float* _edt2dsq_features(
+    T* labels, size_t sx, size_t sy,
+    float wx, float wy,
+    bool black_border, int parallel,
+    float* output_dt, size_t* output_feat,
+    int tie_mode);
+
+template <typename T>
+float* _edt3dsq_features(
+    T* labels, size_t sx, size_t sy, size_t sz,
+    float wx, float wy, float wz,
+    bool black_border, int parallel,
+    float* output_dt, size_t* output_feat,
+    int tie_mode);
 
 #define sq(x) (static_cast<float>(x) * static_cast<float>(x))
 
@@ -783,6 +802,250 @@ float* _edt2d(
 
   return transform;
 }
+
+
+// ================================
+// Feature-transform implementations
+// ================================
+// Tie-breaking policy for equal-distance cases.
+// 0 = prefer "last" site encountered (current behavior)
+// 1 = prefer "first" (lexicographically smaller index)
+enum { TIE_LAST = 0, TIE_FIRST = 1 };
+
+namespace detail_ft {
+
+// Felzenszwalb 1D lower envelope + argmin (with weight w, tie-breaking)
+inline void dt1d_parabolic_with_arg(
+    const float* f_in, int n, float w, int tie_mode,
+    std::vector<float>& d, std::vector<int>& arg) {
+  d.assign(n, std::numeric_limits<float>::infinity());
+  arg.assign(n, -1);
+  if (n <= 0) return;
+
+  const float w2 = w * w;
+  // Tiny bias to make tie policy effective without affecting distances
+  const float bias_scale = (tie_mode == TIE_FIRST) ? +1e-7f : -1e-7f;
+  auto biased_val = [&](int i, const float* fptr) {
+    return fptr[i] + w2 * float(i) * float(i) + bias_scale * float(i);
+  };
+
+  // thread-local scratch to avoid alloc churn
+  static thread_local std::vector<int>   v_buf;
+  static thread_local std::vector<float> z_buf;
+  static thread_local std::vector<float> f_buf;
+
+  v_buf.resize(n);
+  z_buf.resize(n + 1);
+  f_buf.resize(n);
+
+  for (int i = 0; i < n; ++i) f_buf[i] = f_in[i];
+
+  int* v = v_buf.data();
+  float* z = z_buf.data();
+  const float* f = f_buf.data();
+
+  int k = 0;
+  v[0] = 0;
+  z[0] = -INFINITY;
+  z[1] = +INFINITY;
+
+  auto inter = [&](int i, int j) -> float {
+    const float fi = biased_val(i, f);
+    const float fj = biased_val(j, f);
+    return (fi - fj) / (2.f * w2 * float(i - j));
+  };
+
+  for (int q = 1; q < n; ++q) {
+    float s = inter(q, v[k]);
+    // tie policy: <= (prefer last) vs < (prefer first)
+    if (tie_mode == TIE_FIRST) {
+      while (k >= 0 && s < z[k]) {
+        --k;
+        if (k >= 0) s = inter(q, v[k]);
+      }
+    } else { // TIE_LAST
+      while (k >= 0 && s <= z[k]) {
+        --k;
+        if (k >= 0) s = inter(q, v[k]);
+      }
+    }
+    ++k;
+    v[k]   = q;
+    z[k]   = s;
+    z[k+1] = +INFINITY;
+  }
+
+  k = 0;
+  for (int x = 0; x < n; ++x) {
+    while (z[k + 1] < x) ++k;
+    const int p = v[k];
+    d[x]   = w2 * (x - p) * (x - p) + f[p];
+    arg[x] = p;
+  }
+}
+
+} // namespace detail_ft
+
+
+// 2D: carry x-arg through X pass, lift to (x,y) in Y pass
+template <typename T>
+float* _edt2dsq_features(
+    T* labels, size_t sx, size_t sy,
+    float wx, float wy,
+    bool /*black_border*/, int parallel,
+    float* output_dt, size_t* output_feat,
+    int tie_mode) {
+
+  const size_t voxels = sx * sy;
+  std::unique_ptr<float[]> tmp(new float[voxels]);
+  std::unique_ptr<int[]>   argx(new int[voxels]);
+  float* tmp_p = tmp.get();
+  int*   argx_p = argx.get();
+
+  // --- X pass (per row), parallel over blocks of rows ---
+  {
+    ThreadPool pool(std::max(1, parallel));
+    const size_t by = std::max<size_t>(1, sy / (size_t(4) * std::max(1, parallel)));
+    for (size_t y0 = 0; y0 < sy; y0 += by) {
+      const size_t y1 = std::min(sy, y0 + by);
+      pool.enqueue([=]() {
+        std::vector<float> drow; std::vector<int> arow; std::vector<float> f(sx);
+        for (size_t y = y0; y < y1; ++y) {
+          const size_t off = y * sx;
+          for (size_t x = 0; x < sx; ++x) f[x] = (labels[off + x] != 0) ? 0.f : std::numeric_limits<float>::infinity();
+          detail_ft::dt1d_parabolic_with_arg(f.data(), int(sx), wx, tie_mode, drow, arow);
+          for (size_t x = 0; x < sx; ++x) { tmp_p[off + x] = drow[x]; argx_p[off + x] = arow[x]; }
+        }
+      });
+    }
+    pool.join();
+  }
+
+  // --- Y pass (per column), parallel over blocks of columns ---
+  {
+    ThreadPool pool(std::max(1, parallel));
+    const size_t bx = std::max<size_t>(1, sx / (size_t(4) * std::max(1, parallel)));
+    for (size_t x0 = 0; x0 < sx; x0 += bx) {
+      const size_t x1 = std::min(sx, x0 + bx);
+      pool.enqueue([=]() {
+        std::vector<float> dcol; std::vector<int> arow; std::vector<float> g(sy); std::vector<int> axcol(sy);
+        for (size_t x = x0; x < x1; ++x) {
+          for (size_t y = 0; y < sy; ++y) { const size_t idx = y * sx + x; g[y] = tmp_p[idx]; axcol[y] = argx_p[idx]; }
+          detail_ft::dt1d_parabolic_with_arg(g.data(), int(sy), wy, tie_mode, dcol, arow);
+          for (size_t y = 0; y < sy; ++y) {
+            const int r = arow[y]; const size_t idx = y * sx + x;
+            output_dt[idx] = dcol[y];
+            output_feat[idx] = (r >= 0 && axcol[r] >= 0) ? size_t(r) * sx + size_t(axcol[r]) : size_t(0);
+          }
+        }
+      });
+    }
+    pool.join();
+  }
+
+  return output_dt;
+}
+
+
+// 3D: X → Y → Z, carrying (seed x, seed y), finalize with z
+template <typename T>
+float* _edt3dsq_features(
+    T* labels, size_t sx, size_t sy, size_t sz,
+    float wx, float wy, float wz,
+    bool /*black_border*/, int parallel,
+    float* output_dt, size_t* output_feat,
+    int tie_mode) {
+
+  const size_t sxy = sx * sy;
+  const size_t voxels = sxy * sz;
+
+  std::unique_ptr<float[]> dx(new float[voxels]);
+  std::unique_ptr<int[]>   sx_seed(new int[voxels]);
+  float* dx_p = dx.get();
+  int*   sx_seed_p = sx_seed.get();
+
+  // X pass (per y-row in each z-slice), chunked by blocks of y
+  {
+    ThreadPool pool(std::max(1, parallel));
+    const size_t by = std::max<size_t>(1, sy / (size_t(4) * std::max(1, parallel)));
+    for (size_t z = 0; z < sz; ++z) {
+      for (size_t y0 = 0; y0 < sy; y0 += by) {
+        const size_t y1 = std::min(sy, y0 + by);
+        pool.enqueue([=]() {
+          std::vector<float> drow; std::vector<int> arow; std::vector<float> f(sx);
+          const size_t base_z = z * sxy;
+          for (size_t y = y0; y < y1; ++y) {
+            const size_t base = base_z + y * sx;
+            for (size_t x = 0; x < sx; ++x) f[x] = (labels[base + x] != 0) ? 0.f : std::numeric_limits<float>::infinity();
+            detail_ft::dt1d_parabolic_with_arg(f.data(), int(sx), wx, tie_mode, drow, arow);
+            for (size_t x = 0; x < sx; ++x) { dx_p[base + x] = drow[x]; sx_seed_p[base + x] = arow[x]; }
+          }
+        });
+      }
+    }
+    pool.join();
+  }
+
+  std::unique_ptr<float[]> dxy(new float[voxels]);
+  std::unique_ptr<int[]>   sy_seed(new int[voxels]);
+  std::unique_ptr<int[]>   sx_seed_y(new int[voxels]);
+  float* dxy_p = dxy.get();
+  int*   sy_seed_p = sy_seed.get();
+  int*   sx_seed_y_p = sx_seed_y.get();
+
+  // Y pass (per x-column in each z-slice), chunked by blocks of x
+  {
+    ThreadPool pool(std::max(1, parallel));
+    const size_t bx = std::max<size_t>(1, sx / (size_t(4) * std::max(1, parallel)));
+    for (size_t z = 0; z < sz; ++z) {
+      for (size_t x0 = 0; x0 < sx; x0 += bx) {
+        const size_t x1 = std::min(sx, x0 + bx);
+        pool.enqueue([=]() {
+          std::vector<float> dcol; std::vector<int> arow; std::vector<float> g(sy); std::vector<int> axcol(sy);
+          for (size_t x = x0; x < x1; ++x) {
+            for (size_t y = 0; y < sy; ++y) { const size_t idx = z * sxy + y * sx + x; g[y] = dx_p[idx]; axcol[y] = sx_seed_p[idx]; }
+            detail_ft::dt1d_parabolic_with_arg(g.data(), int(sy), wy, tie_mode, dcol, arow);
+            for (size_t y = 0; y < sy; ++y) { const size_t idx = z * sxy + y * sx + x; const int r = arow[y]; dxy_p[idx] = dcol[y]; sy_seed_p[idx] = r; sx_seed_y_p[idx] = (r >= 0 ? axcol[r] : -1); }
+          }
+        });
+      }
+    }
+    pool.join();
+  }
+
+  // Z pass (per (x,y) column), chunked by blocks of columns
+  {
+    ThreadPool pool(std::max(1, parallel));
+    const size_t bxy = std::max<size_t>(1, (sx * sy) / (size_t(4) * std::max(1, parallel)));
+    const size_t cols = sx * sy;
+    for (size_t c0 = 0; c0 < cols; c0 += bxy) {
+      const size_t c1 = std::min(cols, c0 + bxy);
+      pool.enqueue([=]() {
+        std::vector<float> dline; std::vector<int> arow; std::vector<float> g(sz); std::vector<int> ayline(sz);
+        for (size_t c = c0; c < c1; ++c) {
+          const size_t y = c / sx; const size_t x = c % sx;
+          for (size_t z = 0; z < sz; ++z) { const size_t idx = z * sxy + y * sx + x; g[z] = dxy_p[idx]; ayline[z] = sy_seed_p[idx]; }
+          detail_ft::dt1d_parabolic_with_arg(g.data(), int(sz), wz, tie_mode, dline, arow);
+          for (size_t z = 0; z < sz; ++z) {
+            const size_t idx = z * sxy + y * sx + x; const int rz = arow[z];
+            output_dt[idx] = dline[z];
+            if (rz >= 0) {
+              const int ry = ayline[rz];
+              const int rx = (ry >= 0) ? sx_seed_y_p[rz * sxy + size_t(ry) * sx + x] : -1;
+              output_feat[idx] = (rx >= 0 && ry >= 0) ? size_t(rx) + sx * (size_t(ry) + sy * size_t(rz)) : size_t(0);
+            } else {
+              output_feat[idx] = 0;
+            }
+          }
+        }
+      });
+    }
+    pool.join();
+  }
+
+  return output_dt;
+}
+
 
 
 // Should be trivial to make an N-d version

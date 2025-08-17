@@ -19,11 +19,17 @@ if sys.platform == 'win32':
   ]
 else:
   extra_compile_args += [
-    '-std=c++17', '-O3', '-ffast-math', '-pthread'
+    '-std=c++17', '-Ofast', '-ffast-math', '-fno-math-errno', '-fno-trapping-math',
+    '-march=native', '-mtune=native', '-flto', '-DNDEBUG', '-pthread'
   ]
 
 if sys.platform == 'darwin':
   extra_compile_args += [ '-stdlib=libc++', '-mmacosx-version-min=10.9' ]
+
+# Add extra_link_args for LTO if not Windows
+extra_link_args = []
+if sys.platform != 'win32':
+  extra_link_args += ['-flto']
 
 
 setuptools.setup(
@@ -36,6 +42,7 @@ setuptools.setup(
       language='c++',
       include_dirs=[ 'src', str(NumpyImport()) ],
       extra_compile_args=extra_compile_args,
+      extra_link_args=extra_link_args,
     ),
   ],
   long_description_content_type='text/markdown',

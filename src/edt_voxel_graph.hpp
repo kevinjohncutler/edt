@@ -20,7 +20,7 @@
  * an obstructed edge to a voxel is 1/2.
  *
  * The edt represents the foreground labels as 6-connected,
- * and so we only concern outselves with the XYZ axes and not
+ * and so we only concern ourselves with the XYZ axes and not
  * any of the diagonals in the graph representation.
  * 
  * edt_voxel_graph - compute the euclidean distance transform 
