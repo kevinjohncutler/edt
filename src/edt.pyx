@@ -60,6 +60,35 @@ ctypedef fused NUMBER:
   double
 
 cdef extern from "edt.hpp" namespace "pyedt":
+    cdef float* _edt2dsq_features_u32[T](
+        T* labels,
+        size_t sx, size_t sy,
+        float wx, float wy,
+        native_bool black_border, int parallel,
+        float* output_dt, uint32_t* output_feat,
+        int tie_mode
+        ) nogil
+
+    cdef float* _edt3dsq_features_u32[T](
+        T* labels,
+        size_t sx, size_t sy, size_t sz,
+        float wx, float wy, float wz,
+        native_bool black_border, int parallel,
+        float* output_dt, uint32_t* output_feat,
+        int tie_mode
+        ) nogil
+    cdef void _expand2d_u32[T](
+        T* labels, size_t sx, size_t sy,
+        float wx, float wy,
+        native_bool black_border, int parallel,
+        uint32_t* out, int tie_mode) nogil
+
+    cdef void _expand3d_u32[T](
+        T* labels, size_t sx, size_t sy, size_t sz,
+        float wx, float wy, float wz,
+        native_bool black_border, int parallel,
+        uint32_t* out, int tie_mode) nogil
+
     cdef void squared_edt_1d_multi_seg[T](
         T *labels,
         float *dest,
@@ -334,7 +363,7 @@ def edtsq(
 @cython.binding(True)
 def feature_transform(data, anisotropy=None, black_border=False,
                       int parallel=1, voxel_graph=None,
-                      return_distances=False, ties='last'):
+                      return_distances=False, ties='last', features_dtype='auto'):
   """
   Feature transform of a label/seed image.
 
@@ -360,9 +389,14 @@ def feature_transform(data, anisotropy=None, black_border=False,
       Tie-breaking policy for voxels equidistant to multiple seeds.
       'last' (default): prefers the last site encountered (largest index, matches NumPy).
       'first', 'scipy', 'left', 'smallest': prefers the first (lexicographically smallest index, matches SciPy).
+      All aliases besides 'last' map to the same behavior ('first').
+  features_dtype : {'auto', 'uint32', 'u32', 'uintp'}, optional
+      Output dtype for the feature (nearest seed) array. 'auto' (default) uses uint32 if the
+      number of voxels fits; otherwise uses uintp. 'uint32' or 'u32' always uses np.uint32,
+      'uintp' always uses np.uintp.
   Returns
   -------
-  feat : ndarray of intp
+  feat : ndarray of intp or uint32
       Linear indices of the nearest seed for each voxel.
   dt : ndarray of float32, optional
       Squared Euclidean distance, if return_distances=True.
@@ -386,7 +420,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
   cdef np.ndarray[np.uint8_t, ndim=1] seeds1
   cdef Py_ssize_t n1 = 0
   cdef np.ndarray[np.float32_t, ndim=1] dt1
-  cdef np.ndarray[np.uintp_t,   ndim=1] feat1
+  cdef np.ndarray feat1
   cdef float wx1
   cdef Py_ssize_t i1 = 0
   cdef Py_ssize_t s1 = 0
@@ -397,7 +431,9 @@ def feature_transform(data, anisotropy=None, black_border=False,
   cdef Py_ssize_t sx2 = 0
   cdef Py_ssize_t sy2 = 0
   cdef np.ndarray[np.float32_t, ndim=2] dt2
-  cdef np.ndarray[np.uintp_t,   ndim=2] feat2
+  cdef np.ndarray[np.uint32_t, ndim=2] feat2_u32
+  cdef np.ndarray[np.uintp_t,  ndim=2] feat2_up
+  cdef float* dt2_ptr = NULL
 
   # 3D
   cdef np.ndarray[np.uint8_t,  ndim=3] seeds3
@@ -405,7 +441,9 @@ def feature_transform(data, anisotropy=None, black_border=False,
   cdef Py_ssize_t sy3 = 0
   cdef Py_ssize_t sz3 = 0
   cdef np.ndarray[np.float32_t, ndim=3] dt3
-  cdef np.ndarray[np.uintp_t,   ndim=3] feat3
+  cdef np.ndarray[np.uint32_t, ndim=3] feat3_u32
+  cdef np.ndarray[np.uintp_t,  ndim=3] feat3_up
+  cdef float* dt3_ptr = NULL
 
   # --- Python-level setup after declarations ---
   bb = black_border
@@ -435,12 +473,24 @@ def feature_transform(data, anisotropy=None, black_border=False,
     except Exception:
       parallel = max(1, parallel)
 
+  # Decide features_dtype
+  voxels = arr.size
+  use_u32 = False
+  if isinstance(features_dtype, str):
+    fd = features_dtype.lower()
+    if fd == 'auto':
+      use_u32 = (voxels < 2**32)
+    elif fd in ('uint32', 'u32'):
+      use_u32 = True
+    else:
+      use_u32 = False  # 'uintp' or anything else
+
   # 1D path
   if dims == 1:
     seeds1 = (arr != 0).astype(np.uint8, order='C', copy=False)
     n1 = seeds1.shape[0]
     dt1   = np.empty((n1,), dtype=np.float32)
-    feat1 = np.empty((n1,), dtype=np.uintp)
+    feat1 = np.empty((n1,), dtype=np.uint32 if use_u32 else np.uintp)
     wx1 = <float>anis[0]
 
     # compute nearest seed via simple midpoint selection
@@ -466,37 +516,222 @@ def feature_transform(data, anisotropy=None, black_border=False,
     seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
     sx2 = seeds2.shape[0]
     sy2 = seeds2.shape[1]
-    dt2   = np.empty((sx2, sy2), dtype=np.float32)
-    feat2 = np.empty((sx2, sy2), dtype=np.uintp)
+    if return_distances:
+        dt2 = np.empty((sx2, sy2), dtype=np.float32)
+        dt2_ptr = &dt2[0, 0]
 
-    _edt2dsq_features[uint8_t](
-      &seeds2[0, 0],
-      <size_t>sx2, <size_t>sy2,
-      <float>anis[0], <float>anis[1],
-      bb, parallel,
-      &dt2[0, 0], <size_t*>&feat2[0, 0],
-      tie_mode
-    )
-    return (feat2, dt2) if return_distances else feat2
+    if use_u32:
+        feat2_u32 = np.empty((sx2, sy2), dtype=np.uint32)
+        _edt2dsq_features_u32[uint8_t](
+            &seeds2[0, 0],
+            <size_t>sx2, <size_t>sy2,
+            <float>anis[0], <float>anis[1],
+            bb, parallel,
+            dt2_ptr, &feat2_u32[0, 0],
+            tie_mode
+        )
+        return (feat2_u32, dt2) if return_distances else feat2_u32
+    else:
+        feat2_up = np.empty((sx2, sy2), dtype=np.uintp)
+        _edt2dsq_features[uint8_t](
+            &seeds2[0, 0],
+            <size_t>sx2, <size_t>sy2,
+            <float>anis[0], <float>anis[1],
+            bb, parallel,
+            dt2_ptr, <size_t*>&feat2_up[0, 0],
+            tie_mode
+        )
+        return (feat2_up, dt2) if return_distances else feat2_up
 
   # 3D path
   seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
   sx3 = seeds3.shape[0]
   sy3 = seeds3.shape[1]
   sz3 = seeds3.shape[2]
+  if return_distances:
+      dt3 = np.empty((sx3, sy3, sz3), dtype=np.float32)
+      dt3_ptr = &dt3[0, 0, 0]
 
-  dt3   = np.empty((sx3, sy3, sz3), dtype=np.float32)
-  feat3 = np.empty((sx3, sy3, sz3), dtype=np.uintp)
+  if use_u32:
+      feat3_u32 = np.empty((sx3, sy3, sz3), dtype=np.uint32)
+      _edt3dsq_features_u32[uint8_t](
+          &seeds3[0, 0, 0],
+          <size_t>sx3, <size_t>sy3, <size_t>sz3,
+          <float>anis[0], <float>anis[1], <float>anis[2],
+          bb, parallel,
+          dt3_ptr, &feat3_u32[0, 0, 0],
+          tie_mode
+      )
+      return (feat3_u32, dt3) if return_distances else feat3_u32
+  else:
+      feat3_up = np.empty((sx3, sy3, sz3), dtype=np.uintp)
+      _edt3dsq_features[uint8_t](
+          &seeds3[0, 0, 0],
+          <size_t>sx3, <size_t>sy3, <size_t>sz3,
+          <float>anis[0], <float>anis[1], <float>anis[2],
+          bb, parallel,
+          dt3_ptr, <size_t*>&feat3_up[0, 0, 0],
+          tie_mode
+      )
+      return (feat3_up, dt3) if return_distances else feat3_up
 
-  _edt3dsq_features[uint8_t](
-    &seeds3[0, 0, 0],
-    <size_t>sx3, <size_t>sy3, <size_t>sz3,
-    <float>anis[0], <float>anis[1], <float>anis[2],
-    bb, parallel,
-    &dt3[0, 0, 0], <size_t*>&feat3[0, 0, 0],
-    tie_mode
+
+# ================================
+# Fast label expansion (no distances)
+# ================================
+@cython.binding(True)
+def expand_labels(
+    data, anisotropy=None, black_border=False,
+    int parallel=1, voxel_graph=None, ties='last'):
+  """Expand nonzero labels by nearest-neighbor in Euclidean metric (no distances).
+
+  Returns an array of dtype uint32 with labels copied from nearest seed.
+  Tie-breaking:
+    'last' (default) prefers larger index; 'first'/'scipy'/'left'/'smallest' prefer smaller.
+  """
+  cdef int tie_mode
+  if isinstance(ties, str) and ties.lower() in ('first','scipy','left','smallest'):
+    tie_mode = 1
+  else:
+    tie_mode = 0
+
+  cdef native_bool bb = black_border
+  cdef np.ndarray arr = np.asarray(data)
+  if arr.ndim not in (1,2,3):
+    raise ValueError('Only 1D, 2D, 3D supported')
+  if not arr.flags.c_contiguous:
+    arr = np.ascontiguousarray(arr)
+
+  cdef int dims = arr.ndim
+  cdef tuple anis
+  if anisotropy is None:
+    anis = (1.0,) * dims
+  else:
+    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
+    if len(anis) != dims:
+      raise ValueError('anisotropy length must match data.ndim')
+
+  if parallel <= 0:
+    try: parallel = multiprocessing.cpu_count()
+    except Exception: parallel = 1
+  else:
+    try: parallel = max(1, min(parallel, multiprocessing.cpu_count()))
+    except Exception: parallel = max(1, parallel)
+
+  # --- Cython variable declarations for all branches ---
+  cdef np.ndarray[np.uint8_t, ndim=1] seeds1
+  cdef Py_ssize_t n1
+  cdef np.ndarray[np.uint32_t, ndim=1] out1
+  cdef np.ndarray pos
+  cdef np.ndarray mids
+  cdef Py_ssize_t i
+  cdef Py_ssize_t k
+  cdef Py_ssize_t s
+
+  cdef np.ndarray[np.uint8_t, ndim=2] seeds2
+  cdef Py_ssize_t sx
+  cdef Py_ssize_t sy
+  cdef np.ndarray[np.uint32_t, ndim=2] out2
+  cdef np.ndarray[np.uint32_t, ndim=2] feat2
+  cdef np.ndarray[np.uint32_t, ndim=2] arr_flat_u32
+  cdef Py_ssize_t nvox2 = 0
+  cdef Py_ssize_t idx2 = 0
+  cdef np.uint32_t* feat2_ptr = NULL
+  cdef np.uint32_t* out2_ptr = NULL
+  cdef np.uint32_t* arr_flat_ptr = NULL
+
+  cdef np.ndarray[np.uint8_t, ndim=3] seeds3
+  cdef Py_ssize_t sx3
+  cdef Py_ssize_t sy3
+  cdef Py_ssize_t sz3
+  cdef np.ndarray[np.uint32_t, ndim=3] out3
+  cdef np.ndarray[np.uint32_t, ndim=3] feat3
+  cdef np.ndarray[np.uint32_t, ndim=3] arr_flat_u32_3
+  cdef Py_ssize_t nvox3 = 0
+  cdef Py_ssize_t idx3 = 0
+  cdef np.uint32_t* feat3_ptr = NULL
+  cdef np.uint32_t* out3_ptr = NULL
+  cdef np.uint32_t* arr_flat_ptr3 = NULL
+
+  # 1D: simple midpoint selection
+  if dims == 1:
+    seeds1 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    n1 = seeds1.shape[0]
+    out1 = np.empty((n1,), dtype=np.uint32)
+    pos = np.flatnonzero(seeds1)
+    i = 0
+    k = 0
+    # s declared above
+    if pos.size == 0:
+      out1.fill(0)
+    elif pos.size == 1:
+      out1.fill(<np.uint32_t>arr[int(pos[0])])
+    else:
+      mids = (pos[:-1] + pos[1:]) * 0.5
+      for i in range(n1):
+        while k < mids.size and (i > mids[k] if tie_mode==1 else i >= mids[k]):
+          k += 1
+        s = <Py_ssize_t>pos[min(k, pos.size-1)]
+        out1[i] = <np.uint32_t>arr[s]
+    return out1
+
+  # 2D
+  if dims == 2:
+    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    # C-order arrays are (rows, cols) = (y, x). Kernels expect (sx=x, sy=y).
+    sx = seeds2.shape[1]
+    sy = seeds2.shape[0]
+
+    # compute feature (linear seed indices, x-fastest indexing) using core FT for symmetry
+    feat2 = np.empty((sy, sx), dtype=np.uint32)
+    _edt2dsq_features_u32[uint8_t](
+        &seeds2[0,0],
+        <size_t>sx, <size_t>sy,
+        <float>anis[1], <float>anis[0],
+        bb, parallel,
+        <float*>NULL, &feat2[0,0],
+        tie_mode
+    )
+
+    # map linear indices -> original label values (uint32)
+    arr_flat_u32 = np.ascontiguousarray(arr.astype(np.uint32, copy=False))  # (sy, sx)
+    out2 = np.empty((sy, sx), dtype=np.uint32)
+    nvox2 = sx * sy
+    feat2_ptr = &feat2[0,0]
+    out2_ptr  = &out2[0,0]
+    arr_flat_ptr = &arr_flat_u32[0,0]
+    for idx2 in range(nvox2):
+        out2_ptr[idx2] = arr_flat_ptr[feat2_ptr[idx2]]
+    return out2
+
+  # 3D
+  seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
+  # C-order 3D arrays are (z, y, x). Kernels expect sizes (sx=x, sy=y, sz=z).
+  sx3 = seeds3.shape[2]
+  sy3 = seeds3.shape[1]
+  sz3 = seeds3.shape[0]
+
+  # compute feature (linear seed indices with x-fastest indexing) using core FT for symmetry
+  feat3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
+  _edt3dsq_features_u32[uint8_t](
+      &seeds3[0,0,0],
+      <size_t>sx3, <size_t>sy3, <size_t>sz3,
+      <float>anis[2], <float>anis[1], <float>anis[0],
+      bb, parallel,
+      <float*>NULL, &feat3[0,0,0],
+      tie_mode
   )
-  return (feat3, dt3) if return_distances else feat3
+
+  # map linear indices -> original label values (uint32)
+  arr_flat_u32_3 = np.ascontiguousarray(arr.astype(np.uint32, copy=False))  # (sz3, sy3, sx3)
+  out3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
+  nvox3 = sx3 * sy3 * sz3
+  feat3_ptr = &feat3[0,0,0]
+  out3_ptr  = &out3[0,0,0]
+  arr_flat_ptr3 = &arr_flat_u32_3[0,0,0]
+  for idx3 in range(nvox3):
+      out3_ptr[idx3] = arr_flat_ptr3[feat3_ptr[idx3]]
+  return out3
 
 
 def edt1d(data, anisotropy=1.0, native_bool black_border=False):
@@ -1184,247 +1419,47 @@ def each(labels, dt, in_place=False):
   return ImageIterator()
 
 
-# def expand_labels(labels, anisotropy=None, preserve_existing=True):
-#     """
-#     Expand nonzero labels into zeros by nearest-neighbor Voronoi assignment.
-#     Uses edt.edtsq for distances, then vectorized steepest-descent with pointer-jumping
-#     to recover the nearest seed for each voxel. Pure NumPy. No SciPy.
-#     """
-#     arr = np.asarray(labels)
-#     if arr.ndim < 1:
-#         raise ValueError("labels must be at least 1D")
-#     if not (arr.flags.c_contiguous or arr.flags.f_contiguous):
-#         arr = np.ascontiguousarray(arr)
-
-#     seeds = (arr > 0)
-#     if not np.any(seeds):
-#         return np.zeros_like(arr, dtype=arr.dtype)
-
-#     # 1) Fast squared EDT of background via this package
-#     dt2 = edtsq(~seeds, anisotropy=anisotropy, black_border=False, parallel=1)
-
-#     # 2) Vectorized "steepest-descent" neighbor map
-#     shp = arr.shape
-#     ndim = arr.ndim
-#     total = arr.size
-
-#     base = np.arange(total, dtype=np.intp).reshape(shp)
-
-#     # Build neighbor stacks
-#     nb_dt = []
-#     nb_ix = []
-
-#     for ax in range(ndim):
-#         # negative direction (shift -1)
-#         sl = [slice(None)] * ndim
-#         sl[ax] = slice(1, None)
-#         dt_neg = dt2[tuple(sl)]
-#         ix_neg = base[tuple(sl)]
-#         padw = [(0, 0)] * ndim
-#         padw[ax] = (1, 0)
-#         nb_dt.append(np.pad(dt_neg, padw, constant_values=np.inf))
-#         nb_ix.append(np.pad(ix_neg, padw, constant_values=-1))
-
-#         # positive direction (shift +1)
-#         sl[ax] = slice(0, -1)
-#         dt_pos = dt2[tuple(sl)]
-#         ix_pos = base[tuple(sl)]
-#         padw[ax] = (0, 1)
-#         nb_dt.append(np.pad(dt_pos, padw, constant_values=np.inf))
-#         nb_ix.append(np.pad(ix_pos, padw, constant_values=-1))
-
-#     nb_dt = np.stack(nb_dt, axis=-1)
-#     nb_ix = np.stack(nb_ix, axis=-1)
-
-#     # Choose best neighbor
-#     dir = np.argmin(nb_dt, axis=-1)
-#     next_idx = nb_ix.reshape(total, 2 * ndim)[np.arange(total, dtype=np.intp), dir.ravel()]
-
-#     # Seeds and borders point to self
-#     flat_self = np.arange(total, dtype=np.intp)
-#     mask_bad = (next_idx < 0) | seeds.ravel()
-#     if mask_bad.any():
-#         next_idx[mask_bad] = flat_self[mask_bad]
-
-#     # 3) Pointer-jumping to converge quickly to seeds
-#     for _ in range(16):
-#         jj = next_idx[next_idx]
-#         if np.array_equal(jj, next_idx):
-#             break
-#         next_idx = jj
-
-#     # 4) Scatter nearest labels back
-#     out = arr.copy()
-#     bg = (~seeds).ravel()
-#     out.ravel()[bg] = arr.ravel()[next_idx[bg]]
-
-#     if preserve_existing:
-#         return out
-#     else:
-#         return arr.ravel()[next_idx].reshape(arr.shape)
-
-# @cython.binding(True)
-# def feature_transform(data, anisotropy=None, black_border=False,
-#                       int parallel=1, voxel_graph=None,
-#                       return_distances=False):
-#     """
-#     Feature transform of a label/seed image.
-
-#     Nonzero elements are seeds. Returns an array of dtype np.intp with the
-#     linear index of the nearest seed for every voxel. If return_distances=True,
-#     also returns the squared EDT (from edtsq on ~seeds).
-#     """
-#     arr = np.asarray(data)
-#     if arr.ndim < 1:
-#         raise ValueError("data must be at least 1D")
-#     # ensure contiguity for predictable strides
-#     if not (arr.flags.c_contiguous or arr.flags.f_contiguous):
-#         arr = np.ascontiguousarray(arr)
-
-#     seeds = (arr != 0)
-#     shp = arr.shape
-#     total = arr.size
-
-#     # degenerate cases
-#     if not seeds.any():
-#         feat = np.arange(total, dtype=np.intp).reshape(shp)
-#         if return_distances:
-#             return feat, np.full(shp, np.inf, dtype=np.float32)
-#         return feat
-#     if seeds.all():
-#         feat = np.arange(total, dtype=np.intp).reshape(shp)
-#         if return_distances:
-#             return feat, np.zeros(shp, dtype=np.float32)
-#         return feat
-
-#     # squared EDT to nearest background; anisotropy is honored
-#     dt2 = edtsq(~seeds, anisotropy=anisotropy,
-#                 black_border=black_border,
-#                 parallel=parallel,
-#                 voxel_graph=voxel_graph)
-
-#     ndim = arr.ndim
-#     base = np.arange(total, dtype=np.intp).reshape(shp)
-
-#     # Build axial neighbor stacks (2*ndim)
-#     nb_dt = []
-#     nb_ix = []
-#     for ax in range(ndim):
-#         # shift -1
-#         sl = [slice(None)] * ndim
-#         sl[ax] = slice(1, None)
-#         dt_neg = dt2[tuple(sl)]
-#         ix_neg = base[tuple(sl)]
-#         pad = [(0, 0)] * ndim
-#         pad[ax] = (1, 0)
-#         nb_dt.append(np.pad(dt_neg, pad, constant_values=np.inf))
-#         nb_ix.append(np.pad(ix_neg, pad, constant_values=-1))
-
-#         # shift +1
-#         sl[ax] = slice(0, -1)
-#         dt_pos = dt2[tuple(sl)]
-#         ix_pos = base[tuple(sl)]
-#         pad[ax] = (0, 1)
-#         nb_dt.append(np.pad(dt_pos, pad, constant_values=np.inf))
-#         nb_ix.append(np.pad(ix_pos, pad, constant_values=-1))
-
-#     nb_dt = np.stack(nb_dt, axis=-1)               # (*shp, 2*ndim)
-#     nb_ix = np.stack(nb_ix, axis=-1)               # (*shp, 2*ndim)
-
-#     # Greedy steepest descent step
-#     dirs = np.argmin(nb_dt, axis=-1)               # (*shp,)
-#     flat_nb_ix = nb_ix.reshape(total, 2 * ndim)
-#     next_idx = flat_nb_ix[np.arange(total, dtype=np.intp), dirs.ravel()]
-
-#     # Seeds and borders point to self
-#     flat_self = np.arange(total, dtype=np.intp)
-#     flat_seeds = seeds.ravel()
-#     bad = (next_idx < 0) | flat_seeds
-#     if bad.any():
-#         next_idx[bad] = flat_self[bad]
-
-#     # Pointer jumping to converge to seeds in O(log D) iterations
-#     for _ in range(32):
-#         jj = next_idx[next_idx]
-#         if np.array_equal(jj, next_idx):
-#             break
-#         next_idx = jj
-
-#     feat = next_idx.reshape(shp)
-#     if return_distances:
-#         return feat, dt2
-#     return feat
-
 
 # @cython.binding(True)
 # def expand_labels(labels, anisotropy=None, preserve_existing=True,
-#                   black_border=False, int parallel=1, voxel_graph=None):
-#     """
-#     Expand nonzero labels into zeros via Voronoi assignment to the nearest seed.
+#                   black_border=False, int parallel=1, voxel_graph=None,
+#                   ties='last'):
+#   """
+#   Expand nonzero labels into zeros via Voronoi assignment to the nearest seed.
 
-#     This is a pure NumPy/Cython path:
-#       1) Run edtsq on ~seeds (zeros) honoring anisotropy.
-#       2) Recover nearest-seed linear indices with a vectorized neighbor descent.
-#       3) Scatter corresponding label ids back; optionally preserve existing ids.
-#     """
-#     arr = np.asarray(labels)
-#     if arr.ndim < 1:
-#         raise ValueError("labels must be at least 1D")
-#     if not (arr.flags.c_contiguous or arr.flags.f_contiguous):
-#         arr = np.ascontiguousarray(arr)
-
-#     feat = feature_transform(arr, anisotropy=anisotropy,
-#                              black_border=black_border,
-#                              parallel=parallel,
-#                              voxel_graph=voxel_graph)
-
-#     if preserve_existing:
-#         out = arr.copy()
-#         bg = (arr == 0)
-#         out[bg] = arr.ravel()[feat][bg]
-#         return out
-
-#     return arr.ravel()[feat].reshape(arr.shape)
-
-@cython.binding(True)
-def expand_labels(labels, anisotropy=None, preserve_existing=True,
-                  black_border=False, int parallel=1, voxel_graph=None,
-                  ties='last'):
-  """
-  Expand nonzero labels into zeros via Voronoi assignment to the nearest seed.
-
-  Parameters
-  ----------
-  labels : ndarray
-      Input label image.
-  anisotropy : tuple, optional
-      Voxel size per axis (default 1.0 for each axis).
-  preserve_existing : bool, optional
-      If True, keep nonzero labels unchanged (default True).
-  black_border : bool, optional
-      If True, treat the border as background (default False).
-  parallel : int, optional
-      Number of threads for parallel execution.
-  voxel_graph : ndarray, optional
-      Not used.
-  ties : {'last', 'first', 'scipy', 'left', 'smallest'}, optional
-      Tie-breaking policy for voxels equidistant to multiple seeds.
-      'last' (default): prefers the last site encountered (largest index, matches NumPy).
-      'first', 'scipy', 'left', 'smallest': prefers the first (lexicographically smallest index, matches SciPy).
-  Returns
-  -------
-  out : ndarray
-      Expanded label image.
-  """
-  arr = np.asarray(labels)
-  feat = feature_transform(arr, anisotropy=anisotropy,
-                           black_border=black_border,
-                           parallel=parallel,
-                           return_distances=False,
-                           ties=ties)
-  if preserve_existing:
-    out = arr.copy()
-    bg = (arr == 0)
-    out[bg] = arr.ravel()[feat][bg]
-    return out
-  return arr.ravel()[feat].reshape(arr.shape)
+#   Parameters
+#   ----------
+#   labels : ndarray
+#       Input label image.
+#   anisotropy : tuple, optional
+#       Voxel size per axis (default 1.0 for each axis).
+#   preserve_existing : bool, optional
+#       If True, keep nonzero labels unchanged (default True).
+#   black_border : bool, optional
+#       If True, treat the border as background (default False).
+#   parallel : int, optional
+#       Number of threads for parallel execution.
+#   voxel_graph : ndarray, optional
+#       Not used.
+#   ties : {'last', 'first', 'scipy', 'left', 'smallest'}, optional
+#       Tie-breaking policy for voxels equidistant to multiple seeds.
+#       'last' (default): prefers the last site encountered (largest index, matches NumPy).
+#       'first', 'scipy', 'left', 'smallest': prefers the first (lexicographically smallest index, matches SciPy).
+#       All aliases besides 'last' map to the same behavior ('first').
+#   Returns
+#   -------
+#   out : ndarray
+#       Expanded label image.
+#   """
+#   arr = np.asarray(labels)
+#   feat = feature_transform(arr, anisotropy=anisotropy,
+#                            black_border=black_border,
+#                            parallel=parallel,
+#                            return_distances=False,
+#                            ties=ties)
+#   if preserve_existing:
+#     out = arr.copy()
+#     bg = (arr == 0)
+#     out[bg] = arr.ravel()[feat][bg]
+#     return out
+#   return arr.ravel()[feat].reshape(arr.shape)
