@@ -1,6 +1,7 @@
 CHANGES
 =======
 
+* faster expand labels
 * working feature trasnform
 * fix: add in non-functional order parameter for edt, sdf, edtsq
 * docs: remove order parameter from documentation

@@ -19,7 +19,11 @@ if sys.platform == 'win32':
   ]
 else:
   extra_compile_args += [
-    '-std=c++17', '-Ofast', '-ffast-math', '-fno-math-errno', '-fno-trapping-math',
+    '-std=c++17', 
+    # '-Ofast', #'-ffast-math', 
+    # '-Ofast', '-fno-finite-math-only',
+    '-O3','-ffast-math','-fno-finite-math-only','-fno-unsafe-math-optimizations',
+    '-fno-math-errno', '-fno-trapping-math',
     '-march=native', '-mtune=native', '-flto', '-DNDEBUG', '-pthread'
   ]
 
@@ -33,8 +37,9 @@ if sys.platform != 'win32':
 
 
 setuptools.setup(
-  setup_requires=['pbr', 'cython'],
+  setup_requires=['cython', 'setuptools_scm'],
   python_requires=">=3.8,<4",
+  use_scm_version=True,
   ext_modules=[
     setuptools.Extension(
       'edt',
@@ -43,8 +48,8 @@ setuptools.setup(
       include_dirs=[ 'src', str(NumpyImport()) ],
       extra_compile_args=extra_compile_args,
       extra_link_args=extra_link_args,
+      define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
     ),
   ],
   long_description_content_type='text/markdown',
-  pbr=True
 )

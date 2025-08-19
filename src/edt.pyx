@@ -65,8 +65,7 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t sx, size_t sy,
         float wx, float wy,
         native_bool black_border, int parallel,
-        float* output_dt, uint32_t* output_feat,
-        int tie_mode
+        float* output_dt, uint32_t* output_feat
         ) nogil
 
     cdef float* _edt3dsq_features_u32[T](
@@ -74,20 +73,23 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t sx, size_t sy, size_t sz,
         float wx, float wy, float wz,
         native_bool black_border, int parallel,
-        float* output_dt, uint32_t* output_feat,
-        int tie_mode
+        float* output_dt, uint32_t* output_feat
         ) nogil
     cdef void _expand2d_u32[T](
         T* labels, size_t sx, size_t sy,
         float wx, float wy,
         native_bool black_border, int parallel,
-        uint32_t* out, int tie_mode) nogil
+        uint32_t* out,
+        const uint32_t* label_values
+    ) nogil
 
     cdef void _expand3d_u32[T](
         T* labels, size_t sx, size_t sy, size_t sz,
         float wx, float wy, float wz,
         native_bool black_border, int parallel,
-        uint32_t* out, int tie_mode) nogil
+        uint32_t* out,
+        const uint32_t* label_values
+    ) nogil
 
     cdef void squared_edt_1d_multi_seg[T](
         T *labels,
@@ -119,8 +121,7 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t sx, size_t sy,
         float wx, float wy,
         native_bool black_border, int parallel,
-        float* output_dt, size_t* output_feat,
-        int tie_mode
+        float* output_dt, size_t* output_feat
         ) nogil
 
     cdef float* _edt3dsq_features[T](
@@ -128,8 +129,7 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t sx, size_t sy, size_t sz,
         float wx, float wy, float wz,
         native_bool black_border, int parallel,
-        float* output_dt, size_t* output_feat,
-        int tie_mode
+        float* output_dt, size_t* output_feat
         ) nogil
 
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
@@ -363,7 +363,7 @@ def edtsq(
 @cython.binding(True)
 def feature_transform(data, anisotropy=None, black_border=False,
                       int parallel=1, voxel_graph=None,
-                      return_distances=False, ties='last', features_dtype='auto'):
+                      return_distances=False, features_dtype='auto'):
   """
   Feature transform of a label/seed image.
 
@@ -401,15 +401,6 @@ def feature_transform(data, anisotropy=None, black_border=False,
   dt : ndarray of float32, optional
       Squared Euclidean distance, if return_distances=True.
   """
-  cdef int tie_mode
-  if isinstance(ties, str):
-    t = ties.lower()
-    if t in ('first', 'scipy', 'left', 'smallest'):
-      tie_mode = 1  # TIE_FIRST
-    else:
-      tie_mode = 0  # TIE_LAST (default)
-  else:
-    tie_mode = 0
   # --- Cython declarations at function top-level ---
   cdef native_bool bb
   cdef int dims
@@ -527,8 +518,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
             <size_t>sx2, <size_t>sy2,
             <float>anis[0], <float>anis[1],
             bb, parallel,
-            dt2_ptr, &feat2_u32[0, 0],
-            tie_mode
+            dt2_ptr, &feat2_u32[0, 0]
         )
         return (feat2_u32, dt2) if return_distances else feat2_u32
     else:
@@ -538,8 +528,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
             <size_t>sx2, <size_t>sy2,
             <float>anis[0], <float>anis[1],
             bb, parallel,
-            dt2_ptr, <size_t*>&feat2_up[0, 0],
-            tie_mode
+            dt2_ptr, <size_t*>&feat2_up[0, 0]
         )
         return (feat2_up, dt2) if return_distances else feat2_up
 
@@ -559,8 +548,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
           <size_t>sx3, <size_t>sy3, <size_t>sz3,
           <float>anis[0], <float>anis[1], <float>anis[2],
           bb, parallel,
-          dt3_ptr, &feat3_u32[0, 0, 0],
-          tie_mode
+          dt3_ptr, &feat3_u32[0, 0, 0]
       )
       return (feat3_u32, dt3) if return_distances else feat3_u32
   else:
@@ -570,8 +558,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
           <size_t>sx3, <size_t>sy3, <size_t>sz3,
           <float>anis[0], <float>anis[1], <float>anis[2],
           bb, parallel,
-          dt3_ptr, <size_t*>&feat3_up[0, 0, 0],
-          tie_mode
+          dt3_ptr, <size_t*>&feat3_up[0, 0, 0]
       )
       return (feat3_up, dt3) if return_distances else feat3_up
 
@@ -582,25 +569,16 @@ def feature_transform(data, anisotropy=None, black_border=False,
 @cython.binding(True)
 def expand_labels(
     data, anisotropy=None, black_border=False,
-    int parallel=1, voxel_graph=None, ties='last'):
+    int parallel=1, voxel_graph=None):
   """Expand nonzero labels by nearest-neighbor in Euclidean metric (no distances).
 
   Returns an array of dtype uint32 with labels copied from nearest seed.
-  Tie-breaking:
-    'last' (default) prefers larger index; 'first'/'scipy'/'left'/'smallest' prefer smaller.
   """
-  cdef int tie_mode
-  if isinstance(ties, str) and ties.lower() in ('first','scipy','left','smallest'):
-    tie_mode = 1
-  else:
-    tie_mode = 0
-
   cdef native_bool bb = black_border
-  cdef np.ndarray arr = np.asarray(data)
+  # Enforce C-contiguous np.uint32 input
+  cdef np.ndarray arr = np.require(data, dtype=np.uint32, requirements='C')
   if arr.ndim not in (1,2,3):
     raise ValueError('Only 1D, 2D, 3D supported')
-  if not arr.flags.c_contiguous:
-    arr = np.ascontiguousarray(arr)
 
   cdef int dims = arr.ndim
   cdef tuple anis
@@ -619,7 +597,6 @@ def expand_labels(
     except Exception: parallel = max(1, parallel)
 
   # --- Cython variable declarations for all branches ---
-  cdef np.ndarray[np.uint8_t, ndim=1] seeds1
   cdef Py_ssize_t n1
   cdef np.ndarray[np.uint32_t, ndim=1] out1
   cdef np.ndarray pos
@@ -628,40 +605,28 @@ def expand_labels(
   cdef Py_ssize_t k
   cdef Py_ssize_t s
 
-  cdef np.ndarray[np.uint8_t, ndim=2] seeds2
   cdef Py_ssize_t sx
   cdef Py_ssize_t sy
   cdef np.ndarray[np.uint32_t, ndim=2] out2
-  cdef np.ndarray[np.uint32_t, ndim=2] feat2
-  cdef np.ndarray[np.uint32_t, ndim=2] arr_flat_u32
-  cdef Py_ssize_t nvox2 = 0
-  cdef Py_ssize_t idx2 = 0
-  cdef np.uint32_t* feat2_ptr = NULL
-  cdef np.uint32_t* out2_ptr = NULL
-  cdef np.uint32_t* arr_flat_ptr = NULL
+  cdef np.ndarray[np.uint8_t, ndim=2] seeds2
+  cdef np.ndarray[np.uint32_t, ndim=1] arr_u32_2d
 
-  cdef np.ndarray[np.uint8_t, ndim=3] seeds3
   cdef Py_ssize_t sx3
   cdef Py_ssize_t sy3
   cdef Py_ssize_t sz3
   cdef np.ndarray[np.uint32_t, ndim=3] out3
-  cdef np.ndarray[np.uint32_t, ndim=3] feat3
-  cdef np.ndarray[np.uint32_t, ndim=3] arr_flat_u32_3
-  cdef Py_ssize_t nvox3 = 0
-  cdef Py_ssize_t idx3 = 0
-  cdef np.uint32_t* feat3_ptr = NULL
-  cdef np.uint32_t* out3_ptr = NULL
-  cdef np.uint32_t* arr_flat_ptr3 = NULL
+  cdef np.ndarray[np.uint8_t, ndim=3] seeds3
+  cdef np.ndarray[np.uint32_t, ndim=1] arr_u32_3d
+
 
   # 1D: simple midpoint selection
   if dims == 1:
-    seeds1 = (arr != 0).astype(np.uint8, order='C', copy=False)
-    n1 = seeds1.shape[0]
+    n1 = arr.shape[0]
     out1 = np.empty((n1,), dtype=np.uint32)
-    pos = np.flatnonzero(seeds1)
+    # Detect seeds directly on arr
+    pos = np.flatnonzero(arr)
     i = 0
     k = 0
-    # s declared above
     if pos.size == 0:
       out1.fill(0)
     elif pos.size == 1:
@@ -669,7 +634,7 @@ def expand_labels(
     else:
       mids = (pos[:-1] + pos[1:]) * 0.5
       for i in range(n1):
-        while k < mids.size and (i > mids[k] if tie_mode==1 else i >= mids[k]):
+        while k < mids.size and i >= mids[k]:
           k += 1
         s = <Py_ssize_t>pos[min(k, pos.size-1)]
         out1[i] = <np.uint32_t>arr[s]
@@ -677,61 +642,40 @@ def expand_labels(
 
   # 2D
   if dims == 2:
-    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
     # C-order arrays are (rows, cols) = (y, x). Kernels expect (sx=x, sy=y).
-    sx = seeds2.shape[1]
-    sy = seeds2.shape[0]
-
-    # compute feature (linear seed indices, x-fastest indexing) using core FT for symmetry
-    feat2 = np.empty((sy, sx), dtype=np.uint32)
-    _edt2dsq_features_u32[uint8_t](
-        &seeds2[0,0],
+    sx = arr.shape[1]
+    sy = arr.shape[0]
+    out2 = np.empty((sy, sx), dtype=np.uint32)
+    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    arr_u32_2d = np.ascontiguousarray(arr.ravel(), dtype=np.uint32)
+    _expand2d_u32[uint8_t](
+        &seeds2[0, 0],
         <size_t>sx, <size_t>sy,
         <float>anis[1], <float>anis[0],
         bb, parallel,
-        <float*>NULL, &feat2[0,0],
-        tie_mode
+        &out2[0, 0],
+        &arr_u32_2d[0]
     )
-
-    # map linear indices -> original label values (uint32)
-    arr_flat_u32 = np.ascontiguousarray(arr.astype(np.uint32, copy=False))  # (sy, sx)
-    out2 = np.empty((sy, sx), dtype=np.uint32)
-    nvox2 = sx * sy
-    feat2_ptr = &feat2[0,0]
-    out2_ptr  = &out2[0,0]
-    arr_flat_ptr = &arr_flat_u32[0,0]
-    for idx2 in range(nvox2):
-        out2_ptr[idx2] = arr_flat_ptr[feat2_ptr[idx2]]
     return out2
 
   # 3D
-  seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
-  # C-order 3D arrays are (z, y, x). Kernels expect sizes (sx=x, sy=y, sz=z).
-  sx3 = seeds3.shape[2]
-  sy3 = seeds3.shape[1]
-  sz3 = seeds3.shape[0]
-
-  # compute feature (linear seed indices with x-fastest indexing) using core FT for symmetry
-  feat3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
-  _edt3dsq_features_u32[uint8_t](
-      &seeds3[0,0,0],
-      <size_t>sx3, <size_t>sy3, <size_t>sz3,
-      <float>anis[2], <float>anis[1], <float>anis[0],
-      bb, parallel,
-      <float*>NULL, &feat3[0,0,0],
-      tie_mode
-  )
-
-  # map linear indices -> original label values (uint32)
-  arr_flat_u32_3 = np.ascontiguousarray(arr.astype(np.uint32, copy=False))  # (sz3, sy3, sx3)
-  out3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
-  nvox3 = sx3 * sy3 * sz3
-  feat3_ptr = &feat3[0,0,0]
-  out3_ptr  = &out3[0,0,0]
-  arr_flat_ptr3 = &arr_flat_u32_3[0,0,0]
-  for idx3 in range(nvox3):
-      out3_ptr[idx3] = arr_flat_ptr3[feat3_ptr[idx3]]
-  return out3
+  if dims == 3:
+    # C-order 3D arrays are (z, y, x). Kernels expect sizes (sx=x, sy=y, sz=z).
+    sx3 = arr.shape[2]
+    sy3 = arr.shape[1]
+    sz3 = arr.shape[0]
+    out3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
+    seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    arr_u32_3d = np.ascontiguousarray(arr.ravel(), dtype=np.uint32)
+    _expand3d_u32[uint8_t](
+        &seeds3[0, 0, 0],
+        <size_t>sx3, <size_t>sy3, <size_t>sz3,
+        <float>anis[2], <float>anis[1], <float>anis[0],
+        bb, parallel,
+        &out3[0, 0, 0],
+        &arr_u32_3d[0]
+    )
+    return out3
 
 
 def edt1d(data, anisotropy=1.0, native_bool black_border=False):
@@ -1419,47 +1363,3 @@ def each(labels, dt, in_place=False):
   return ImageIterator()
 
 
-
-# @cython.binding(True)
-# def expand_labels(labels, anisotropy=None, preserve_existing=True,
-#                   black_border=False, int parallel=1, voxel_graph=None,
-#                   ties='last'):
-#   """
-#   Expand nonzero labels into zeros via Voronoi assignment to the nearest seed.
-
-#   Parameters
-#   ----------
-#   labels : ndarray
-#       Input label image.
-#   anisotropy : tuple, optional
-#       Voxel size per axis (default 1.0 for each axis).
-#   preserve_existing : bool, optional
-#       If True, keep nonzero labels unchanged (default True).
-#   black_border : bool, optional
-#       If True, treat the border as background (default False).
-#   parallel : int, optional
-#       Number of threads for parallel execution.
-#   voxel_graph : ndarray, optional
-#       Not used.
-#   ties : {'last', 'first', 'scipy', 'left', 'smallest'}, optional
-#       Tie-breaking policy for voxels equidistant to multiple seeds.
-#       'last' (default): prefers the last site encountered (largest index, matches NumPy).
-#       'first', 'scipy', 'left', 'smallest': prefers the first (lexicographically smallest index, matches SciPy).
-#       All aliases besides 'last' map to the same behavior ('first').
-#   Returns
-#   -------
-#   out : ndarray
-#       Expanded label image.
-#   """
-#   arr = np.asarray(labels)
-#   feat = feature_transform(arr, anisotropy=anisotropy,
-#                            black_border=black_border,
-#                            parallel=parallel,
-#                            return_distances=False,
-#                            ties=ties)
-#   if preserve_existing:
-#     out = arr.copy()
-#     bg = (arr == 0)
-#     out[bg] = arr.ravel()[feat][bg]
-#     return out
-#   return arr.ravel()[feat].reshape(arr.shape)

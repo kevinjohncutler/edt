@@ -33,28 +33,12 @@
 
 namespace pyedt {
     
-// --- Feature-transform forward declarations (2D/3D) ---
-template <typename T>
-float* _edt2dsq_features(
-    T* labels, size_t sx, size_t sy,
-    float wx, float wy,
-    bool black_border, int parallel,
-    float* output_dt, size_t* output_feat,
-    int tie_mode);
-
-template <typename T>
-float* _edt3dsq_features(
-    T* labels, size_t sx, size_t sy, size_t sz,
-    float wx, float wy, float wz,
-    bool black_border, int parallel,
-    float* output_dt, size_t* output_feat,
-    int tie_mode);
 
 #define sq(x) (static_cast<float>(x) * static_cast<float>(x))
 
 inline void tofinite(float *f, const size_t voxels) {
   for (size_t i = 0; i < voxels; i++) {
-    if (f[i] == INFINITY) {
+    if (f[i] == std::numeric_limits<float>::infinity()) {
       f[i] = std::numeric_limits<float>::max() - 1;
     }
   }
@@ -63,7 +47,7 @@ inline void tofinite(float *f, const size_t voxels) {
 inline void toinfinite(float *f, const size_t voxels) {
   for (size_t i = 0; i < voxels; i++) {
     if (f[i] >= std::numeric_limits<float>::max() - 1) {
-      f[i] = INFINITY;
+      f[i] = std::numeric_limits<float>::infinity();
     }
   }
 }
@@ -98,7 +82,7 @@ void squared_edt_1d_multi_seg(
     d[0] = static_cast<float>(working_segid != 0) * anistropy; // 0 or 1
   }
   else {
-    d[0] = working_segid == 0 ? 0 : INFINITY;
+    d[0] = working_segid == 0 ? 0 : std::numeric_limits<float>::infinity();
   }
 
   for (i = stride; i < n * stride; i += stride) {
@@ -201,8 +185,8 @@ void squared_edt_1d_parabolic(
   
   std::unique_ptr<float[]> ranges(new float[n + 1]());
 
-  ranges[0] = -INFINITY;
-  ranges[1] = +INFINITY;
+  ranges[0] = -std::numeric_limits<float>::infinity();
+  ranges[1] = std::numeric_limits<float>::infinity();
 
   /* Unclear if this adds much but I certainly find it easier to get the parens right.
    *
@@ -227,7 +211,7 @@ void squared_edt_1d_parabolic(
     k++;
     v[k] = i;
     ranges[k] = s;
-    ranges[k + 1] = +INFINITY;
+    ranges[k + 1] = std::numeric_limits<float>::infinity();
   }
 
   k = 0;
@@ -276,8 +260,8 @@ void squared_edt_1d_parabolic(
 
   std::unique_ptr<float[]> ranges(new float[n + 1]());
 
-  ranges[0] = -INFINITY;
-  ranges[1] = +INFINITY;
+  ranges[0] = -std::numeric_limits<float>::infinity();
+  ranges[1] = std::numeric_limits<float>::infinity();
 
   /* Unclear if this adds much but I certainly find it easier to get the parens right.
    *
@@ -302,7 +286,7 @@ void squared_edt_1d_parabolic(
     k++;
     v[k] = i;
     ranges[k] = s;
-    ranges[k + 1] = +INFINITY;
+    ranges[k + 1] = std::numeric_limits<float>::infinity();
   }
 
   k = 0;
@@ -349,13 +333,14 @@ void _squared_edt_1d_parabolic(
  * 
  * Returns: writes squared distance transform in f
  */
+// Modified: allow optional arg_out for argmin tracking (feature transform)
 template <typename T>
 void squared_edt_1d_parabolic_multi_seg(
   T* segids, float* f,
   const int n, const long int stride, const float anisotropy,
-  const bool black_border=false
+  const bool black_border=false,
+  int* arg_out=nullptr
 ) {
-
   T working_segid = segids[0];
   T segid;
   long int last = 0;
@@ -365,10 +350,16 @@ void squared_edt_1d_parabolic_multi_seg(
     if (segid != working_segid) {
       if (working_segid != 0) {
         _squared_edt_1d_parabolic(
-          f + last * stride, 
+          f + last * stride,
           i - last, stride, anisotropy,
           (black_border || last > 0), true
         );
+        if (arg_out) {
+          // For each voxel in this run, write the starting index (last)
+          for (int j = 0; j < i - last; ++j) {
+            arg_out[(last + j) * stride] = last;
+          }
+        }
       }
       working_segid = segid;
       last = i;
@@ -377,10 +368,15 @@ void squared_edt_1d_parabolic_multi_seg(
 
   if (working_segid != 0 && last < n) {
     _squared_edt_1d_parabolic(
-      f + last * stride, 
+      f + last * stride,
       n - last, stride, anisotropy,
       (black_border || last > 0), black_border
     );
+    if (arg_out) {
+      for (int j = 0; j < n - last; ++j) {
+        arg_out[(last + j) * stride] = last;
+      }
+    }
   }
 }
 
@@ -804,96 +800,14 @@ float* _edt2d(
 }
 
 
-// ================================
-// Feature-transform implementations
-// ================================
-// TIE_LAST: prefer later (larger index) on ties – NumPy-like
-// TIE_FIRST: prefer earlier (smaller index) on ties – SciPy-compatible
-enum { TIE_LAST = 0, TIE_FIRST = 1 };
-
-namespace detail_ft {
-
-// Felzenszwalb 1D lower envelope + argmin (with weight w, tie-breaking)
-inline void dt1d_parabolic_with_arg(
-    const float* f_in, int n, float w, int tie_mode,
-    std::vector<float>& d, std::vector<int>& arg) {
-  d.assign(n, std::numeric_limits<float>::infinity());
-  arg.assign(n, -1);
-  if (n <= 0) return;
-
-  const float w2 = w * w;
-
-  // thread-local scratch to avoid alloc churn
-  static thread_local std::vector<int>   v_buf;
-  static thread_local std::vector<float> z_buf;
-  static thread_local std::vector<float> f_buf;
-
-  v_buf.resize(n);
-  z_buf.resize(n + 1);
-  f_buf.resize(n);
-
-  // Copy input row
-  for (int i = 0; i < n; ++i) f_buf[i] = f_in[i];
-
-  int*   v = v_buf.data();
-  float* z = z_buf.data();
-  const float* f = f_buf.data();
-
-  // Intersection between parabolas from i and j (no bias)
-  auto inter = [&](int i, int j) -> float {
-    // s = ((f[i] + w2*i*i) - (f[j] + w2*j*j)) / (2*w2*(i-j))
-    const float fi = f[i];
-    const float fj = f[j];
-    const float ij = float(i - j);
-    return ((fi - fj) + w2 * float(i + j) * ij) / (2.f * w2 * ij);
-  };
-
-  int k = 0;
-  v[0] = 0;
-  z[0] = -INFINITY;
-  z[1] = +INFINITY;
-
-  for (int q = 1; q < n; ++q) {
-    float s = inter(q, v[k]);
-    if (tie_mode == TIE_LAST) {
-      // Prefer later sites on ties (<=)
-      while (k >= 0 && s <= z[k]) {
-        --k;
-        if (k >= 0) s = inter(q, v[k]);
-      }
-    } else {
-      // Prefer earlier sites on ties (<); matches SciPy's behavior
-      while (k >= 0 && s < z[k]) {
-        --k;
-        if (k >= 0) s = inter(q, v[k]);
-      }
-    }
-    ++k;
-    v[k]   = q;
-    z[k]   = s;
-    z[k+1] = +INFINITY;
-  }
-
-  k = 0;
-  for (int x = 0; x < n; ++x) {
-    while (z[k + 1] < x) ++k;
-    const int p = v[k];
-    d[x]   = w2 * (x - p) * (x - p) + f[p];
-    arg[x] = p;
-  }
-}
-
-} // namespace detail_ft
-
-
 // --- Internal helpers for boolean EDT/feature transform ---
 template <typename T, typename OUTIDX=size_t>
 inline float* _edt2dsq_bool_core(
     T* labels, size_t sx, size_t sy,
     float wx, float wy,
     bool /*black_border*/, int parallel,
-    float* output_dt, OUTIDX* output_feat, // if nullptr, skip writing features
-    int tie_mode)
+    float* output_dt, OUTIDX* output_feat // if nullptr, skip writing features
+    )
 {
   const float BIG = std::numeric_limits<float>::max() / 4.0f;
   const size_t voxels = sx * sy;
@@ -910,51 +824,21 @@ inline float* _edt2dsq_bool_core(
     for (size_t y0 = 0; y0 < sy; y0 += by) {
       const size_t y1 = std::min(sy, y0 + by);
       pool.enqueue([=]() {
-        // Fast midpoint partitioning: collect seeds; no forward/back sweep needed
-        std::vector<int> seeds;
-        seeds.reserve(sx);
+        std::vector<float> row(sx);
+        std::vector<float> drow(sx);
+        std::vector<int>   arow(sx);
         for (size_t y = y0; y < y1; ++y) {
           const size_t off = y * sx;
-          seeds.clear();
+          // Build row
           for (size_t x = 0; x < sx; ++x) {
-            if (labels[off + x] != 0) seeds.push_back((int)x);
+            row[x] = (labels[off + x] != 0) ? 0.f : BIG;
           }
-          // write tmp and argx with tie policy
-          if (seeds.empty()) {
-            for (size_t x = 0; x < sx; ++x) {
-              tmp_p[off + x] = BIG;
-              if (output_feat) argx_p[off + x] = -1;
-            }
-          } else if (seeds.size() == 1) {
-            const int s = seeds[0];
-            const float wx2 = wx * wx;
-            for (size_t x = 0; x < sx; ++x) {
-              const float dxx = float((x >= (size_t)s) ? (x - (size_t)s) : ((size_t)s - x));
-              tmp_p[off + x] = wx2 * dxx * dxx;
-              if (output_feat) argx_p[off + x] = s;
-            }
-          } else {
-            const float wx2 = wx * wx;
-            size_t k = 0;
-            float mid = 0.5f * float(seeds[0] + seeds[1]);
-            for (size_t x = 0; x < sx; ++x) {
-              // advance partition index respecting tie policy
-              if (tie_mode == TIE_LAST) {
-                while (k + 1 < seeds.size() && float(x) >= mid) {
-                  ++k;
-                  if (k + 1 < seeds.size()) mid = 0.5f * float(seeds[k] + seeds[k+1]);
-                }
-              } else { // TIE_FIRST
-                while (k + 1 < seeds.size() && float(x) > mid) {
-                  ++k;
-                  if (k + 1 < seeds.size()) mid = 0.5f * float(seeds[k] + seeds[k+1]);
-                }
-              }
-              const int s = seeds[k];
-              const float dxx = float((x >= (size_t)s) ? (x - (size_t)s) : ((size_t)s - x));
-              tmp_p[off + x] = wx2 * dxx * dxx;
-              if (output_feat) argx_p[off + x] = s;
-            }
+          squared_edt_1d_parabolic_multi_seg<float>(
+              row.data(), drow.data(), sx, 1, wx, false, arow.data()
+          );
+          for (size_t x = 0; x < sx; ++x) {
+            tmp_p[off + x] = drow[x];
+            if (output_feat) argx_p[off + x] = arow[x];
           }
         }
       });
@@ -969,7 +853,7 @@ inline float* _edt2dsq_bool_core(
     for (size_t x0 = 0; x0 < sx; x0 += bx) {
       const size_t x1 = std::min(sx, x0 + bx);
       pool.enqueue([=]() {
-        std::vector<float> dcol; std::vector<int> arow; std::vector<float> g(sy);
+        std::vector<float> dcol(sy); std::vector<int> arow(sy); std::vector<float> g(sy);
         std::vector<int> axcol; if (output_feat) axcol.resize(sy);
         for (size_t x = x0; x < x1; ++x) {
           for (size_t y = 0; y < sy; ++y) {
@@ -977,7 +861,9 @@ inline float* _edt2dsq_bool_core(
             g[y] = tmp_p[idx];
             if (output_feat) axcol[y] = argx_p[idx];
           }
-          detail_ft::dt1d_parabolic_with_arg(g.data(), int(sy), wy, tie_mode, dcol, arow);
+          squared_edt_1d_parabolic_multi_seg<float>(
+              g.data(), dcol.data(), sy, 1, wy, false, arow.data()
+          );
           for (size_t y = 0; y < sy; ++y) {
             const size_t idx = y * sx + x;
             if (output_dt) output_dt[idx] = dcol[y];
@@ -1001,8 +887,8 @@ inline float* _edt3dsq_bool_core(
     T* labels, size_t sx, size_t sy, size_t sz,
     float wx, float wy, float wz,
     bool /*black_border*/, int parallel,
-    float* output_dt, OUTIDX* output_feat, // if nullptr, skip writing features
-    int tie_mode)
+    float* output_dt, OUTIDX* output_feat // if nullptr, skip writing features
+    )
 {
   const float BIG = std::numeric_limits<float>::max() / 4.0f;
   const size_t sxy = sx * sy;
@@ -1015,7 +901,7 @@ inline float* _edt3dsq_bool_core(
   float* dx_p = dx.get();
   int*   sx_seed_p = output_feat ? sx_seed.get() : nullptr;
 
-  // X pass
+  // X pass (now parabola-based, for tie-breaking matching all axes)
   {
     ThreadPool pool(std::max(1, parallel));
     const size_t by = std::max<size_t>(1, sy / (size_t(4) * std::max(1, parallel)));
@@ -1023,51 +909,22 @@ inline float* _edt3dsq_bool_core(
       for (size_t y0 = 0; y0 < sy; y0 += by) {
         const size_t y1 = std::min(sy, y0 + by);
         pool.enqueue([=]() {
-          std::vector<int> seeds;
-          seeds.reserve(sx);
+          std::vector<float> row(sx);
+          std::vector<float> drow(sx);
+          std::vector<int>   arow(sx);
           const size_t base_z = z * sxy;
           for (size_t y = y0; y < y1; ++y) {
             const size_t base = base_z + y * sx;
-            // collect seeds only; no forward/back sweep
-            seeds.clear();
+            // Build row
             for (size_t x = 0; x < sx; ++x) {
-              if (labels[base + x] != 0) seeds.push_back((int)x);
+              row[x] = (labels[base + x] != 0) ? 0.f : BIG;
             }
-            // write dx and sx_seed respecting ties
-            if (seeds.empty()) {
-              for (size_t x = 0; x < sx; ++x) {
-                dx_p[base + x] = BIG;
-                if (output_feat) sx_seed_p[base + x] = -1;
-              }
-            } else if (seeds.size() == 1) {
-              const int s = seeds[0];
-              const float wx2 = wx * wx;
-              for (size_t x = 0; x < sx; ++x) {
-                const float dxx = float((x >= (size_t)s) ? (x - (size_t)s) : ((size_t)s - x));
-                dx_p[base + x] = wx2 * dxx * dxx;
-                if (output_feat) sx_seed_p[base + x] = s;
-              }
-            } else {
-              const float wx2 = wx * wx;
-              size_t k = 0;
-              float mid = 0.5f * float(seeds[0] + seeds[1]);
-              for (size_t x = 0; x < sx; ++x) {
-                if (tie_mode == TIE_LAST) {
-                  while (k + 1 < seeds.size() && float(x) >= mid) {
-                    ++k;
-                    if (k + 1 < seeds.size()) mid = 0.5f * float(seeds[k] + seeds[k+1]);
-                  }
-                } else { // TIE_FIRST
-                  while (k + 1 < seeds.size() && float(x) > mid) {
-                    ++k;
-                    if (k + 1 < seeds.size()) mid = 0.5f * float(seeds[k] + seeds[k+1]);
-                  }
-                }
-                const int s = seeds[k];
-                const float dxx = float((x >= (size_t)s) ? (x - (size_t)s) : ((size_t)s - x));
-                dx_p[base + x] = wx2 * dxx * dxx;
-                if (output_feat) sx_seed_p[base + x] = s;
-              }
+            squared_edt_1d_parabolic_multi_seg<float>(
+                row.data(), drow.data(), sx, 1, wx, false, arow.data()
+            );
+            for (size_t x = 0; x < sx; ++x) {
+              dx_p[base + x] = drow[x];
+              if (output_feat) sx_seed_p[base + x] = arow[x];
             }
           }
         });
@@ -1093,7 +950,7 @@ inline float* _edt3dsq_bool_core(
       for (size_t x0 = 0; x0 < sx; x0 += bx) {
         const size_t x1 = std::min(sx, x0 + bx);
         pool.enqueue([=]() {
-          std::vector<float> dcol; std::vector<int> arow; std::vector<float> g(sy);
+          std::vector<float> dcol(sy); std::vector<int> arow(sy); std::vector<float> g(sy);
           std::vector<int> axcol; if (output_feat) axcol.resize(sy);
           for (size_t x = x0; x < x1; ++x) {
             for (size_t y = 0; y < sy; ++y) {
@@ -1101,7 +958,9 @@ inline float* _edt3dsq_bool_core(
               g[y] = dx_p[idx];
               if (output_feat) axcol[y] = sx_seed_p[idx];
             }
-            detail_ft::dt1d_parabolic_with_arg(g.data(), int(sy), wy, tie_mode, dcol, arow);
+            squared_edt_1d_parabolic_multi_seg<float>(
+                g.data(), dcol.data(), sy, 1, wy, false, arow.data()
+            );
             for (size_t y = 0; y < sy; ++y) {
               const size_t idx = z * sxy + y * sx + x;
               dxy_p[idx] = dcol[y];
@@ -1126,7 +985,7 @@ inline float* _edt3dsq_bool_core(
     for (size_t c0 = 0; c0 < cols; c0 += bxy) {
       const size_t c1 = std::min(cols, c0 + bxy);
       pool.enqueue([=]() {
-        std::vector<float> dline; std::vector<int> arow; std::vector<float> g(sz);
+        std::vector<float> dline(sz); std::vector<int> arow(sz); std::vector<float> g(sz);
         std::vector<int> ayline; if (output_feat) ayline.resize(sz);
         for (size_t c = c0; c < c1; ++c) {
           const size_t y = c / sx; const size_t x = c % sx;
@@ -1135,7 +994,9 @@ inline float* _edt3dsq_bool_core(
             g[z] = dxy_p[idx];
             if (output_feat) ayline[z] = sy_seed_p[idx];
           }
-          detail_ft::dt1d_parabolic_with_arg(g.data(), int(sz), wz, tie_mode, dline, arow);
+          squared_edt_1d_parabolic_multi_seg<float>(
+              g.data(), dline.data(), sz, 1, wz, false, arow.data()
+          );
           for (size_t z = 0; z < sz; ++z) {
             const size_t idx = z * sxy + y * sx + x;
             if (output_dt) output_dt[idx] = dline[z];
@@ -1161,18 +1022,18 @@ inline float* _edt3dsq_bool_core(
   return output_dt;
 }
 
+
+
 template <typename T>
 float* _edt2dsq_features(
     T* labels, size_t sx, size_t sy,
     float wx, float wy,
     bool black_border, int parallel,
-    float* output_dt, size_t* output_feat,
-    int tie_mode) {
+    float* output_dt, size_t* output_feat) {
   return _edt2dsq_bool_core<T, size_t>(
       labels, sx, sy, wx, wy,
       black_border, parallel,
-      output_dt, output_feat,
-      tie_mode);
+      output_dt, output_feat);
 }
 
 template <typename T>
@@ -1180,13 +1041,11 @@ float* _edt3dsq_features(
     T* labels, size_t sx, size_t sy, size_t sz,
     float wx, float wy, float wz,
     bool black_border, int parallel,
-    float* output_dt, size_t* output_feat,
-    int tie_mode) {
+    float* output_dt, size_t* output_feat) {
   return _edt3dsq_bool_core<T, size_t>(
       labels, sx, sy, sz, wx, wy, wz,
       black_border, parallel,
-      output_dt, output_feat,
-      tie_mode);
+      output_dt, output_feat);
 }
 
 // New: u32 wrappers for feature transform
@@ -1195,13 +1054,11 @@ float* _edt2dsq_features_u32(
     T* labels, size_t sx, size_t sy,
     float wx, float wy,
     bool black_border, int parallel,
-    float* output_dt, uint32_t* output_feat,
-    int tie_mode) {
+    float* output_dt, uint32_t* output_feat) {
   return _edt2dsq_bool_core<T, uint32_t>(
       labels, sx, sy, wx, wy,
       black_border, parallel,
-      output_dt, output_feat,
-      tie_mode);
+      output_dt, output_feat);
 }
 
 template <typename T>
@@ -1209,30 +1066,33 @@ float* _edt3dsq_features_u32(
     T* labels, size_t sx, size_t sy, size_t sz,
     float wx, float wy, float wz,
     bool black_border, int parallel,
-    float* output_dt, uint32_t* output_feat,
-    int tie_mode) {
+    float* output_dt, uint32_t* output_feat) {
   return _edt3dsq_bool_core<T, uint32_t>(
       labels, sx, sy, sz, wx, wy, wz,
       black_border, parallel,
-      output_dt, output_feat,
-      tie_mode);
+      output_dt, output_feat);
 }
 
 
+// Modified: allow passing label_values for mapping feature indices to label values.
 template <typename T>
 void _expand2d_u32(
     T* labels, size_t sx, size_t sy,
     float wx, float wy,
     bool black_border, int parallel,
-    uint32_t* out, int tie_mode)
+    uint32_t* out,
+    const uint32_t* label_values = nullptr)
 {
   _edt2dsq_bool_core<T, uint32_t>(
-      labels, sx, sy,
-      wx, wy,
+      labels, sx, sy, wx, wy,
       black_border, parallel,
       /*output_dt*/ nullptr,
-      /*output_feat*/ out,
-      tie_mode);
+      /*output_feat*/ out);
+  if (label_values) {
+    for (size_t i = 0; i < sx * sy; ++i) {
+      out[i] = label_values[out[i]];
+    }
+  }
 }
 
 template <typename T>
@@ -1240,19 +1100,21 @@ void _expand3d_u32(
     T* labels, size_t sx, size_t sy, size_t sz,
     float wx, float wy, float wz,
     bool black_border, int parallel,
-    uint32_t* out, int tie_mode)
+    uint32_t* out,
+    const uint32_t* label_values = nullptr)
 {
+  const size_t voxels = sx * sy * sz;
   _edt3dsq_bool_core<T, uint32_t>(
-      labels, sx, sy, sz,
-      wx, wy, wz,
+      labels, sx, sy, sz, wx, wy, wz,
       black_border, parallel,
       /*output_dt*/ nullptr,
-      /*output_feat*/ out,
-      tie_mode);
+      /*output_feat*/ out);
+  if (label_values) {
+    for (size_t i = 0; i < voxels; ++i) {
+      out[i] = label_values[out[i]];
+    }
+  }
 }
-
-// should be able to delete the detail_expand namespace
-
 
 } // namespace pyedt
 
