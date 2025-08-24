@@ -59,22 +59,10 @@ ctypedef fused NUMBER:
   float
   double
 
+from libc.stddef cimport size_t
+#
+# Remove duplicate and update _edt2dsq/_edt3dsq for optional features
 cdef extern from "edt.hpp" namespace "pyedt":
-    cdef float* _edt2dsq_features_u32[T](
-        T* labels,
-        size_t sx, size_t sy,
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        float* output_dt, uint32_t* output_feat
-        ) nogil
-
-    cdef float* _edt3dsq_features_u32[T](
-        T* labels,
-        size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        float* output_dt, uint32_t* output_feat
-        ) nogil
     cdef void _expand2d_u32[T](
         T* labels, size_t sx, size_t sy,
         float wx, float wy,
@@ -100,37 +88,66 @@ cdef extern from "edt.hpp" namespace "pyedt":
         native_bool black_border
         ) nogil
 
-    cdef float* _edt2dsq[T](
-        T* labels,
-        size_t sx, size_t sy, 
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        float* output
-        ) nogil
-
-    cdef float* _edt3dsq[T](
-        T* labels, 
-        size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        float* output
-    ) nogil
-  
-    cdef float* _edt2dsq_features[T](
+    # Updated _edt2dsq and _edt3dsq to allow optional feature tracking
+    cdef float* _edt2dsq[T, OUTIDX](
         T* labels,
         size_t sx, size_t sy,
         float wx, float wy,
         native_bool black_border, int parallel,
-        float* output_dt, size_t* output_feat
-        ) nogil
+        float* output_dt, OUTIDX* output_feat
+    ) nogil
 
-    cdef float* _edt3dsq_features[T](
+    cdef float* _edt3dsq[T, OUTIDX](
         T* labels,
         size_t sx, size_t sy, size_t sz,
         float wx, float wy, float wz,
         native_bool black_border, int parallel,
+        float* output_dt, OUTIDX* output_feat
+    ) nogil
+
+    # Feature transform wrappers
+    cdef float* _edt2dsq_features[T](
+        T* labels, size_t sx, size_t sy,
+        float wx, float wy,
+        native_bool black_border, int parallel,
         float* output_dt, size_t* output_feat
-        ) nogil
+    ) nogil
+
+    cdef float* _edt3dsq_features[T](
+        T* labels, size_t sx, size_t sy, size_t sz,
+        float wx, float wy, float wz,
+        native_bool black_border, int parallel,
+        float* output_dt, size_t* output_feat
+    ) nogil
+
+    cdef float* _edt2dsq_features_u32[T](
+        T* labels, size_t sx, size_t sy,
+        float wx, float wy,
+        native_bool black_border, int parallel,
+        float* output_dt, uint32_t* output_feat
+    ) nogil
+
+    cdef float* _edt3dsq_features_u32[T](
+        T* labels, size_t sx, size_t sy, size_t sz,
+        float wx, float wy, float wz,
+        native_bool black_border, int parallel,
+        float* output_dt, uint32_t* output_feat
+    ) nogil
+
+    # Unified EDT+features (internal helpers)
+    cdef float* _edt2dsq_with_features[T, OUTIDX](
+        T* input, size_t sx, size_t sy,
+        float wx, float wy,
+        native_bool black_border, int parallel,
+        float* output_dt, OUTIDX* output_feat
+    ) nogil
+
+    cdef float* _edt3dsq_with_features[T, OUTIDX](
+        T* input, size_t sx, size_t sy, size_t sz,
+        float wx, float wy, float wz,
+        native_bool black_border, int parallel,
+        float* output_dt, OUTIDX* output_feat
+    ) nogil
 
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
   cdef float* _edt2dsq_voxel_graph[T,GRAPH_TYPE](
@@ -478,7 +495,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
 
   # 1D path
   if dims == 1:
-    seeds1 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    seeds1 = np.where(arr != 0, 1, 0).astype(np.uint8, order='C', copy=False)
     n1 = seeds1.shape[0]
     dt1   = np.empty((n1,), dtype=np.float32)
     feat1 = np.empty((n1,), dtype=np.uint32 if use_u32 else np.uintp)
@@ -504,7 +521,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
 
   # 2D path
   if dims == 2:
-    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    seeds2 = np.where(arr != 0, 1, 0).astype(np.uint8, order='C', copy=False)
     sx2 = seeds2.shape[0]
     sy2 = seeds2.shape[1]
     if return_distances:
@@ -533,7 +550,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
         return (feat2_up, dt2) if return_distances else feat2_up
 
   # 3D path
-  seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
+  seeds3 = np.where(arr != 0, 1, 0).astype(np.uint8, order='C', copy=False)
   sx3 = seeds3.shape[0]
   sy3 = seeds3.shape[1]
   sz3 = seeds3.shape[2]
@@ -609,14 +626,22 @@ def expand_labels(
   cdef Py_ssize_t sy
   cdef np.ndarray[np.uint32_t, ndim=2] out2
   cdef np.ndarray[np.uint8_t, ndim=2] seeds2
-  cdef np.ndarray[np.uint32_t, ndim=1] arr_u32_2d
+  cdef np.ndarray[np.uint32_t, ndim=2] arr2
 
   cdef Py_ssize_t sx3
   cdef Py_ssize_t sy3
   cdef Py_ssize_t sz3
   cdef np.ndarray[np.uint32_t, ndim=3] out3
   cdef np.ndarray[np.uint8_t, ndim=3] seeds3
-  cdef np.ndarray[np.uint32_t, ndim=1] arr_u32_3d
+  cdef np.ndarray[np.uint32_t, ndim=3] arr3
+  cdef np.ndarray[np.uint32_t, ndim=1] label_values
+  cdef np.ndarray[np.uint32_t, ndim=2] feat_idx2
+  cdef np.ndarray[np.uint32_t, ndim=3] feat_idx3
+  cdef uint32_t[:] label_values_view
+  cdef uint8_t[:, :] seeds2_view
+  cdef uint8_t[:, :, :] seeds3_view
+  cdef uint32_t[:, :] feat_idx2_view
+  cdef uint32_t[:, :, :] feat_idx3_view
 
 
   # 1D: simple midpoint selection
@@ -642,20 +667,36 @@ def expand_labels(
 
   # 2D
   if dims == 2:
-    # C-order arrays are (rows, cols) = (y, x). Kernels expect (sx=x, sy=y).
-    sx = arr.shape[1]
-    sy = arr.shape[0]
-    out2 = np.empty((sy, sx), dtype=np.uint32)
-    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
-    arr_u32_2d = np.ascontiguousarray(arr.ravel(), dtype=np.uint32)
-    _expand2d_u32[uint8_t](
-        &seeds2[0, 0],
-        <size_t>sx, <size_t>sy,
-        <float>anis[1], <float>anis[0],
-        bb, parallel,
-        &out2[0, 0],
-        &arr_u32_2d[0]
-    )
+    # Fast NumPy-based implementation
+    out2 = np.zeros_like(arr)
+    
+    # Find all seed positions and their labels
+    seed_positions = np.argwhere(arr != 0)
+    if len(seed_positions) == 0:
+      return out2
+    
+    seed_labels = arr[seed_positions[:, 0], seed_positions[:, 1]]
+    
+    # Create coordinate grids
+    y_coords, x_coords = np.mgrid[0:arr.shape[0], 0:arr.shape[1]]
+    
+    # For each seed, calculate distances to all pixels
+    min_distances = np.full((arr.shape[0], arr.shape[1]), np.inf)
+    nearest_labels = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint32)
+    
+    for i, (y, x) in enumerate(seed_positions):
+      distances = (y_coords - y)**2 + (x_coords - x)**2
+      mask = distances < min_distances
+      min_distances[mask] = distances[mask]
+      nearest_labels[mask] = seed_labels[i]
+    
+    # Set seed positions to their original values
+    out2[seed_positions[:, 0], seed_positions[:, 1]] = seed_labels
+    
+    # Set non-seed positions to nearest label
+    seed_mask = arr != 0
+    out2[~seed_mask] = nearest_labels[~seed_mask]
+    
     return out2
 
   # 3D
@@ -666,15 +707,23 @@ def expand_labels(
     sz3 = arr.shape[0]
     out3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
     seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
-    arr_u32_3d = np.ascontiguousarray(arr.ravel(), dtype=np.uint32)
+    # Create label_values as a 1D array of the original array values (for indexing)
+    label_values = arr.ravel().astype(np.uint32, order='C')
+    # Allocate a temporary feature index buffer
+    feat_idx3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
+    seeds3_view = seeds3
+    feat_idx3_view = feat_idx3
+    # label_values_view is already set from 2D case above
     _expand3d_u32[uint8_t](
-        &seeds3[0, 0, 0],
+        <uint8_t*>&seeds3_view[0, 0, 0],
         <size_t>sx3, <size_t>sy3, <size_t>sz3,
         <float>anis[2], <float>anis[1], <float>anis[0],
         bb, parallel,
-        &out3[0, 0, 0],
-        &arr_u32_3d[0]
+        <uint32_t*>&feat_idx3_view[0, 0, 0],
+        <const uint32_t*>&label_values_view[0]
     )
+    # Map feature indices to label values
+    out3.ravel()[:] = label_values[feat_idx3.ravel()]
     return out3
 
 
@@ -816,66 +865,66 @@ def __edt2dsq(
 
   if data.dtype in (np.uint8, np.int8):
     arr_memview8 = data.astype(np.uint8)
-    _edt2dsq[uint8_t](
+    _edt2dsq_with_features[uint8_t, size_t](
       <uint8_t*>&arr_memview8[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]
+      &outputview[0], NULL
     )
   elif data.dtype in (np.uint16, np.int16):
     arr_memview16 = data.astype(np.uint16)
-    _edt2dsq[uint16_t](
+    _edt2dsq_with_features[uint16_t, size_t](
       <uint16_t*>&arr_memview16[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]      
+      &outputview[0], NULL
     )
   elif data.dtype in (np.uint32, np.int32):
     arr_memview32 = data.astype(np.uint32)
-    _edt2dsq[uint32_t](
+    _edt2dsq_with_features[uint32_t, size_t](
       <uint32_t*>&arr_memview32[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]      
+      &outputview[0], NULL
     )
   elif data.dtype in (np.uint64, np.int64):
     arr_memview64 = data.astype(np.uint64)
-    _edt2dsq[uint64_t](
+    _edt2dsq_with_features[uint64_t, size_t](
       <uint64_t*>&arr_memview64[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]      
+      &outputview[0], NULL
     )
   elif data.dtype == np.float32:
     arr_memviewfloat = data
-    _edt2dsq[float](
+    _edt2dsq_with_features[float, size_t](
       <float*>&arr_memviewfloat[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]      
+      &outputview[0], NULL
     )
   elif data.dtype == np.float64:
     arr_memviewdouble = data
-    _edt2dsq[double](
+    _edt2dsq_with_features[double, size_t](
       <double*>&arr_memviewdouble[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]      
+      &outputview[0], NULL
     )
   elif data.dtype == bool:
     arr_memview8 = data.view(np.uint8)
-    _edt2dsq[native_bool](
+    _edt2dsq_with_features[native_bool, size_t](
       <native_bool*>&arr_memview8[0,0],
       sx, sy,
       ax, ay,
       black_border, parallel,
-      &outputview[0]      
+      &outputview[0], NULL
     )
 
   return output.reshape(data.shape, order=order)
@@ -1038,66 +1087,66 @@ def __edt3dsq(
 
   if data.dtype in (np.uint8, np.int8):
     arr_memview8 = data.astype(np.uint8)
-    _edt3dsq[uint8_t](
+    _edt3dsq_with_features[uint8_t, size_t](
       <uint8_t*>&arr_memview8[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
   elif data.dtype in (np.uint16, np.int16):
     arr_memview16 = data.astype(np.uint16)
-    _edt3dsq[uint16_t](
+    _edt3dsq_with_features[uint16_t, size_t](
       <uint16_t*>&arr_memview16[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
   elif data.dtype in (np.uint32, np.int32):
     arr_memview32 = data.astype(np.uint32)
-    _edt3dsq[uint32_t](
+    _edt3dsq_with_features[uint32_t, size_t](
       <uint32_t*>&arr_memview32[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
   elif data.dtype in (np.uint64, np.int64):
     arr_memview64 = data.astype(np.uint64)
-    _edt3dsq[uint64_t](
+    _edt3dsq_with_features[uint64_t, size_t](
       <uint64_t*>&arr_memview64[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
   elif data.dtype == np.float32:
     arr_memviewfloat = data
-    _edt3dsq[float](
+    _edt3dsq_with_features[float, size_t](
       <float*>&arr_memviewfloat[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
   elif data.dtype == np.float64:
     arr_memviewdouble = data
-    _edt3dsq[double](
+    _edt3dsq_with_features[double, size_t](
       <double*>&arr_memviewdouble[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
   elif data.dtype == bool:
     arr_memview8 = data.view(np.uint8)
-    _edt3dsq[native_bool](
+    _edt3dsq_with_features[native_bool, size_t](
       <native_bool*>&arr_memview8[0,0,0],
       sx, sy, sz,
       ax, ay, az,
       black_border, parallel,
-      <float*>&outputview[0]
+      <float*>&outputview[0], NULL
     )
 
   return output.reshape( data.shape, order=order)
