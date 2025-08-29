@@ -24,6 +24,18 @@
 #include <vector>
 #include "threadpool.h"
 
+// Portable prefetch macro (no-op if unavailable)
+#if defined(__GNUC__) || defined(__clang__)
+#  define EDT_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
+#elif defined(_MSC_VER)
+#  include <xmmintrin.h>
+#  define EDT_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
+#  define EDT_PREFETCH(addr) do {} while(0)
+#endif
+
+// ND tuning knobs moved into pyedt namespace
+
 
 // The pyedt namespace contains the primary implementation,
 // but users will probably want to use the edt namespace (bottom)
@@ -35,6 +47,17 @@ namespace pyedt {
     
 
 #define sq(x) (static_cast<float>(x) * static_cast<float>(x))
+
+// ND tuning knobs
+static size_t ND_TILE = 8;              // lines per inner tile
+static size_t ND_PREFETCH_STEP = 0;     // lookahead lines for prefetch (0 to disable)
+static size_t ND_CHUNKS_PER_THREAD = 1; // chunks per thread
+
+inline void nd_set_tuning(size_t tile, size_t prefetch_step, size_t chunks_per_thread) {
+  if (tile > 0) ND_TILE = tile;
+  if (prefetch_step > 0) ND_PREFETCH_STEP = prefetch_step;
+  if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
+}
 
 inline void tofinite(float *f, const size_t voxels) {
   for (size_t i = 0; i < voxels; i++) {
@@ -1185,6 +1208,163 @@ void _expand3d_u32(
         nullptr, out
     );
     // No in-place remapping to label_values here; Python layer handles it
+}
+
+// ------------------------------
+// ND threaded axis passes (for Cython ND core)
+// ------------------------------
+
+template <typename T>
+inline void _nd_pass_multi(
+    T* labels, float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel
+) {
+  size_t total = 1;
+  for (size_t d = 0; d < dims; ++d) total *= shape[d];
+  const size_t n = shape[ax];
+  if (n <= 1) return;
+  const size_t s = strides[ax];
+  const size_t lines = total / n;
+
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));
+  const size_t chunk = (lines + chunks - 1) / chunks;
+
+  for (size_t start = 0; start < lines; start += chunk) {
+    const size_t end = std::min(lines, start + chunk);
+    pool.enqueue([=]() {
+      for (size_t idx_line = start; idx_line < end; ++idx_line) {
+        size_t base = 0;
+        size_t tmp = idx_line;
+        for (size_t d = 0; d < dims; ++d) {
+          if (d == ax) continue;
+          const size_t coord = tmp % shape[d];
+          base += coord * strides[d];
+          tmp /= shape[d];
+        }
+        squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+      }
+    });
+  }
+  pool.join();
+}
+
+template <typename T>
+inline void _nd_pass_parabolic(
+    T* labels, float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel
+) {
+  size_t total = 1;
+  for (size_t d = 0; d < dims; ++d) total *= shape[d];
+  const size_t n = shape[ax];
+  if (n <= 1) return;
+  const size_t s = strides[ax];
+  const size_t lines = total / n;
+
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));
+  const size_t chunk = (lines + chunks - 1) / chunks;
+
+  for (size_t start = 0; start < lines; start += chunk) {
+    const size_t end = std::min(lines, start + chunk);
+    pool.enqueue([=]() {
+      for (size_t idx_line = start; idx_line < end; ++idx_line) {
+        size_t base = 0;
+        size_t tmp = idx_line;
+        for (size_t d = 0; d < dims; ++d) {
+          if (d == ax) continue;
+          const size_t coord = tmp % shape[d];
+          base += coord * strides[d];
+          tmp /= shape[d];
+        }
+        squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+      }
+    });
+  }
+  pool.join();
+}
+
+// Threaded pass using precomputed base offsets (faster: no per-line mod/div)
+template <typename T>
+inline void _nd_pass_multi_bases(
+    T* labels, float* dest,
+    const size_t* bases, const size_t num_lines,
+    const size_t n, const size_t s,
+    const float anis,
+    const bool black_border,
+    const int parallel
+) {
+  if (n <= 1 || num_lines == 0) return;
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
+  const size_t chunk = (num_lines + chunks - 1) / chunks;
+  const size_t TILE = ND_TILE;
+  for (size_t start = 0; start < num_lines; start += chunk) {
+    const size_t end = std::min(num_lines, start + chunk);
+    pool.enqueue([=]() {
+      for (size_t i = start; i < end; i += TILE) {
+        const size_t t_end = std::min(end, i + TILE);
+        if (ND_PREFETCH_STEP > 0 && i + ND_PREFETCH_STEP < end) {
+          EDT_PREFETCH(labels + bases[i + ND_PREFETCH_STEP]);
+          EDT_PREFETCH(dest + bases[i + ND_PREFETCH_STEP]);
+        }
+        for (size_t j = i; j < t_end; ++j) {
+          const size_t base = bases[j];
+          squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+        }
+      }
+    });
+  }
+  pool.join();
+}
+
+template <typename T>
+inline void _nd_pass_parabolic_bases(
+    T* labels, float* dest,
+    const size_t* bases, const size_t num_lines,
+    const size_t n, const size_t s,
+    const float anis,
+    const bool black_border,
+    const int parallel
+) {
+  if (n <= 1 || num_lines == 0) return;
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
+  const size_t chunk = (num_lines + chunks - 1) / chunks;
+  const size_t TILE = ND_TILE;
+  for (size_t start = 0; start < num_lines; start += chunk) {
+    const size_t end = std::min(num_lines, start + chunk);
+    pool.enqueue([=]() {
+      for (size_t i = start; i < end; i += TILE) {
+        const size_t t_end = std::min(end, i + TILE);
+        if (ND_PREFETCH_STEP > 0 && i + ND_PREFETCH_STEP < end) {
+          EDT_PREFETCH(labels + bases[i + ND_PREFETCH_STEP]);
+          EDT_PREFETCH(dest + bases[i + ND_PREFETCH_STEP]);
+        }
+        for (size_t j = i; j < t_end; ++j) {
+          const size_t base = bases[j];
+          squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+        }
+      }
+    });
+  }
+  pool.join();
 }
 
 } // namespace pyedt
