@@ -1432,16 +1432,21 @@ inline void _nd_pass_multi_bases(
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
-  const size_t TILE = 8;
+  const size_t TILE = ND_TILE;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
     pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
-        // Prefetch disabled for simplicity
         for (size_t j = i; j < t_end; ++j) {
+          if (ND_PREFETCH_STEP > 0) {
+            const size_t pre = j + ND_PREFETCH_STEP;
+            if (pre < t_end) {
+              EDT_PREFETCH(labels + bases[pre]);
+            }
+          }
           const size_t base = bases[j];
           squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
         }
@@ -1463,16 +1468,21 @@ inline void _nd_pass_parabolic_bases(
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
-  const size_t TILE = 8;
+  const size_t TILE = ND_TILE;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
     pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
-        // Prefetch disabled for simplicity
         for (size_t j = i; j < t_end; ++j) {
+          if (ND_PREFETCH_STEP > 0) {
+            const size_t pre = j + ND_PREFETCH_STEP;
+            if (pre < t_end) {
+              EDT_PREFETCH(labels + bases[pre]);
+            }
+          }
           const size_t base = bases[j];
           squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
         }

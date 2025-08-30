@@ -40,6 +40,25 @@ cimport numpy as np
 np.import_array()
 
 import numpy as np
+import os
+
+@cython.binding(True)
+def nd_tuning(tile=None, prefetch_step=None, chunks_per_thread=None):
+  """Tune ND internals: lines tile size, prefetch lookahead, and chunking.
+
+  Pass ints or None. None leaves the underlying setting unchanged.
+  """
+  cdef size_t t = 0
+  cdef size_t p = 0
+  cdef size_t c = 0
+  if tile is not None:
+    t = <size_t>int(tile)
+  if prefetch_step is not None:
+    p = <size_t>int(prefetch_step)
+  if chunks_per_thread is not None:
+    c = <size_t>int(chunks_per_thread)
+  with nogil:
+    nd_set_tuning(t, p, c)
 
 ctypedef fused UINT:
   uint8_t
@@ -146,6 +165,9 @@ cdef extern from "edt.hpp" namespace "pyedt":
         INDEX* feat_out,
         int parallel
     ) nogil
+
+    # Tuning hook for ND threading/tiling
+    cdef void nd_set_tuning(size_t tile, size_t prefetch_step, size_t chunks_per_thread) nogil
 
     cdef void _nd_expand_init_labels_bases(
         uint8_t* seeds,
@@ -1617,6 +1639,33 @@ def edtsq_nd(
       arr1_u8 = arr.astype(np.uint8, copy=False)
       squared_edt_1d_multi_seg[native_bool](<native_bool*>&arr1_u8[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
     return out1.reshape(arr.shape)
+
+  # Auto-tune ND internals based on effective thread count (can be disabled)
+  cdef bint enable_autotune = True
+  try:
+    enable_autotune = bool(int(os.environ.get('EDT_ND_AUTOTUNE', '1')))
+  except Exception:
+    enable_autotune = True
+  if enable_autotune:
+    cdef int p_eff = parallel
+    try:
+      if p_eff <= 0:
+        p_eff = multiprocessing.cpu_count()
+      else:
+        p_eff = max(1, min(p_eff, multiprocessing.cpu_count()))
+    except Exception:
+      p_eff = max(1, parallel)
+    cdef size_t _tile = 0
+    cdef size_t _pref = 0
+    cdef size_t _chunks = 0
+    if p_eff <= 2:
+      _tile = <size_t>16; _pref = <size_t>2; _chunks = <size_t>3
+    elif p_eff == 4:
+      _tile = <size_t>8; _pref = <size_t>0; _chunks = <size_t>1
+    else:
+      _tile = <size_t>0; _pref = <size_t>0; _chunks = <size_t>0  # keep defaults
+    with nogil:
+      nd_set_tuning(_tile, _pref, _chunks)
 
   # voxel_graph is only defined for 2D/3D specialized APIs; ND core ignores it.
   if voxel_graph is not None:
