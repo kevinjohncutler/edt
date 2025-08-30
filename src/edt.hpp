@@ -327,6 +327,103 @@ void squared_edt_1d_parabolic(
   }
 }
 
+// Variant that also records the true argmin index per element (v[k]).
+inline void squared_edt_1d_parabolic_with_arg(
+    float* f,
+    const long int n,
+    const long int stride,
+    const float anisotropy,
+    const bool black_border_left,
+    const bool black_border_right,
+    int* arg_out
+  ) {
+  if (n == 0) return;
+  const float w2 = anisotropy * anisotropy;
+
+  int k = 0;
+  std::unique_ptr<int[]> v(new int[n]());
+  std::unique_ptr<float[]> ff(new float[n]());
+  for (long int i = 0; i < n; i++) ff[i] = f[i * stride];
+  std::unique_ptr<float[]> ranges(new float[n + 1]());
+  ranges[0] = -std::numeric_limits<float>::infinity();
+  ranges[1] = std::numeric_limits<float>::infinity();
+
+  float s; float factor1, factor2;
+  for (long int i = 1; i < n; i++) {
+    factor1 = (i - v[k]) * w2;
+    factor2 =  i + v[k];
+    s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+    while (k > 0 && s <= ranges[k]) {
+      k--;
+      factor1 = (i - v[k]) * w2;
+      factor2 =  i + v[k];
+      s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+    }
+    k++;
+    v[k] = i;
+    ranges[k] = s;
+    ranges[k + 1] = std::numeric_limits<float>::infinity();
+  }
+
+  k = 0;
+  float envelope;
+  for (long int i = 0; i < n; i++) {
+    while (ranges[k + 1] < i) k++;
+    f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
+    arg_out[i * stride] = v[k];
+    if (black_border_left && black_border_right) {
+      envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
+      f[i * stride] = std::fminf(envelope, f[i * stride]);
+    } else if (black_border_left) {
+      f[i * stride] = std::fminf(w2 * sq(i + 1), f[i * stride]);
+    } else if (black_border_right) {
+      f[i * stride] = std::fminf(w2 * sq(n - i), f[i * stride]);
+    }
+  }
+}
+
+inline void squared_edt_1d_parabolic_with_arg(
+    float* f,
+    const int n,
+    const long int stride,
+    const float anisotropy,
+    int* arg_out
+  ) {
+  if (n == 0) return;
+  const float w2 = anisotropy * anisotropy;
+  int k = 0;
+  std::unique_ptr<int[]> v(new int[n]());
+  std::unique_ptr<float[]> ff(new float[n]());
+  for (long int i = 0; i < n; i++) ff[i] = f[i * stride];
+  std::unique_ptr<float[]> ranges(new float[n + 1]());
+  ranges[0] = -std::numeric_limits<float>::infinity();
+  ranges[1] = std::numeric_limits<float>::infinity();
+  float s; float factor1, factor2;
+  for (long int i = 1; i < n; i++) {
+    factor1 = (i - v[k]) * w2;
+    factor2 =  i + v[k];
+    s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+    while (k > 0 && s <= ranges[k]) {
+      k--;
+      factor1 = (i - v[k]) * w2;
+      factor2 =  i + v[k];
+      s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+    }
+    k++;
+    v[k] = i;
+    ranges[k] = s;
+    ranges[k + 1] = std::numeric_limits<float>::infinity();
+  }
+  k = 0;
+  for (long int i = 0; i < n; i++) {
+    while (ranges[k + 1] < i) k++;
+    f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
+    arg_out[i * stride] = v[k];
+    float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
+    f[i * stride] = std::fminf(envelope, f[i * stride]);
+  }
+}
+
 void _squared_edt_1d_parabolic(
     float* f, 
     const int n, 
@@ -372,16 +469,23 @@ void squared_edt_1d_parabolic_multi_seg(
     segid = segids[i * stride];
     if (segid != working_segid) {
       if (working_segid != 0) {
-        _squared_edt_1d_parabolic(
-          f + last * stride,
-          i - last, stride, anisotropy,
-          (black_border || last > 0), true
-        );
         if (arg_out) {
-          // For each voxel in this run, write the starting index (last)
+          // true argmin indices (relative to run), then offset to absolute
+          squared_edt_1d_parabolic_with_arg(
+            f + last * stride,
+            i - last, stride, anisotropy,
+            (black_border || last > 0), true,
+            arg_out + last * stride
+          );
           for (int j = 0; j < i - last; ++j) {
-            arg_out[(last + j) * stride] = last;
+            arg_out[(last + j) * stride] += last;
           }
+        } else {
+          _squared_edt_1d_parabolic(
+            f + last * stride,
+            i - last, stride, anisotropy,
+            (black_border || last > 0), true
+          );
         }
       }
       working_segid = segid;
@@ -390,17 +494,34 @@ void squared_edt_1d_parabolic_multi_seg(
   }
 
   if (working_segid != 0 && last < n) {
-    _squared_edt_1d_parabolic(
-      f + last * stride,
-      n - last, stride, anisotropy,
-      (black_border || last > 0), black_border
-    );
     if (arg_out) {
+      squared_edt_1d_parabolic_with_arg(
+        f + last * stride,
+        n - last, stride, anisotropy,
+        (black_border || last > 0), black_border,
+        arg_out + last * stride
+      );
       for (int j = 0; j < n - last; ++j) {
-        arg_out[(last + j) * stride] = last;
+        arg_out[(last + j) * stride] += last;
       }
+    } else {
+      _squared_edt_1d_parabolic(
+        f + last * stride,
+        n - last, stride, anisotropy,
+        (black_border || last > 0), black_border
+      );
     }
   }
+}
+
+// Convenience wrapper to expose arg_out to Cython without changing the original name
+template <typename T>
+inline void squared_edt_1d_parabolic_multi_seg_with_arg(
+  T* segids, float* f,
+  const int n, const long int stride, const float anisotropy,
+  const bool black_border, int* arg_out
+) {
+  squared_edt_1d_parabolic_multi_seg<T>(segids, f, n, stride, anisotropy, black_border, arg_out);
 }
 
 /* Df(x,y,z) = min( wx^2 * (x-x')^2 + Df|x'(y,z) )
@@ -1311,18 +1432,15 @@ inline void _nd_pass_multi_bases(
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
-  const size_t TILE = ND_TILE;
+  const size_t TILE = 8;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
     pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
-        if (ND_PREFETCH_STEP > 0 && i + ND_PREFETCH_STEP < end) {
-          EDT_PREFETCH(labels + bases[i + ND_PREFETCH_STEP]);
-          EDT_PREFETCH(dest + bases[i + ND_PREFETCH_STEP]);
-        }
+        // Prefetch disabled for simplicity
         for (size_t j = i; j < t_end; ++j) {
           const size_t base = bases[j];
           squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
@@ -1345,21 +1463,295 @@ inline void _nd_pass_parabolic_bases(
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
-  const size_t TILE = ND_TILE;
+  const size_t TILE = 8;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
     pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
-        if (ND_PREFETCH_STEP > 0 && i + ND_PREFETCH_STEP < end) {
-          EDT_PREFETCH(labels + bases[i + ND_PREFETCH_STEP]);
-          EDT_PREFETCH(dest + bases[i + ND_PREFETCH_STEP]);
-        }
+        // Prefetch disabled for simplicity
         for (size_t j = i; j < t_end; ++j) {
           const size_t base = bases[j];
           squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+        }
+      }
+    });
+  }
+  pool.join();
+}
+
+// Odometer-style threaded pass (no base array; per-chunk init, then incrementally update base)
+template <typename T, typename KERNEL>
+inline void _nd_pass_odometer(
+    T* labels, float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel,
+    KERNEL kernel_call
+) {
+  size_t total = 1;
+  for (size_t d = 0; d < dims; ++d) total *= shape[d];
+  const size_t n = shape[ax];
+  if (n <= 1) return;
+  const size_t s = strides[ax];
+  const size_t lines = total / n;
+
+  // Build axis order (other axes) by increasing stride, tie-break larger extent
+  const size_t m = dims - 1;
+  std::vector<size_t> ord; ord.reserve(m);
+  for (size_t d = 0; d < dims; ++d) if (d != ax) ord.push_back(d);
+  std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b){
+    if (strides[a] == strides[b]) return shape[a] > shape[b];
+    return strides[a] < strides[b];
+  });
+  std::vector<size_t> rad(m);
+  for (size_t i = 0; i < m; ++i) rad[i] = shape[ord[i]];
+
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));
+  const size_t chunk = (lines + chunks - 1) / chunks;
+
+  for (size_t start = 0; start < lines; start += chunk) {
+    const size_t end = std::min(lines, start + chunk);
+    pool.enqueue([=]() {
+      // Initial index vector and base for this chunk
+      size_t tmp = start;
+      std::vector<size_t> idx(m, 0);
+      size_t base = 0;
+      for (size_t i = 0; i < m; ++i) {
+        if (rad[i] > 0) {
+          idx[i] = tmp % rad[i];
+          tmp /= rad[i];
+          base += idx[i] * strides[ord[i]];
+        }
+      }
+      const size_t count = end - start;
+      for (size_t c = 0; c < count; ++c) {
+        // call provided kernel
+        kernel_call(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+        // odometer increment over ord[0] fastest
+        for (size_t i = 0; i < m; ++i) {
+          ++idx[i];
+          base += strides[ord[i]];
+          if (idx[i] < rad[i]) break;
+          // reset and carry
+          base -= strides[ord[i]] * rad[i];
+          idx[i] = 0;
+        }
+      }
+    });
+  }
+  pool.join();
+}
+
+template <typename T>
+inline void _nd_pass_multi_odometer(
+    T* labels, float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel
+) {
+  auto kernel = [&](T* l, float* d, int n, long s, float an, bool bb){
+    squared_edt_1d_multi_seg<T>(l, d, n, s, an, bb);
+  };
+  _nd_pass_odometer<T>(labels, dest, dims, shape, strides, ax, anis, black_border, parallel, kernel);
+}
+
+template <typename T>
+inline void _nd_pass_parabolic_odometer(
+    T* labels, float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel
+) {
+  auto kernel = [&](T* l, float* d, int n, long s, float an, bool bb){
+    squared_edt_1d_parabolic_multi_seg<T>(l, d, n, s, an, bb);
+  };
+  _nd_pass_odometer<T>(labels, dest, dims, shape, strides, ax, anis, black_border, parallel, kernel);
+}
+
+// ------------------------------
+// ND expand labels (feature transform) helpers
+// ------------------------------
+
+template <typename INDEX=size_t>
+inline void _nd_expand_init_bases(
+    const uint8_t* seeds,
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    INDEX* feat_out,
+    const int parallel
+) {
+  if (n <= 1 || num_lines == 0) return;
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  const size_t chunk = (num_lines + chunks - 1) / chunks;
+  for (size_t start = 0; start < num_lines; start += chunk) {
+    const size_t end = std::min(num_lines, start + chunk);
+    pool.enqueue([=]() {
+      std::vector<int> arg(n);
+      for (size_t i = start; i < end; ++i) {
+        const size_t base = bases[i];
+        bool any_zero = false;
+        for (size_t j = 0; j < n; ++j) {
+          const bool seeded = (seeds[base + j * s] != 0);
+          dist[base + j * s] = seeded ? 0.0f : (std::numeric_limits<float>::max() / 4.0f);
+          any_zero |= (!seeded);
+        }
+        if (any_zero) {
+          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+        } else {
+          // all seeded: arg is identity
+          for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+        }
+        for (size_t j = 0; j < n; ++j) {
+          feat_out[base + j * s] = (INDEX)(base + (size_t)arg[j] * s);
+        }
+      }
+    });
+  }
+  pool.join();
+}
+
+template <typename INDEX=size_t>
+inline void _nd_expand_parabolic_bases(
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    const INDEX* feat_in,
+    INDEX* feat_out,
+    const int parallel
+) {
+  if (n <= 1 || num_lines == 0) return;
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  const size_t chunk = (num_lines + chunks - 1) / chunks;
+  for (size_t start = 0; start < num_lines; start += chunk) {
+    const size_t end = std::min(num_lines, start + chunk);
+    pool.enqueue([=]() {
+      std::vector<int> arg(n);
+      for (size_t i = start; i < end; ++i) {
+        const size_t base = bases[i];
+        bool any_nonzero = false;
+        for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
+        if (any_nonzero) {
+          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+        } else {
+          // all zeros: keep current feature mapping
+          for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+        }
+        for (size_t j = 0; j < n; ++j) {
+          feat_out[base + j * s] = feat_in[base + (size_t)arg[j] * s];
+        }
+      }
+    });
+  }
+  pool.join();
+}
+
+// Label-propagation versions to avoid full feature-index arrays when only labels are needed
+inline void _nd_expand_init_labels_bases(
+    const uint8_t* seeds,
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    const uint32_t* labelsp,
+    uint32_t* label_out,
+    const int parallel
+) {
+  if (n <= 1 || num_lines == 0) return;
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  const size_t chunk = (num_lines + chunks - 1) / chunks;
+  for (size_t start = 0; start < num_lines; start += chunk) {
+    const size_t end = std::min(num_lines, start + chunk);
+    pool.enqueue([=]() {
+      std::vector<int> arg(n);
+      for (size_t i = start; i < end; ++i) {
+        const size_t base = bases[i];
+        bool any_nonseed = false;
+        for (size_t j = 0; j < n; ++j) {
+          const bool seeded = (seeds[base + j * s] != 0);
+          dist[base + j * s] = seeded ? 0.0f : (std::numeric_limits<float>::max() / 4.0f);
+          any_nonseed |= (!seeded);
+        }
+        if (any_nonseed) {
+          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+        } else {
+          for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+        }
+        for (size_t j = 0; j < n; ++j) {
+          label_out[base + j * s] = labelsp[base + (size_t)arg[j] * s];
+        }
+      }
+    });
+  }
+  pool.join();
+}
+
+inline void _nd_expand_parabolic_labels_bases(
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    const uint32_t* label_in,
+    uint32_t* label_out,
+    const int parallel
+) {
+  if (n <= 1 || num_lines == 0) return;
+  const int threads = std::max(1, parallel);
+  ThreadPool pool(threads);
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  const size_t chunk = (num_lines + chunks - 1) / chunks;
+  for (size_t start = 0; start < num_lines; start += chunk) {
+    const size_t end = std::min(num_lines, start + chunk);
+    pool.enqueue([=]() {
+      std::vector<int> arg(n);
+      for (size_t i = start; i < end; ++i) {
+        const size_t base = bases[i];
+        bool any_nonzero = false;
+        for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
+        if (any_nonzero) {
+          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+        } else {
+          for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+        }
+        for (size_t j = 0; j < n; ++j) {
+          label_out[base + j * s] = label_in[base + (size_t)arg[j] * s];
         }
       }
     });

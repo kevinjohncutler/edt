@@ -99,6 +99,81 @@ cdef extern from "edt.hpp" namespace "pyedt":
         native_bool black_border
         ) nogil
 
+    cdef void squared_edt_1d_parabolic_with_arg(
+        float *f,
+        int n,
+        int stride,
+        float anisotropy,
+        native_bool black_border_left,
+        native_bool black_border_right,
+        int* arg_out
+        ) nogil
+
+    # Expose variant that returns argmin indices along the processed axis
+    cdef void squared_edt_1d_parabolic_multi_seg_with_arg[T](
+        T *labels,
+        float *dest,
+        int n,
+        int stride,
+        float anisotropy,
+        native_bool black_border,
+        int* arg_out
+        ) nogil
+
+    # ND expand helpers (threaded per-axis over precomputed bases)
+    cdef void _nd_expand_init_bases[INDEX](
+        uint8_t* seeds,
+        float* dist,
+        size_t* bases,
+        size_t num_lines,
+        size_t n,
+        size_t s,
+        float anis,
+        native_bool black_border,
+        INDEX* feat_out,
+        int parallel
+    ) nogil
+
+    cdef void _nd_expand_parabolic_bases[INDEX](
+        float* dist,
+        size_t* bases,
+        size_t num_lines,
+        size_t n,
+        size_t s,
+        float anis,
+        native_bool black_border,
+        INDEX* feat_in,
+        INDEX* feat_out,
+        int parallel
+    ) nogil
+
+    cdef void _nd_expand_init_labels_bases(
+        uint8_t* seeds,
+        float* dist,
+        size_t* bases,
+        size_t num_lines,
+        size_t n,
+        size_t s,
+        float anis,
+        native_bool black_border,
+        uint32_t* labelsp,
+        uint32_t* label_out,
+        int parallel
+    ) nogil
+
+    cdef void _nd_expand_parabolic_labels_bases(
+        float* dist,
+        size_t* bases,
+        size_t num_lines,
+        size_t n,
+        size_t s,
+        float anis,
+        native_bool black_border,
+        uint32_t* label_in,
+        uint32_t* label_out,
+        int parallel
+    ) nogil
+
     # Updated _edt2dsq and _edt3dsq to allow optional feature tracking
     cdef float* _edt2dsq[T, OUTIDX](
         T* labels,
@@ -153,6 +228,18 @@ cdef extern from "edt.hpp" namespace "pyedt":
         float* output_dt, OUTIDX* output_feat
     ) nogil
 
+    # Odometer threaded passes (no base arrays)
+    cdef void _nd_pass_multi_odometer[T](
+        T* labels, float* dest,
+        size_t dims, size_t* shape, size_t* strides,
+        size_t ax, float anis, native_bool black_border, int parallel
+    ) nogil
+    cdef void _nd_pass_parabolic_odometer[T](
+        T* labels, float* dest,
+        size_t dims, size_t* shape, size_t* strides,
+        size_t ax, float anis, native_bool black_border, int parallel
+    ) nogil
+
     cdef float* _edt3dsq_with_features[T, OUTIDX](
         T* input, size_t sx, size_t sy, size_t sz,
         float wx, float wy, float wz,
@@ -185,8 +272,6 @@ cdef extern from "edt.hpp" namespace "pyedt":
         float anis, native_bool black_border, int parallel
     ) nogil
 
-    # Tuning setter
-    cdef void nd_set_tuning(size_t tile, size_t prefetch_step, size_t chunks_per_thread) nogil
 
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
   cdef float* _edt2dsq_voxel_graph[T,GRAPH_TYPE](
@@ -655,8 +740,8 @@ def expand_labels(
   # --- Cython variable declarations for all branches ---
   cdef Py_ssize_t n1
   cdef np.ndarray[np.uint32_t, ndim=1] out1
-  cdef np.ndarray pos
-  cdef np.ndarray mids
+  cdef np.ndarray seed_pos
+  cdef np.ndarray mids_arr
   cdef Py_ssize_t i
   cdef Py_ssize_t k
   cdef Py_ssize_t s
@@ -706,36 +791,27 @@ def expand_labels(
 
   # 2D
   if dims == 2:
-    # Fast NumPy-based implementation
-    out2 = np.zeros_like(arr)
-    
-    # Find all seed positions and their labels
-    seed_positions = np.argwhere(arr != 0)
-    if len(seed_positions) == 0:
-      return out2
-    
-    seed_labels = arr[seed_positions[:, 0], seed_positions[:, 1]]
-    
-    # Create coordinate grids
-    y_coords, x_coords = np.mgrid[0:arr.shape[0], 0:arr.shape[1]]
-    
-    # For each seed, calculate distances to all pixels
-    min_distances = np.full((arr.shape[0], arr.shape[1]), np.inf)
-    nearest_labels = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint32)
-    
-    for i, (y, x) in enumerate(seed_positions):
-      distances = (y_coords - y)**2 + (x_coords - x)**2
-      mask = distances < min_distances
-      min_distances[mask] = distances[mask]
-      nearest_labels[mask] = seed_labels[i]
-    
-    # Set seed positions to their original values
-    out2[seed_positions[:, 0], seed_positions[:, 1]] = seed_labels
-    
-    # Set non-seed positions to nearest label
-    seed_mask = arr != 0
-    out2[~seed_mask] = nearest_labels[~seed_mask]
-    
+    # Optimized path using C++ feature transform kernels (like 3D)
+    sx = arr.shape[1]
+    sy = arr.shape[0]
+    out2 = np.empty((sy, sx), dtype=np.uint32)
+    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
+    # Create label_values as a 1D array of the original array values (for indexing)
+    label_values = arr.ravel().astype(np.uint32, order='C')
+    feat_idx2 = np.empty((sy, sx), dtype=np.uint32)
+    seeds2_view = seeds2
+    feat_idx2_view = feat_idx2
+    label_values_view = label_values
+    _expand2d_u32[uint8_t](
+        <uint8_t*>&seeds2_view[0, 0],
+        <size_t>sx, <size_t>sy,
+        <float>anis[1], <float>anis[0],
+        bb, parallel,
+        <uint32_t*>&feat_idx2_view[0, 0],
+        <const uint32_t*>&label_values_view[0]
+    )
+    # Map feature indices to label values
+    out2.ravel()[:] = label_values[feat_idx2.ravel()]
     return out2
 
   # 3D
@@ -748,6 +824,7 @@ def expand_labels(
     seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
     # Create label_values as a 1D array of the original array values (for indexing)
     label_values = arr.ravel().astype(np.uint32, order='C')
+    label_values_view = label_values
     # Allocate a temporary feature index buffer
     feat_idx3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
     seeds3_view = seeds3
@@ -763,7 +840,404 @@ def expand_labels(
     )
     # Map feature indices to label values
     out3.ravel()[:] = label_values[feat_idx3.ravel()]
-    return out3
+  return out3
+
+
+@cython.binding(True)
+def expand_labels_nd(
+    data, anisotropy=None, black_border=False,
+    int parallel=1, voxel_graph=None, return_features=False
+  ):
+  """Expand nonzero labels to zeros by nearest-neighbor in Euclidean metric (ND).
+
+  This is a unified ND implementation (1D, 2D, 3D, …) that performs an
+  in-place multi-axis lower-envelope transform with true argmin tracking.
+  It early-exits trivial lines (all seeds on axis 0; all zeros on later axes)
+  and, by default, propagates labels directly (no full feature map) for speed.
+
+  Parameters
+  ----------
+  data : ndarray
+      Input array; nonzero elements are seeds whose values are the labels.
+      Any integer dtype is accepted; internally cast to uint32 for labels.
+  anisotropy : float or sequence of float, optional
+      Per-axis voxel size (default 1.0 for all axes).
+  black_border : bool, optional
+      If True, treat the border as background (default False).
+  parallel : int, optional
+      Number of threads; if <= 0, uses cpu_count().
+  voxel_graph : ignored
+      Present for API parity; not used in ND path.
+  return_features : bool, optional
+      If True, also return the feature (nearest-seed linear index) array.
+
+  Returns
+  -------
+  labels : ndarray, dtype=uint32
+      Expanded labels, same shape as input.
+  features : ndarray, optional
+      If return_features=True, the nearest-seed linear indices (uint32 or uintp)
+      as a second return value.
+  """
+  cdef np.ndarray[np.uint32_t, ndim=1] out1
+  cdef np.ndarray pos
+  cdef np.ndarray mids
+  cdef Py_ssize_t i = 0
+  cdef Py_ssize_t k = 0
+  cdef Py_ssize_t s
+  # Declarations for optional feature-return path
+  cdef np.ndarray feat_prev
+  cdef np.ndarray feat_next
+  cdef np.ndarray tmpF
+  cdef uint32_t* fprev_u32
+  cdef uint32_t* fnext_u32
+  cdef size_t* fprev_sz
+  cdef size_t* fnext_sz
+  cdef np.ndarray[np.uint32_t, ndim=1] out_flat
+  cdef np.uint32_t* outp
+  cdef np.uint32_t* labp2
+  cdef size_t idx2
+
+  if parallel <= 0:
+    try:
+      parallel = multiprocessing.cpu_count()
+    except Exception:
+      parallel = 1
+  else:
+    try:
+      parallel = max(1, min(parallel, multiprocessing.cpu_count()))
+    except Exception:
+      parallel = max(1, parallel)
+
+  arr = np.require(data, dtype=np.uint32, requirements='C')
+  dims = arr.ndim
+  # Build anisotropy tuple
+  cdef tuple anis
+  if anisotropy is None:
+    anis = (1.0,) * dims
+  else:
+    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
+    if len(anis) != dims:
+      raise ValueError('anisotropy length must match data.ndim')
+  if dims == 1:
+    # reuse 1D midpoint selection from expand_labels 1D branch
+    n1 = arr.shape[0]
+    out1 = np.empty((n1,), dtype=np.uint32)
+    seed_pos = np.flatnonzero(arr)
+    if seed_pos.size == 0:
+      out1.fill(0)
+      return (out1, np.zeros((n1,), dtype=np.uintp)) if return_features else out1
+    if seed_pos.size == 1:
+      out1.fill(<np.uint32_t>arr[int(seed_pos[0])])
+      if return_features:
+        feat1 = np.full((n1,), int(seed_pos[0]), dtype=np.uintp)
+        return out1, feat1
+      return out1
+    mids_arr = (seed_pos[:-1] + seed_pos[1:]) * 0.5
+    for i in range(n1):
+      while k < mids_arr.size and i >= mids_arr[k]:
+        k += 1
+      s = <Py_ssize_t>seed_pos[min(k, seed_pos.size-1)]
+      out1[i] = <np.uint32_t>arr[s]
+    if return_features:
+      feat1 = np.empty((n1,), dtype=np.uintp)
+      k = 0
+      for i in range(n1):
+        while k < mids_arr.size and i >= mids_arr[k]:
+          k += 1
+        feat1[i] = <Py_ssize_t>seed_pos[min(k, seed_pos.size-1)]
+      return out1, feat1
+    return out1
+  elif dims == 2 or dims == 3:
+    pass  # fall through to general ND implementation
+  else:
+    pass  # general ND implementation
+
+  # General ND implementation (dims >= 2)
+  cdef native_bool bb = black_border
+  # Work with C-contiguous buffer
+  if not arr.flags.c_contiguous:
+    arr = np.ascontiguousarray(arr)
+  cdef np.ndarray[np.uint8_t, ndim=1] seeds_flat = (arr.ravel(order='K') != 0).astype(np.uint8, order='C')
+  cdef np.ndarray[np.uint32_t, ndim=1] labels_flat = arr.ravel(order='K').astype(np.uint32, order='C')
+  cdef Py_ssize_t nd = arr.ndim
+  cdef tuple shape = arr.shape
+  # element strides for C-order
+  cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
+  cdef size_t* cstrides = <size_t*> malloc(nd * sizeof(size_t))
+  cdef Py_ssize_t* paxes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
+  cdef float* canis = <float*> malloc(nd * sizeof(float))
+  if cshape == NULL or cstrides == NULL or paxes == NULL or canis == NULL:
+    if cshape != NULL: free(cshape)
+    if cstrides != NULL: free(cstrides)
+    if paxes != NULL: free(paxes)
+    if canis != NULL: free(canis)
+    raise MemoryError('Allocation failure in expand_labels_nd')
+  cdef Py_ssize_t i_ax
+  cdef Py_ssize_t ii
+  for ii in range(nd):
+    cshape[ii] = <size_t>shape[ii]
+    canis[ii] = <float>anis[ii]
+  # C-order strides
+  cstrides[nd-1] = 1
+  for ii in range(nd-2, -1, -1):
+    cstrides[ii] = cstrides[ii+1] * cshape[ii+1]
+  # Determine pass axis order by increasing stride, tie-break larger extent
+  for ii in range(nd): paxes[ii] = ii
+  cdef Py_ssize_t j
+  cdef Py_ssize_t keyi
+  for ii in range(1, nd):
+    keyi = paxes[ii]
+    j = ii - 1
+    while j >= 0 and (cstrides[paxes[j]] > cstrides[keyi] or (cstrides[paxes[j]] == cstrides[keyi] and cshape[paxes[j]] < cshape[keyi])):
+      paxes[j+1] = paxes[j]
+      j -= 1
+    paxes[j+1] = keyi
+
+  # Allocate work buffers
+  cdef size_t total = 1
+  for ii in range(nd): total *= cshape[ii]
+  cdef np.ndarray[np.float32_t, ndim=1] dist = np.empty((total,), dtype=np.float32)
+  cdef float* distp = <float*> np.PyArray_DATA(dist)
+  # Allocate either label propagation buffers or feature buffers
+  cdef bint use_u32_feat = (total < (1<<32))
+  cdef np.ndarray[np.uint32_t, ndim=1] lab_prev
+  cdef np.ndarray[np.uint32_t, ndim=1] lab_next
+  cdef np.ndarray[np.uint32_t, ndim=1] tmpL
+  cdef uint32_t* labp = <uint32_t*> np.PyArray_DATA(labels_flat)
+  cdef uint32_t* lprev
+  cdef uint32_t* lnext
+  feat_prev = None
+  feat_next = None
+  tmpF = None
+  fprev_u32 = NULL
+  fnext_u32 = NULL
+  fprev_sz = NULL
+  fnext_sz = NULL
+  if return_features:
+    if use_u32_feat:
+      feat_prev = np.empty((total,), dtype=np.uint32)
+      feat_next = np.empty((total,), dtype=np.uint32)
+      fprev_u32 = <uint32_t*> np.PyArray_DATA(feat_prev)
+      fnext_u32 = <uint32_t*> np.PyArray_DATA(feat_next)
+    else:
+      feat_prev = np.empty((total,), dtype=np.uintp)
+      feat_next = np.empty((total,), dtype=np.uintp)
+      fprev_sz = <size_t*> np.PyArray_DATA(feat_prev)
+      fnext_sz = <size_t*> np.PyArray_DATA(feat_next)
+  else:
+    lab_prev = np.empty((total,), dtype=np.uint32)
+    lab_next = np.empty((total,), dtype=np.uint32)
+    lprev = <uint32_t*> np.PyArray_DATA(lab_prev)
+    lnext = <uint32_t*> np.PyArray_DATA(lab_next)
+  cdef uint8_t* seedsp = <uint8_t*> np.PyArray_DATA(seeds_flat)
+  cdef uint32_t* labelsp = <uint32_t*> np.PyArray_DATA(labels_flat)
+
+  # Axis 0 pass (threaded)
+  cdef Py_ssize_t ax0 = paxes[0]
+  cdef size_t n0 = cshape[ax0]
+  cdef size_t s0 = cstrides[ax0]
+  cdef size_t lines = total // n0
+  # Precompute maximum lines across all passes to size bases safely
+  cdef size_t max_lines = lines
+  for ii in range(1, nd):
+    if total // cshape[paxes[ii]] > max_lines:
+      max_lines = total // cshape[paxes[ii]]
+  cdef size_t* bases = <size_t*> malloc(max_lines * sizeof(size_t))
+  if bases == NULL:
+    free(cshape); free(cstrides); free(paxes); free(canis)
+    raise MemoryError('Allocation failure for bases')
+  # Build ord (other axes) by increasing stride
+  cdef Py_ssize_t ord_len = nd - 1
+  cdef Py_ssize_t* ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
+  if ord == NULL:
+    free(bases); free(cshape); free(cstrides); free(paxes); free(canis)
+    raise MemoryError('Allocation failure for ord')
+  cdef Py_ssize_t ord_pos = 0
+  for ii in range(nd):
+    if ii != ax0:
+      ord[ord_pos] = ii
+      ord_pos += 1
+  for i_ax in range(1, ord_len):
+    keyi = ord[i_ax]
+    j = i_ax - 1
+    while j >= 0 and (cstrides[ord[j]] > cstrides[keyi] or (cstrides[ord[j]] == cstrides[keyi] and cshape[ord[j]] < cshape[keyi])):
+      ord[j+1] = ord[j]
+      j -= 1
+    ord[j+1] = keyi
+  cdef size_t il
+  cdef size_t base_b
+  cdef size_t tmp_b
+  cdef size_t coord_b
+  with nogil:
+    for il in range(lines):
+      base_b = 0
+      tmp_b = il
+      for j in range(ord_len):
+        coord_b = tmp_b % cshape[ord[j]]
+        base_b += coord_b * cstrides[ord[j]]
+        tmp_b //= cshape[ord[j]]
+      bases[il] = base_b
+  if return_features:
+    with nogil:
+      if use_u32_feat:
+        _nd_expand_init_bases[uint32_t](seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, fprev_u32, parallel)
+      else:
+        _nd_expand_init_bases[size_t](seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, fprev_sz, parallel)
+  else:
+    with nogil:
+      _nd_expand_init_labels_bases(seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, labp, lprev, parallel)
+
+  # Remaining axes
+  cdef Py_ssize_t a
+  for a in range(1, nd):
+    lines = total // cshape[paxes[a]]
+    # rebuild ord for this axis
+    free(ord)
+    ord_len = nd - 1
+    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
+    if ord == NULL:
+      free(bases); free(cshape); free(cstrides); free(paxes); free(canis)
+      raise MemoryError('Allocation failure for ord')
+    ord_pos = 0
+    for ii in range(nd):
+      if ii != paxes[a]:
+        ord[ord_pos] = ii
+        ord_pos += 1
+    for i_ax in range(1, ord_len):
+      keyi = ord[i_ax]
+      j = i_ax - 1
+      while j >= 0 and (cstrides[ord[j]] > cstrides[keyi] or (cstrides[ord[j]] == cstrides[keyi] and cshape[ord[j]] < cshape[keyi])):
+        ord[j+1] = ord[j]
+        j -= 1
+      ord[j+1] = keyi
+    # recompute bases for this axis
+    with nogil:
+      for il in range(lines):
+        base_b = 0
+        tmp_b = il
+        for j in range(ord_len):
+          coord_b = tmp_b % cshape[ord[j]]
+          base_b += coord_b * cstrides[ord[j]]
+          tmp_b //= cshape[ord[j]]
+        bases[il] = base_b
+    # threaded parabolic pass for this axis
+    n0 = cshape[paxes[a]]
+    s0 = cstrides[paxes[a]]
+    if return_features:
+      with nogil:
+        if use_u32_feat:
+          _nd_expand_parabolic_bases[uint32_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_u32, fnext_u32, parallel)
+        else:
+          _nd_expand_parabolic_bases[size_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_sz, fnext_sz, parallel)
+      # swap features
+      tmpF = feat_prev; feat_prev = feat_next; feat_next = tmpF
+      if use_u32_feat:
+        fprev_u32 = <uint32_t*> np.PyArray_DATA(feat_prev)
+        fnext_u32 = <uint32_t*> np.PyArray_DATA(feat_next)
+      else:
+        fprev_sz = <size_t*> np.PyArray_DATA(feat_prev)
+        fnext_sz = <size_t*> np.PyArray_DATA(feat_next)
+    else:
+      with nogil:
+        _nd_expand_parabolic_labels_bases(distp, bases, lines, n0, s0, canis[paxes[a]], bb, lprev, lnext, parallel)
+      # swap labels
+      tmpL = lab_prev; lab_prev = lab_next; lab_next = tmpL
+      lprev = <uint32_t*> np.PyArray_DATA(lab_prev)
+      lnext = <uint32_t*> np.PyArray_DATA(lab_next)
+
+  free(bases); free(ord); free(cshape); free(cstrides); free(paxes); free(canis)
+  if return_features:
+    # Map features to label values and return both
+    out_flat = np.empty((total,), dtype=np.uint32)
+    outp = <np.uint32_t*> np.PyArray_DATA(out_flat)
+    labp2 = <np.uint32_t*> np.PyArray_DATA(labels_flat)
+    if use_u32_feat:
+      for il in range(total):
+        idx2 = fprev_u32[il]
+        outp[il] = labp2[idx2]
+    else:
+      for il in range(total):
+        idx2 = fprev_sz[il]
+        outp[il] = labp2[idx2]
+    return out_flat.reshape(arr.shape), feat_prev.reshape(arr.shape)
+  else:
+    return lab_prev.reshape(arr.shape)
+
+
+@cython.binding(True)
+def feature_transform_nd(
+    data, anisotropy=None, black_border=False,
+    int parallel=1, voxel_graph=None,
+    return_distances=False, features_dtype='auto'
+  ):
+  """ND feature transform (nearest seed) with optional squared distances.
+
+  Parameters
+  ----------
+  data : ndarray
+      Seed image (nonzero are seeds). Any numeric dtype accepted.
+  anisotropy : float or sequence of float, optional
+      Per-axis voxel size (default 1.0 for all axes).
+  black_border : bool, optional
+      If True, treat the border as background (default False).
+  parallel : int, optional
+      Number of threads; if <= 0, uses cpu_count().
+  voxel_graph : ignored
+      Present for API parity; not used in ND path.
+  return_distances : bool, optional
+      If True, also return squared EDT of the seed mask.
+  features_dtype : {'auto','uint32','u32','uintp'}, optional
+      Output dtype for feature indices; 'auto' picks uint32 if fits, else uintp.
+
+  Returns
+  -------
+  feat : ndarray of uint32 or uintp
+      Linear index of nearest seed for each voxel.
+  dist : ndarray of float32, optional
+      Squared Euclidean distance, if return_distances=True.
+  """
+  arr = np.asarray(data)
+  if arr.size == 0:
+    if return_distances:
+      return np.zeros_like(arr, dtype=np.uintp), np.zeros_like(arr, dtype=np.float32)
+    return np.zeros_like(arr, dtype=np.uintp)
+
+  dims = arr.ndim
+  if anisotropy is None:
+    anis = (1.0,) * dims
+  else:
+    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
+    if len(anis) != dims:
+      raise ValueError('anisotropy length must match data.ndim')
+  if parallel <= 0:
+    try:
+      parallel = multiprocessing.cpu_count()
+    except Exception:
+      parallel = 1
+  else:
+    try:
+      parallel = max(1, min(parallel, multiprocessing.cpu_count()))
+    except Exception:
+      parallel = max(1, parallel)
+
+  # Use ND expand path with feature return on original array (nonzero=seeds)
+  labels, feats = expand_labels_nd(arr.astype(np.uint32, copy=False), anis, black_border, parallel, voxel_graph, True)
+
+  voxels = arr.size
+  if isinstance(features_dtype, str):
+    fd = features_dtype.lower()
+    if fd in ('uint32', 'u32'):
+      feats = feats.astype(np.uint32, copy=False)
+    elif fd == 'uintp':
+      feats = feats.astype(np.uintp, copy=False)
+    else:
+      feats = feats.astype(np.uint32 if voxels < 2**32 else np.uintp, copy=False)
+
+  if return_distances:
+    dist = edtsq_nd((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel, voxel_graph)
+    return feats, dist
+  return feats
 
 
 def edt1d(data, anisotropy=1.0, native_bool black_border=False):
@@ -1107,6 +1581,43 @@ def edtsq_nd(
     if len(anis) != dims:
       raise ValueError('anisotropy length must match data.ndim')
 
+  # Declarations for optional 1D fast-path
+  cdef uint8_t[:] arr1_u8
+  cdef uint16_t[:] arr1_u16
+  cdef uint32_t[:] arr1_u32
+  cdef uint64_t[:] arr1_u64
+  cdef float[:] arr1_f32
+  cdef double[:] arr1_f64
+  cdef np.ndarray[float, ndim=1] out1
+  cdef float[:] out1_view
+
+  # Fast-path: 1D do inline specialized kernel (no external call)
+  if dims == 1:
+    out1 = np.zeros((arr.size,), dtype=np.float32)
+    out1_view = out1
+    if arr.dtype in (np.uint8, np.int8):
+      arr1_u8 = arr.astype(np.uint8, copy=False)
+      squared_edt_1d_multi_seg[uint8_t](<uint8_t*>&arr1_u8[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    elif arr.dtype in (np.uint16, np.int16):
+      arr1_u16 = arr.astype(np.uint16, copy=False)
+      squared_edt_1d_multi_seg[uint16_t](<uint16_t*>&arr1_u16[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    elif arr.dtype in (np.uint32, np.int32):
+      arr1_u32 = arr.astype(np.uint32, copy=False)
+      squared_edt_1d_multi_seg[uint32_t](<uint32_t*>&arr1_u32[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    elif arr.dtype in (np.uint64, np.int64):
+      arr1_u64 = arr.astype(np.uint64, copy=False)
+      squared_edt_1d_multi_seg[uint64_t](<uint64_t*>&arr1_u64[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    elif arr.dtype == np.float32:
+      arr1_f32 = arr
+      squared_edt_1d_multi_seg[float](<float*>&arr1_f32[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    elif arr.dtype == np.float64:
+      arr1_f64 = arr
+      squared_edt_1d_multi_seg[double](<double*>&arr1_f64[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    elif arr.dtype == bool:
+      arr1_u8 = arr.astype(np.uint8, copy=False)
+      squared_edt_1d_multi_seg[native_bool](<native_bool*>&arr1_u8[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
+    return out1.reshape(arr.shape)
+
   # voxel_graph is only defined for 2D/3D specialized APIs; ND core ignores it.
   if voxel_graph is not None:
     raise TypeError('voxel_graph is only supported by 2D/3D specialized APIs')
@@ -1175,6 +1686,12 @@ def edtsq_nd(
   cdef size_t kk
   cdef size_t kk2
   cdef size_t lines
+  # Max number of lines among all passes; used to size bases buffer safely.
+  cdef size_t max_lines = 0
+  for ii2 in range(nd):
+    lines = tot // <size_t>cshape[paxes[ii2]]
+    if lines > max_lines:
+      max_lines = lines
   cdef size_t* bases
   cdef Py_ssize_t a
   cdef size_t il
@@ -1189,7 +1706,7 @@ def edtsq_nd(
   if arr.dtype in (np.uint8, np.int8):
     # Precompute bases for axis 0 and run threaded multi pass
     lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
+    bases = <size_t*> malloc(max_lines * sizeof(size_t))
     if bases == NULL:
       free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
       raise MemoryError('Allocation failure for bases')
@@ -1280,7 +1797,7 @@ def edtsq_nd(
             outp[kk2] = INFINITY
   elif arr.dtype in (np.uint16, np.int16):
     lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
+    bases = <size_t*> malloc(max_lines * sizeof(size_t))
     if bases == NULL:
       free(cshape); free(cstrides); free(caxes); free(canis)
       raise MemoryError('Allocation failure for bases')
@@ -1362,7 +1879,7 @@ def edtsq_nd(
             outp[kk2] = INFINITY
   elif arr.dtype in (np.uint32, np.int32):
     lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
+    bases = <size_t*> malloc(max_lines * sizeof(size_t))
     if bases == NULL:
       free(cshape); free(cstrides); free(caxes); free(canis)
       raise MemoryError('Allocation failure for bases')
@@ -1442,7 +1959,7 @@ def edtsq_nd(
             outp[kk2] = INFINITY
   elif arr.dtype in (np.uint64, np.int64):
     lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
+    bases = <size_t*> malloc(max_lines * sizeof(size_t))
     if bases == NULL:
       free(cshape); free(cstrides); free(caxes); free(canis)
       raise MemoryError('Allocation failure for bases')
@@ -2259,15 +2776,6 @@ def edt_nd(
   res = edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
   return np.sqrt(res, res)
 
-@cython.binding(True)
-def set_nd_tuning(tile: int = 0, prefetch: int = 0, chunks_per_thread: int = 0):
-  """Adjust internal ND tuning (experimental).
-
-  tile: lines per inner tile (0 = keep current)
-  prefetch: lookahead lines for prefetch (0 = keep current)
-  chunks_per_thread: chunks per thread (0 = keep current)
-  """
-  nd_set_tuning(<size_t>tile, <size_t>prefetch, <size_t>chunks_per_thread)
 
 def edt3d(
     data, anisotropy=(1.0, 1.0, 1.0), 

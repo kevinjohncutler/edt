@@ -128,10 +128,18 @@ inline void ThreadPool::join () {
         stop = true;
     }
     condition.notify_all();
-    for(std::thread &worker: workers)
-        worker.join();
+    for(std::thread &worker: workers) {
+        if (worker.joinable()) {
+            try { worker.join(); } catch(...) { /* swallow */ }
+        }
+    }
 
     workers.clear();
+    // clear any remaining tasks to avoid destructor-time aborts
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        while(!tasks.empty()) tasks.pop();
+    }
 }
 
 // the destructor joins all threads
