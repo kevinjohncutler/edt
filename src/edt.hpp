@@ -1355,7 +1355,7 @@ inline void _nd_pass_multi(
 
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (lines + chunks - 1) / chunks;
 
   for (size_t start = 0; start < lines; start += chunk) {
@@ -1397,7 +1397,8 @@ inline void _nd_pass_parabolic(
 
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));
+  // Allow finer task granularity: more than one chunk per thread when helpful
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (lines + chunks - 1) / chunks;
 
   for (size_t start = 0; start < lines; start += chunk) {
@@ -1533,7 +1534,10 @@ inline void _nd_pass_odometer(
     pool.enqueue([=]() {
       // Initial index vector and base for this chunk
       size_t tmp = start;
+      const size_t TILE = ND_TILE > 0 ? ND_TILE : 8;
       std::vector<size_t> idx(m, 0);
+      std::vector<size_t> sim_idx(m, 0);
+      std::vector<size_t> bases_tile(TILE);
       size_t base = 0;
       for (size_t i = 0; i < m; ++i) {
         if (rad[i] > 0) {
@@ -1543,18 +1547,37 @@ inline void _nd_pass_odometer(
         }
       }
       const size_t count = end - start;
-      for (size_t c = 0; c < count; ++c) {
-        // call provided kernel
-        kernel_call(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
-        // odometer increment over ord[0] fastest
-        for (size_t i = 0; i < m; ++i) {
-          ++idx[i];
-          base += strides[ord[i]];
-          if (idx[i] < rad[i]) break;
-          // reset and carry
-          base -= strides[ord[i]] * rad[i];
-          idx[i] = 0;
+      size_t cdone = 0;
+      while (cdone < count) {
+        const size_t tcount = std::min(TILE, count - cdone);
+        size_t sim_base = base;
+        sim_idx = idx;
+        for (size_t t = 0; t < tcount; ++t) {
+          bases_tile[t] = sim_base;
+          // increment sim state
+          for (size_t i = 0; i < m; ++i) {
+            ++sim_idx[i];
+            sim_base += strides[ord[i]];
+            if (sim_idx[i] < rad[i]) break;
+            sim_base -= strides[ord[i]] * rad[i];
+            sim_idx[i] = 0;
+          }
         }
+        // Execute tile with optional prefetch
+        for (size_t t = 0; t < tcount; ++t) {
+          if (ND_PREFETCH_STEP > 0) {
+            const size_t pre = t + ND_PREFETCH_STEP;
+            if (pre < tcount) {
+              EDT_PREFETCH(labels + bases_tile[pre]);
+            }
+          }
+          const size_t b = bases_tile[t];
+          kernel_call(labels + b, dest + b, (int)n, (long int)s, anis, black_border);
+        }
+        // Commit sim state for next tile
+        base = sim_base;
+        idx.swap(sim_idx);
+        cdone += tcount;
       }
     });
   }

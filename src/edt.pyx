@@ -41,6 +41,10 @@ np.import_array()
 
 import numpy as np
 import os
+import time
+
+
+_nd_profile_last = None
 
 @cython.binding(True)
 def nd_tuning(tile=None, prefetch_step=None, chunks_per_thread=None):
@@ -281,18 +285,7 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t ax, float anis, native_bool black_border, int parallel
     ) nogil
 
-    cdef void _nd_pass_multi_bases[T](
-        T* labels, float* dest,
-        size_t* bases, size_t num_lines,
-        size_t n, size_t s,
-        float anis, native_bool black_border, int parallel
-    ) nogil
-    cdef void _nd_pass_parabolic_bases[T](
-        T* labels, float* dest,
-        size_t* bases, size_t num_lines,
-        size_t n, size_t s,
-        float anis, native_bool black_border, int parallel
-    ) nogil
+    # Deprecated base-enumeration ND passes removed in favor of odometer passes
 
 
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
@@ -322,10 +315,89 @@ cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
     size_t voxels
   ) except +
 
+# Compact tuning chooser for ND (dims >= 4) based on effective threads.
+cdef inline void _nd_pick_tuning(int p_eff, size_t* tile, size_t* pref, size_t* chunks) nogil:
+  if p_eff < 16:
+    if p_eff > 2:
+      tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
+    else:
+      tile[0] = <size_t>16; pref[0] = <size_t>2; chunks[0] = <size_t>3
+  elif p_eff < 20:
+    tile[0] = <size_t>32; pref[0] = <size_t>2; chunks[0] = <size_t>3
+  else:
+    tile[0] = <size_t>16; pref[0] = <size_t>0; chunks[0] = <size_t>3
+
+# Dim/size-aware tuning (compact) for 2D/3D and general ND
+cdef inline void _nd_pick_tuning_dim(int dims, int sc, int p_eff, size_t* tile, size_t* pref, size_t* chunks) nogil:
+  # sc: size class (2D: 0=tiny<=64^2,1=small<=128^2,2=med<=512^2,3=large; 3D: 0<=32,1<=48,2<=64,3=large)
+  if dims == 2:
+    if sc <= 2:  # tiny/small/medium
+      tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
+    else:  # large
+      if p_eff >= 16:
+        tile[0] = <size_t>32; pref[0] = <size_t>2; chunks[0] = <size_t>3
+      else:
+        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
+  elif dims == 3:
+    if sc == 0:  # <=32
+      if p_eff >= 12:
+        tile[0] = <size_t>32; pref[0] = <size_t>1; chunks[0] = <size_t>1
+      elif p_eff <= 4:
+        tile[0] = <size_t>16; pref[0] = <size_t>2; chunks[0] = <size_t>3
+      else:
+        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>2
+    elif sc <= 2:  # <=48 or <=64
+      if p_eff >= 12:
+        tile[0] = <size_t>32; pref[0] = <size_t>1; chunks[0] = <size_t>1
+      else:
+        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>2
+    else:  # large
+      if p_eff >= 16:
+        tile[0] = <size_t>32; pref[0] = <size_t>2; chunks[0] = <size_t>3
+      else:
+        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
+  else:
+    _nd_pick_tuning(p_eff, tile, pref, chunks)
+
 def nvl(val, default_val):
   if val is None:
     return default_val
   return val
+
+def _adaptive_thread_limit_2d(parallel, total_elements):
+  """Apply adaptive thread limiting for 2D arrays to prevent performance regressions."""
+  # Check if adaptive limiting is disabled
+  try:
+    if not bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1'))):
+      return parallel
+  except Exception:
+    pass
+
+  if total_elements <= 16384:  # 128x128 or smaller
+    return min(parallel, 4)
+  elif total_elements <= 262144:  # 512x512 or smaller
+    return min(parallel, 8)
+  elif parallel >= 16:  # Large 2D with high threads
+    return min(parallel, 12)
+  return parallel
+
+def _adaptive_thread_limit_3d(parallel, shape):
+  """Apply adaptive thread limiting for 3D arrays to prevent performance regressions."""
+  # Check if adaptive limiting is disabled
+  try:
+    if not bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1'))):
+      return parallel
+  except Exception:
+    pass
+
+  max_dim = max(shape[0], max(shape[1], shape[2]))
+  if max_dim <= 32:  # Very small 3D (32^3 or smaller)
+    return min(parallel, 4)
+  elif max_dim <= 48:  # Small 3D (48^3 or smaller)
+    return min(parallel, 8)
+  elif max_dim <= 64:  # Medium 3D (64^3 or smaller)
+    return min(parallel, 12)
+  return parallel
 
 @cython.binding(True)
 def sdf(
@@ -481,6 +553,23 @@ def edtsq(
 
   Returns: Squared EDT of data
   """
+  global _nd_profile_last
+  _nd_profile_last = None
+  profile_env = os.environ.get('EDT_ND_PROFILE', '')
+  profile_enabled = False
+  if profile_env:
+    try:
+      profile_enabled = bool(int(profile_env))
+    except Exception:
+      profile_enabled = True
+  requested_parallel = parallel
+  profile_data = None
+  profile_sections = None
+  profile_axes = None
+  t_total_start = 0.0
+  if profile_enabled:
+    t_total_start = time.perf_counter()
+
   if isinstance(data, list):
     data = np.array(data)
 
@@ -1232,6 +1321,7 @@ def feature_transform_nd(
     anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
     if len(anis) != dims:
       raise ValueError('anisotropy length must match data.ndim')
+
   if parallel <= 0:
     try:
       parallel = multiprocessing.cpu_count()
@@ -1369,10 +1459,13 @@ def edt2dsq(
   return __edt2dsq(data, anisotropy, black_border, parallel)
 
 def __edt2dsq(
-    data, anisotropy=(1.0, 1.0), 
+    data, anisotropy=(1.0, 1.0),
     native_bool black_border=False,
     parallel=1
   ):
+  # Unified adaptive limiting for 2D
+  parallel = _adaptive_thread_limit_2d(parallel, data.size)
+
   cdef uint8_t[:,:] arr_memview8
   cdef uint16_t[:,:] arr_memview16
   cdef uint32_t[:,:] arr_memview32
@@ -1572,1260 +1665,6 @@ def __edt2dsq_voxel_graph(
 
   return output.reshape( data.shape, order=order)
 
-@cython.binding(True)
-def edtsq_nd(
-  data, anisotropy=None, native_bool black_border=False,
-  int parallel=1, voxel_graph=None, order=None,
-):
-  """Genuine ND squared EDT using 1D kernels, matching 2D/3D semantics.
-
-  Algorithm:
-    - Axis 0 (x-fastest for C, first for F): multi-seg 1D on labels -> workspace floats (stride=1)
-    - tofinite if !black_border
-    - Axes 1..N-1: parabolic multi-seg 1D on labels with stride along that axis, writing to workspace
-    - toinfinite at end if !black_border
-  """
-  if isinstance(data, list):
-    data = np.array(data)
-  arr = np.asarray(data)
-  if arr.size == 0:
-    return np.zeros_like(arr, dtype=np.float32)
-  # ensure contiguous buffer
-  if not arr.flags.c_contiguous and not arr.flags.f_contiguous:
-    arr = np.ascontiguousarray(arr)
-
-  dims = arr.ndim
-  # anisotropy vector
-  if anisotropy is None:
-    anis = (1.0,) * dims
-  else:
-    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
-    if len(anis) != dims:
-      raise ValueError('anisotropy length must match data.ndim')
-
-  # Declarations for optional 1D fast-path
-  cdef uint8_t[:] arr1_u8
-  cdef uint16_t[:] arr1_u16
-  cdef uint32_t[:] arr1_u32
-  cdef uint64_t[:] arr1_u64
-  cdef float[:] arr1_f32
-  cdef double[:] arr1_f64
-  cdef np.ndarray[float, ndim=1] out1
-  cdef float[:] out1_view
-
-  # Fast-path: 1D do inline specialized kernel (no external call)
-  if dims == 1:
-    out1 = np.zeros((arr.size,), dtype=np.float32)
-    out1_view = out1
-    if arr.dtype in (np.uint8, np.int8):
-      arr1_u8 = arr.astype(np.uint8, copy=False)
-      squared_edt_1d_multi_seg[uint8_t](<uint8_t*>&arr1_u8[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    elif arr.dtype in (np.uint16, np.int16):
-      arr1_u16 = arr.astype(np.uint16, copy=False)
-      squared_edt_1d_multi_seg[uint16_t](<uint16_t*>&arr1_u16[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    elif arr.dtype in (np.uint32, np.int32):
-      arr1_u32 = arr.astype(np.uint32, copy=False)
-      squared_edt_1d_multi_seg[uint32_t](<uint32_t*>&arr1_u32[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    elif arr.dtype in (np.uint64, np.int64):
-      arr1_u64 = arr.astype(np.uint64, copy=False)
-      squared_edt_1d_multi_seg[uint64_t](<uint64_t*>&arr1_u64[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    elif arr.dtype == np.float32:
-      arr1_f32 = arr
-      squared_edt_1d_multi_seg[float](<float*>&arr1_f32[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    elif arr.dtype == np.float64:
-      arr1_f64 = arr
-      squared_edt_1d_multi_seg[double](<double*>&arr1_f64[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    elif arr.dtype == bool:
-      arr1_u8 = arr.astype(np.uint8, copy=False)
-      squared_edt_1d_multi_seg[native_bool](<native_bool*>&arr1_u8[0], &out1_view[0], arr.size, 1, <float>anis[0], black_border)
-    return out1.reshape(arr.shape)
-
-  # Auto-tune ND internals based on effective thread count (can be disabled)
-  cdef bint enable_autotune = True
-  try:
-    enable_autotune = bool(int(os.environ.get('EDT_ND_AUTOTUNE', '1')))
-  except Exception:
-    enable_autotune = True
-  if enable_autotune:
-    cdef int p_eff = parallel
-    try:
-      if p_eff <= 0:
-        p_eff = multiprocessing.cpu_count()
-      else:
-        p_eff = max(1, min(p_eff, multiprocessing.cpu_count()))
-    except Exception:
-      p_eff = max(1, parallel)
-    cdef size_t _tile = 0
-    cdef size_t _pref = 0
-    cdef size_t _chunks = 0
-    if p_eff <= 2:
-      _tile = <size_t>16; _pref = <size_t>2; _chunks = <size_t>3
-    elif p_eff == 4:
-      _tile = <size_t>8; _pref = <size_t>0; _chunks = <size_t>1
-    else:
-      _tile = <size_t>0; _pref = <size_t>0; _chunks = <size_t>0  # keep defaults
-    with nogil:
-      nd_set_tuning(_tile, _pref, _chunks)
-
-  # voxel_graph is only defined for 2D/3D specialized APIs; ND core ignores it.
-  if voxel_graph is not None:
-    raise TypeError('voxel_graph is only supported by 2D/3D specialized APIs')
-
-  # internal axis order: x-fastest axis first
-  c_order = arr.flags.c_contiguous
-  axes = list(range(dims-1, -1, -1)) if c_order else list(range(dims))
-
-  # logical strides (elements)
-  shape = tuple(arr.shape)
-  strides = [1] * dims
-  if c_order:
-    for i in range(dims-2, -1, -1):
-      strides[i] = strides[i+1] * shape[i+1]
-  else:
-    for i in range(1, dims):
-      strides[i] = strides[i-1] * shape[i-1]
-
-  total = int(arr.size)
-  out = np.zeros((total,), dtype=np.float32)
-
-  # dtype dispatch: get flat pointers
-  flat = arr.ravel(order='K')
-  cdef float* outp = <float*> np.PyArray_DATA(out)
-  
-  # Build C arrays for loop indices and anisotropy
-  cdef Py_ssize_t nd = dims
-  cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
-  cdef size_t* cstrides = <size_t*> malloc(nd * sizeof(size_t))
-  cdef Py_ssize_t* caxes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
-  cdef Py_ssize_t* paxes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
-  cdef float* canis = <float*> malloc(nd * sizeof(float))
-  if cshape == NULL or cstrides == NULL or caxes == NULL or paxes == NULL or canis == NULL:
-    if cshape != NULL: free(cshape)
-    if cstrides != NULL: free(cstrides)
-    if caxes != NULL: free(caxes)
-    if paxes != NULL: free(paxes)
-    if canis != NULL: free(canis)
-    raise MemoryError('Allocation failure in edtsq_nd')
-  cdef Py_ssize_t ii
-  for ii in range(nd):
-    cshape[ii] = <size_t>shape[ii]
-    cstrides[ii] = <size_t>strides[ii]
-    caxes[ii] = <Py_ssize_t>axes[ii]
-    canis[ii] = <float>anis[ii]
-
-  # Determine pass axis order: sort axes by increasing stride (cache locality)
-  for ii in range(nd):
-    paxes[ii] = ii
-  cdef Py_ssize_t ii2
-  cdef Py_ssize_t keyi
-  cdef Py_ssize_t jj
-  for ii2 in range(1, nd):
-    keyi = paxes[ii2]
-    jj = ii2 - 1
-    while jj >= 0 and (
-      cstrides[paxes[jj]] > cstrides[keyi]
-      or (cstrides[paxes[jj]] == cstrides[keyi] and cshape[paxes[jj]] < cshape[keyi])
-    ):
-      paxes[jj+1] = paxes[jj]
-      jj -= 1
-    paxes[jj+1] = keyi
-
-  cdef void* dataptr = <void*> np.PyArray_DATA(flat)
-  cdef size_t tot = <size_t> total
-  cdef size_t kk
-  cdef size_t kk2
-  cdef size_t lines
-  # Max number of lines among all passes; used to size bases buffer safely.
-  cdef size_t max_lines = 0
-  for ii2 in range(nd):
-    lines = tot // <size_t>cshape[paxes[ii2]]
-    if lines > max_lines:
-      max_lines = lines
-  cdef size_t* bases
-  cdef Py_ssize_t a
-  cdef size_t il
-  cdef size_t base_b
-  cdef size_t tmp_b
-  cdef size_t coord_b
-  cdef Py_ssize_t ord_len
-  cdef Py_ssize_t* ord
-  cdef Py_ssize_t pos
-  cdef Py_ssize_t j
-  cdef Py_ssize_t key_ax
-  if arr.dtype in (np.uint8, np.int8):
-    # Precompute bases for axis 0 and run threaded multi pass
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(max_lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    # Build axis order for base enumeration: other axes sorted by increasing stride
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    # Fill with axes except caxes[0]
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    # Simple insertion sort by stride (ascending)
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[uint8_t](<uint8_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      with nogil:
-        for kk in range(tot):
-          pass
-      # reuse bases buffer
-      if lines * sizeof(size_t) > 0:
-        # recompute bases for this axis using stride-ascending order of other axes
-        # build ord for this axis
-        ord_len = nd - 1
-        free(ord)
-        ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-        if ord == NULL:
-          free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-          raise MemoryError('Allocation failure for ord')
-        pos = 0
-        for ii in range(nd):
-          if ii != paxes[a]:
-            ord[pos] = ii
-            pos += 1
-        for il in range(1, ord_len):
-          key_ax = ord[il]
-          j = il - 1
-          while j >= 0 and (
-            cstrides[ord[j]] > cstrides[key_ax]
-            or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-          ):
-            ord[j+1] = ord[j]
-            j -= 1
-          ord[j+1] = key_ax
-        with nogil:
-          for il in range(lines):
-            base_b = 0
-            tmp_b = il
-            for j in range(ord_len):
-              coord_b = tmp_b % cshape[ord[j]]
-              base_b += cstrides[ord[j]] * coord_b
-              tmp_b //= cshape[ord[j]]
-            bases[il] = base_b
-        with nogil:
-          _nd_pass_parabolic_bases[uint8_t](<uint8_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  elif arr.dtype in (np.uint16, np.int16):
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(max_lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    # Build stride-ascending order of other axes for axis 0
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[uint16_t](<uint16_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      # Build ord for this axis
-      free(ord)
-      ord = <Py_ssize_t*> malloc((nd-1) * sizeof(Py_ssize_t))
-      if ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
-      pos = 0
-      for ii in range(nd):
-        if ii != paxes[a]:
-          ord[pos] = ii
-          pos += 1
-      for il in range(1, nd-1):
-        key_ax = ord[il]
-        j = il - 1
-        while j >= 0 and (
-          cstrides[ord[j]] > cstrides[key_ax]
-          or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-        ):
-          ord[j+1] = ord[j]
-          j -= 1
-        ord[j+1] = key_ax
-      with nogil:
-        for il in range(lines):
-          base_b = 0
-          tmp_b = il
-          for j in range(nd-1):
-            coord_b = tmp_b % cshape[ord[j]]
-            base_b += coord_b * cstrides[ord[j]]
-            tmp_b //= cshape[ord[j]]
-          bases[il] = base_b
-      with nogil:
-        _nd_pass_parabolic_bases[uint16_t](<uint16_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  elif arr.dtype in (np.uint32, np.int32):
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(max_lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[uint32_t](<uint32_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      free(ord)
-      ord = <Py_ssize_t*> malloc((nd-1) * sizeof(Py_ssize_t))
-      if ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
-      pos = 0
-      for ii in range(nd):
-        if ii != paxes[a]:
-          ord[pos] = ii
-          pos += 1
-      for il in range(1, nd-1):
-        key_ax = ord[il]
-        j = il - 1
-        while j >= 0 and (
-          cstrides[ord[j]] > cstrides[key_ax]
-          or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-        ):
-          ord[j+1] = ord[j]
-          j -= 1
-        ord[j+1] = key_ax
-      with nogil:
-        for il in range(lines):
-          base_b = 0
-          tmp_b = il
-          for j in range(nd-1):
-            coord_b = tmp_b % cshape[ord[j]]
-            base_b += coord_b * cstrides[ord[j]]
-            tmp_b //= cshape[ord[j]]
-          bases[il] = base_b
-      with nogil:
-        _nd_pass_parabolic_bases[uint32_t](<uint32_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  elif arr.dtype in (np.uint64, np.int64):
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(max_lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[uint64_t](<uint64_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      free(ord)
-      ord = <Py_ssize_t*> malloc((nd-1) * sizeof(Py_ssize_t))
-      if ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
-      pos = 0
-      for ii in range(nd):
-        if ii != paxes[a]:
-          ord[pos] = ii
-          pos += 1
-      for il in range(1, nd-1):
-        key_ax = ord[il]
-        j = il - 1
-        while j >= 0 and (
-          cstrides[ord[j]] > cstrides[key_ax]
-          or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-        ):
-          ord[j+1] = ord[j]
-          j -= 1
-        ord[j+1] = key_ax
-      with nogil:
-        for il in range(lines):
-          base_b = 0
-          tmp_b = il
-          for j in range(nd-1):
-            coord_b = tmp_b % cshape[ord[j]]
-            base_b += coord_b * cstrides[ord[j]]
-            tmp_b //= cshape[ord[j]]
-          bases[il] = base_b
-      with nogil:
-        _nd_pass_parabolic_bases[uint64_t](<uint64_t*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  elif arr.dtype == np.float32:
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[float](<float*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      free(ord)
-      ord = <Py_ssize_t*> malloc((nd-1) * sizeof(Py_ssize_t))
-      if ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
-      pos = 0
-      for ii in range(nd):
-        if ii != paxes[a]:
-          ord[pos] = ii
-          pos += 1
-      for il in range(1, nd-1):
-        key_ax = ord[il]
-        j = il - 1
-        while j >= 0 and (
-          cstrides[ord[j]] > cstrides[key_ax]
-          or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-        ):
-          ord[j+1] = ord[j]
-          j -= 1
-        ord[j+1] = key_ax
-      with nogil:
-        for il in range(lines):
-          base_b = 0
-          tmp_b = il
-          for j in range(nd-1):
-            coord_b = tmp_b % cshape[ord[j]]
-            base_b += coord_b * cstrides[ord[j]]
-            tmp_b //= cshape[ord[j]]
-          bases[il] = base_b
-      with nogil:
-        _nd_pass_parabolic_bases[float](<float*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  elif arr.dtype == np.float64:
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[double](<double*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      free(ord)
-      ord = <Py_ssize_t*> malloc((nd-1) * sizeof(Py_ssize_t))
-      if ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
-      pos = 0
-      for ii in range(nd):
-        if ii != paxes[a]:
-          ord[pos] = ii
-          pos += 1
-      for il in range(1, nd-1):
-        key_ax = ord[il]
-        j = il - 1
-        while j >= 0 and (
-          cstrides[ord[j]] > cstrides[key_ax]
-          or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-        ):
-          ord[j+1] = ord[j]
-          j -= 1
-        ord[j+1] = key_ax
-      with nogil:
-        for il in range(lines):
-          base_b = 0
-          tmp_b = il
-          for j in range(nd-1):
-            coord_b = tmp_b % cshape[ord[j]]
-            base_b += coord_b * cstrides[ord[j]]
-            tmp_b //= cshape[ord[j]]
-          bases[il] = base_b
-      with nogil:
-        _nd_pass_parabolic_bases[double](<double*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  elif arr.dtype == bool:
-    lines = tot // <size_t>cshape[paxes[0]]
-    bases = <size_t*> malloc(lines * sizeof(size_t))
-    if bases == NULL:
-      free(cshape); free(cstrides); free(caxes); free(canis)
-      raise MemoryError('Allocation failure for bases')
-    ord_len = nd - 1
-    ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
-      free(bases); free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-      raise MemoryError('Allocation failure for ord')
-    pos = 0
-    for ii in range(nd):
-      if ii != paxes[0]:
-        ord[pos] = ii
-        pos += 1
-    for il in range(1, ord_len):
-      key_ax = ord[il]
-      j = il - 1
-      while j >= 0 and (
-        cstrides[ord[j]] > cstrides[key_ax]
-        or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-      ):
-        ord[j+1] = ord[j]
-        j -= 1
-      ord[j+1] = key_ax
-    with nogil:
-      for il in range(lines):
-        base_b = 0
-        tmp_b = il
-        for j in range(ord_len):
-          coord_b = tmp_b % cshape[ord[j]]
-          base_b += coord_b * cstrides[ord[j]]
-          tmp_b //= cshape[ord[j]]
-        bases[il] = base_b
-      _nd_pass_multi_bases[native_bool](<native_bool*>dataptr, outp, bases, lines, <size_t>cshape[paxes[0]], <size_t>cstrides[paxes[0]], canis[paxes[0]], black_border, parallel)
-    if not black_border:
-      with nogil:
-        for kk in range(tot):
-          if isinf(outp[kk]):
-            outp[kk] = 3.4028234e+38
-    for a in range(1, nd):
-      lines = tot // <size_t>cshape[paxes[a]]
-      free(ord)
-      ord = <Py_ssize_t*> malloc((nd-1) * sizeof(Py_ssize_t))
-      if ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(caxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
-      pos = 0
-      for ii in range(nd):
-        if ii != paxes[a]:
-          ord[pos] = ii
-          pos += 1
-      for il in range(1, nd-1):
-        key_ax = ord[il]
-        j = il - 1
-        while j >= 0 and (
-          cstrides[ord[j]] > cstrides[key_ax]
-          or (cstrides[ord[j]] == cstrides[key_ax] and cshape[ord[j]] < cshape[key_ax])
-        ):
-          ord[j+1] = ord[j]
-          j -= 1
-        ord[j+1] = key_ax
-      with nogil:
-        for il in range(lines):
-          base_b = 0
-          tmp_b = il
-          for j in range(nd-1):
-            coord_b = tmp_b % cshape[ord[j]]
-            base_b += coord_b * cstrides[ord[j]]
-            tmp_b //= cshape[ord[j]]
-          bases[il] = base_b
-      with nogil:
-        _nd_pass_parabolic_bases[native_bool](<native_bool*>dataptr, outp, bases, lines, <size_t>cshape[paxes[a]], <size_t>cstrides[paxes[a]], canis[paxes[a]], black_border, parallel)
-    free(bases); free(ord)
-    if not black_border:
-      with nogil:
-        for kk2 in range(tot):
-          if outp[kk2] >= 3.4028234e+38:
-            outp[kk2] = INFINITY
-  else:
-    free(cshape); free(cstrides); free(caxes); free(canis)
-    raise TypeError('Unsupported dtype')
-
-  free(cshape); free(cstrides); free(caxes); free(paxes); free(canis)
-  return out.reshape(arr.shape, order=('C' if c_order else 'F'))
-
-@cython.inline
-cdef void _edtsq_nd_core_u8_c(uint8_t* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  # Axis 0: multi-seg using incremental enumeration
-  cdef size_t base = 0
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  # loop over all lines orthogonal to ax0
-  while True:
-    squared_edt_1d_multi_seg[uint8_t](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    # increment mixed-radix index over dims except ax0
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  # Remaining axes
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    idx = <size_t*> malloc(dims * sizeof(size_t))
-    if idx == NULL:
-      return
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[uint8_t](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-    free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.inline
-cdef void _edtsq_nd_core_u16_c(uint16_t* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  cdef size_t base = 0
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  while True:
-    squared_edt_1d_multi_seg[uint16_t](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    idx = <size_t*> malloc(dims * sizeof(size_t))
-    if idx == NULL:
-      return
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[uint16_t](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-    free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.inline
-cdef void _edtsq_nd_core_u32_c(uint32_t* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  cdef size_t base = 0
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  while True:
-    squared_edt_1d_multi_seg[uint32_t](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    idx = <size_t*> malloc(dims * sizeof(size_t))
-    if idx == NULL:
-      return
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[uint32_t](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-    free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.inline
-cdef void _edtsq_nd_core_u64_c(uint64_t* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  cdef size_t base = 0
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  while True:
-    squared_edt_1d_multi_seg[uint64_t](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    idx = <size_t*> malloc(dims * sizeof(size_t))
-    if idx == NULL:
-      return
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[uint64_t](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-    free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.inline
-cdef void _edtsq_nd_core_f32_c(float* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  cdef size_t base = 0
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  while True:
-    squared_edt_1d_multi_seg[float](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    idx = <size_t*> malloc(dims * sizeof(size_t))
-    if idx == NULL:
-      return
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[float](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-    free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.inline
-cdef void _edtsq_nd_core_f64_c(double* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  cdef size_t base = 0
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  while True:
-    squared_edt_1d_multi_seg[double](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    idx = <size_t*> malloc(dims * sizeof(size_t))
-    if idx == NULL:
-      return
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[double](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-    free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.inline
-cdef void _edtsq_nd_core_bool_c(native_bool* labels, float* dest, Py_ssize_t dims, size_t* shape, Py_ssize_t* axes, size_t* strides, float* anis, native_bool black_border) nogil:
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  cdef bint done, done2
-  for i in range(dims): total *= shape[i]
-  cdef Py_ssize_t ax0 = axes[0]
-  cdef size_t n0 = shape[ax0]
-  cdef size_t s0 = strides[ax0]
-  
-  cdef size_t* idx = <size_t*> malloc(dims * sizeof(size_t))
-  if idx == NULL:
-    return
-  for i in range(dims): idx[i] = 0
-  cdef size_t base = 0
-  while True:
-    squared_edt_1d_multi_seg[native_bool](labels + base, dest + base, <int>n0, <int>s0, anis[ax0], black_border)
-    done = True
-    for i in range(dims):
-      if i == ax0:
-        continue
-      idx[i] += 1
-      base += strides[i]
-      if idx[i] < shape[i]:
-        done = False
-        break
-      base -= idx[i] * strides[i]
-      idx[i] = 0
-    if done:
-      break
-  if not black_border:
-    for i in range(total):
-      if isinf(dest[i]):
-        dest[i] = 3.4028234e+38
-  cdef Py_ssize_t aidx
-  cdef size_t n, s
-  cdef Py_ssize_t ax
-  for aidx in range(1, dims):
-    ax = axes[aidx]
-    n = shape[ax]
-    s = strides[ax]
-    if n <= 1:
-      continue
-    base = 0
-    for i in range(dims): idx[i] = 0
-    while True:
-      squared_edt_1d_parabolic_multi_seg[native_bool](labels + base, dest + base, <int>n, <int>s, anis[ax], black_border)
-      done2 = True
-      for i in range(dims):
-        if i == ax:
-          continue
-        idx[i] += 1
-        base += strides[i]
-        if idx[i] < shape[i]:
-          done2 = False
-          break
-        base -= idx[i] * strides[i]
-        idx[i] = 0
-      if done2:
-        break
-  free(idx)
-  if not black_border:
-    for i in range(total):
-      if dest[i] >= 3.4028234e+38:
-        dest[i] = INFINITY
-
-@cython.binding(True)
-def edt_nd(
-    data, anisotropy=None, native_bool black_border=False, 
-    int parallel=1, voxel_graph=None, order=None,
-  ):
-  res = edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
-  return np.sqrt(res, res)
-
-
 def edt3d(
     data, anisotropy=(1.0, 1.0, 1.0), 
     native_bool black_border=False,
@@ -2844,10 +1683,13 @@ def edt3dsq(
   return __edt3dsq(data, anisotropy, black_border, parallel)
 
 def __edt3dsq(
-    data, anisotropy=(1.0, 1.0, 1.0), 
+    data, anisotropy=(1.0, 1.0, 1.0),
     native_bool black_border=False,
     int parallel=1
   ):
+  # Unified adaptive limiting for 3D
+  parallel = _adaptive_thread_limit_3d(parallel, data.shape)
+
   cdef uint8_t[:,:,:] arr_memview8
   cdef uint16_t[:,:,:] arr_memview16
   cdef uint32_t[:,:,:] arr_memview32
@@ -3049,6 +1891,262 @@ def __edt3dsq_voxel_graph(
     )
 
   return output.reshape(data.shape, order=order)
+
+
+
+
+
+
+@cython.binding(True)
+def edt_nd(
+    data, anisotropy=None, native_bool black_border=False, 
+    int parallel=1, voxel_graph=None, order=None,
+  ):
+  res = edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
+  return np.sqrt(res, res)
+
+@cython.binding(True)
+def edtsq_nd(
+  data, anisotropy=None, native_bool black_border=False,
+  int parallel=1, voxel_graph=None, order=None,
+):
+  """General ND squared EDT using a dimension-agnostic pass schedule."""
+  global _nd_profile_last
+  _nd_profile_last = None
+
+  cdef bint profile_enabled = False
+  cdef double t_total_start = 0.0
+  cdef dict profile_data = {}
+  cdef dict profile_sections = {}
+  cdef list profile_axes = []
+
+  profile_env = os.environ.get('EDT_ND_PROFILE')
+  if profile_env:
+    try:
+      profile_enabled = bool(int(profile_env))
+    except Exception:
+      profile_enabled = True
+  if profile_enabled:
+    t_total_start = time.perf_counter()
+
+  requested_parallel = parallel
+
+  if isinstance(data, list):
+    data = np.array(data)
+  arr = np.asarray(data)
+  if arr.size == 0:
+    if profile_enabled:
+      now = time.perf_counter()
+      _nd_profile_last = {
+        'shape': tuple(arr.shape),
+        'dims': arr.ndim,
+        'dtype': str(arr.dtype),
+        'requested_parallel': requested_parallel,
+        'parallel_used': 0,
+        'sections': {'prep': now - t_total_start, 'total': now - t_total_start},
+        'axes': []
+      }
+    return np.zeros_like(arr, dtype=np.float32)
+  if not arr.flags.c_contiguous and not arr.flags.f_contiguous:
+    arr = np.ascontiguousarray(arr)
+
+  dims = arr.ndim
+  if anisotropy is None:
+    anis = (1.0,) * dims
+  else:
+    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
+    if len(anis) != dims:
+      raise ValueError('anisotropy length must match data.ndim')
+
+  if profile_enabled:
+    profile_data = {
+      'shape': tuple(arr.shape),
+      'dims': dims,
+      'dtype': str(arr.dtype),
+      'requested_parallel': requested_parallel,
+      'parallel_used': None,
+      'sections': {},
+      'axes': profile_axes,
+    }
+    profile_sections = profile_data['sections']
+    profile_sections['prep'] = time.perf_counter() - t_total_start
+
+  cdef int p = parallel
+  try:
+    if p <= 0:
+      p = multiprocessing.cpu_count()
+    else:
+      p = max(1, min(p, multiprocessing.cpu_count()))
+  except Exception:
+    p = max(1, parallel)
+  parallel = p
+
+  if profile_enabled:
+    profile_data['parallel_used'] = parallel
+
+  if voxel_graph is not None:
+    raise TypeError('voxel_graph is only supported by 2D/3D specialized APIs')
+
+  cdef Py_ssize_t nd = dims
+  cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
+  cdef size_t* cstrides = <size_t*> malloc(nd * sizeof(size_t))
+  if cshape == NULL or cstrides == NULL:
+    if cshape != NULL: free(cshape)
+    if cstrides != NULL: free(cstrides)
+    raise MemoryError('Allocation failure')
+
+  cdef size_t total = 1
+  cdef Py_ssize_t i
+  for i in range(nd):
+    cshape[i] = <size_t>arr.shape[i]
+  if arr.flags.c_contiguous:
+    cstrides[nd-1] = 1
+    for i in range(nd-2, -1, -1):
+      cstrides[i] = cstrides[i+1] * cshape[i+1]
+  else:
+    cstrides[0] = 1
+    for i in range(1, nd):
+      cstrides[i] = cstrides[i-1] * cshape[i-1]
+  for i in range(nd):
+    total *= cshape[i]
+
+  cdef np.ndarray out = np.zeros((<Py_ssize_t> total,), dtype=np.float32)
+  cdef float* outp = <float*> np.PyArray_DATA(out)
+  cdef void* datap = <void*> np.PyArray_DATA(arr.ravel(order='K'))
+
+  cdef double t_tmp
+  cdef double t_axis
+  cdef double multi_elapsed = 0.0
+  cdef double parabolic_elapsed = 0.0
+
+  if nd == 1:
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    if arr.dtype in (np.uint8, np.int8):
+      squared_edt_1d_multi_seg[uint8_t](<uint8_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    elif arr.dtype in (np.uint16, np.int16):
+      squared_edt_1d_multi_seg[uint16_t](<uint16_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    elif arr.dtype in (np.uint32, np.int32):
+      squared_edt_1d_multi_seg[uint32_t](<uint32_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    elif arr.dtype in (np.uint64, np.int64):
+      squared_edt_1d_multi_seg[uint64_t](<uint64_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    elif arr.dtype == np.float32:
+      squared_edt_1d_multi_seg[float](<float*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    elif arr.dtype == np.float64:
+      squared_edt_1d_multi_seg[double](<double*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    elif arr.dtype == bool:
+      squared_edt_1d_multi_seg[native_bool](<native_bool*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
+    if profile_enabled:
+      multi_elapsed = time.perf_counter() - t_tmp
+      profile_axes.append({'axis': 0, 'kind': 'multi', 'time': multi_elapsed})
+      profile_sections['multi_pass'] = multi_elapsed
+      profile_sections['parabolic_pass'] = 0.0
+      profile_sections['total'] = time.perf_counter() - t_total_start
+      _nd_profile_last = profile_data
+    free(cshape); free(cstrides)
+    order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
+    return np.reshape(out, arr.shape, order=order_ch2)
+
+  cdef Py_ssize_t* axes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
+  if axes == NULL:
+    free(cshape); free(cstrides)
+    raise MemoryError('Allocation failure')
+  for i in range(nd):
+    axes[i] = i
+  cdef Py_ssize_t a, j, key
+  for a in range(1, nd):
+    key = axes[a]
+    j = a - 1
+    while j >= 0 and (
+      cstrides[axes[j]] > cstrides[key]
+      or (cstrides[axes[j]] == cstrides[key] and cshape[axes[j]] < cshape[key])
+    ):
+      axes[j+1] = axes[j]
+      j -= 1
+    axes[j+1] = key
+
+  if profile_enabled:
+    t_tmp = time.perf_counter()
+  if arr.dtype in (np.uint8, np.int8):
+    _nd_pass_multi_odometer[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  elif arr.dtype in (np.uint16, np.int16):
+    _nd_pass_multi_odometer[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  elif arr.dtype in (np.uint32, np.int32):
+    _nd_pass_multi_odometer[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  elif arr.dtype in (np.uint64, np.int64):
+    _nd_pass_multi_odometer[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  elif arr.dtype == np.float32:
+    _nd_pass_multi_odometer[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  elif arr.dtype == np.float64:
+    _nd_pass_multi_odometer[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  elif arr.dtype == bool:
+    _nd_pass_multi_odometer[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+  if profile_enabled:
+    multi_elapsed = time.perf_counter() - t_tmp
+    profile_axes.append({'axis': int(axes[0]), 'kind': 'multi', 'time': multi_elapsed})
+
+  if not black_border:
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    with nogil:
+      for i in range(total):
+        if isinf(outp[i]):
+          outp[i] = 3.4028234e+38
+    if profile_enabled:
+      profile_sections['multi_fix'] = time.perf_counter() - t_tmp
+  elif profile_enabled:
+    profile_sections['multi_fix'] = 0.0
+
+  for a in range(1, nd):
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    if arr.dtype in (np.uint8, np.int8):
+      _nd_pass_parabolic_odometer[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    elif arr.dtype in (np.uint16, np.int16):
+      _nd_pass_parabolic_odometer[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    elif arr.dtype in (np.uint32, np.int32):
+      _nd_pass_parabolic_odometer[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    elif arr.dtype in (np.uint64, np.int64):
+      _nd_pass_parabolic_odometer[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    elif arr.dtype == np.float32:
+      _nd_pass_parabolic_odometer[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    elif arr.dtype == np.float64:
+      _nd_pass_parabolic_odometer[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    elif arr.dtype == bool:
+      _nd_pass_parabolic_odometer[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+    if profile_enabled:
+      t_axis = time.perf_counter() - t_tmp
+      parabolic_elapsed += t_axis
+      profile_axes.append({'axis': int(axes[a]), 'kind': 'parabolic', 'time': t_axis})
+
+  if not black_border:
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    with nogil:
+      for i in range(total):
+        if outp[i] >= 3.4028234e+38:
+          outp[i] = INFINITY
+    if profile_enabled:
+      profile_sections['post_fix'] = time.perf_counter() - t_tmp
+  elif profile_enabled:
+    profile_sections['post_fix'] = 0.0
+
+  free(cshape); free(cstrides); free(axes)
+  if profile_enabled:
+    profile_sections['multi_pass'] = multi_elapsed
+    profile_sections['parabolic_pass'] = parabolic_elapsed
+    profile_sections['total'] = time.perf_counter() - t_total_start
+    _nd_profile_last = profile_data
+
+  order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
+  return np.reshape(out, arr.shape, order=order_ch2)
+
+@cython.binding(True)
+def edtsq_nd_last_profile():
+  """Return the last ND profile captured when EDT_ND_PROFILE is enabled."""
+  return _nd_profile_last
+
+
 
 
 ## These below functions are concerned with fast rendering
