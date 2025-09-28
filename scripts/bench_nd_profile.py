@@ -77,6 +77,16 @@ def bench_pair(arr: np.ndarray, parallel: int, reps: int) -> Tuple[float, float,
     return spec_best, nd_best, spec_out, nd_out
 
 
+def adaptive_repeat(time_s: float, min_samples: int, min_time: float, max_time: float) -> int:
+    if time_s <= 0:
+        return min_samples
+    reps = max(min_samples, int(min_time / time_s))
+    reps = min(reps, int(max_time / max(time_s, 1e-9)))
+    if reps < 1:
+        reps = 1
+    return reps
+
+
 def extract_axes(profile: dict) -> str:
     axes = profile.get('axes', [])
     parts = []
@@ -99,7 +109,9 @@ def main() -> None:
     dims_requested = parse_int_list(args.dims)
     dtype = np.dtype(args.dtype)
     shapes = default_shapes(dims_requested)
-    repeats = int(os.environ.get('EDT_BENCH_REPEAT', '1'))
+    min_time = float(os.environ.get('EDT_BENCH_MIN_TIME', '0.5'))
+    max_time = float(os.environ.get('EDT_BENCH_MAX_TIME', '10.0'))
+    min_samples = int(os.environ.get('EDT_BENCH_MIN_REPEAT', '1'))
     rng = np.random.default_rng(0)
 
     os.environ.pop('EDT_ND_AUTOTUNE', None)
@@ -110,18 +122,24 @@ def main() -> None:
     for parallel in parallels:
         for shape in shapes:
             arr = make_array(rng, shape, dtype)
-            spec_times = []
-            nd_times = []
-            max_diff = 0.0
-            for _ in range(repeats):
-                spec_time, nd_time, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
-                spec_times.append(spec_time)
-                nd_times.append(nd_time)
-                max_diff = max(max_diff, float(np.max(np.abs(spec_out - nd_out))))
-                del spec_out, nd_out
-            spec_time = float(np.mean(spec_times))
-            nd_time = float(np.mean(nd_times))
-            diff = max_diff
+            spec_time, nd_time, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
+            diff = float(np.max(np.abs(spec_out - nd_out)))
+            del spec_out, nd_out
+
+            repeat_count = adaptive_repeat(nd_time, min_samples=min_samples, min_time=min_time, max_time=max_time)
+            if repeat_count > 1:
+                spec_times = [spec_time]
+                nd_times = [nd_time]
+                max_diff = diff
+                for _ in range(repeat_count - 1):
+                    spec_time_r, nd_time_r, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
+                    spec_times.append(spec_time_r)
+                    nd_times.append(nd_time_r)
+                    max_diff = max(max_diff, float(np.max(np.abs(spec_out - nd_out))))
+                    del spec_out, nd_out
+                spec_time = float(np.mean(spec_times))
+                nd_time = float(np.mean(nd_times))
+                diff = max_diff
             profile = edt.edtsq_nd_last_profile() or {}
             sections = profile.get('sections', {})
             row = {

@@ -770,7 +770,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
             <size_t>sx2, <size_t>sy2,
             <float>anis[0], <float>anis[1],
             bb, parallel,
-            dt2_ptr, &feat2_u32[0, 0]
+            dt2_ptr, <uint32_t*>&feat2_u32[0, 0]
         )
         return (feat2_u32, dt2) if return_distances else feat2_u32
     else:
@@ -800,7 +800,7 @@ def feature_transform(data, anisotropy=None, black_border=False,
           <size_t>sx3, <size_t>sy3, <size_t>sz3,
           <float>anis[0], <float>anis[1], <float>anis[2],
           bb, parallel,
-          dt3_ptr, &feat3_u32[0, 0, 0]
+          dt3_ptr, <uint32_t*>&feat3_u32[0, 0, 0]
       )
       return (feat3_u32, dt3) if return_distances else feat3_u32
   else:
