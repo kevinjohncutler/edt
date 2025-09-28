@@ -99,6 +99,7 @@ def main() -> None:
     dims_requested = parse_int_list(args.dims)
     dtype = np.dtype(args.dtype)
     shapes = default_shapes(dims_requested)
+    repeats = int(os.environ.get('EDT_BENCH_REPEAT', '1'))
     rng = np.random.default_rng(0)
 
     os.environ.pop('EDT_ND_AUTOTUNE', None)
@@ -109,9 +110,18 @@ def main() -> None:
     for parallel in parallels:
         for shape in shapes:
             arr = make_array(rng, shape, dtype)
-            spec_time, nd_time, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
-            diff = float(np.max(np.abs(spec_out - nd_out)))
-            del spec_out, nd_out
+            spec_times = []
+            nd_times = []
+            max_diff = 0.0
+            for _ in range(repeats):
+                spec_time, nd_time, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
+                spec_times.append(spec_time)
+                nd_times.append(nd_time)
+                max_diff = max(max_diff, float(np.max(np.abs(spec_out - nd_out))))
+                del spec_out, nd_out
+            spec_time = float(np.mean(spec_times))
+            nd_time = float(np.mean(nd_times))
+            diff = max_diff
             profile = edt.edtsq_nd_last_profile() or {}
             sections = profile.get('sections', {})
             row = {

@@ -33,31 +33,31 @@ jobs:
           OUTPUT_CSV: benchmarks/nd_profile_ci.csv
         run: |
           python - <<'PY'
-import csv
-import os
-from pathlib import Path
+          import csv
+          import os
+          from pathlib import Path
 
-csv_path = Path(os.environ["OUTPUT_CSV"])
-if not csv_path.exists():
-    raise SystemExit(f"Missing benchmark output: {csv_path}")
+          csv_path = Path(os.environ["OUTPUT_CSV"])
+          if not csv_path.exists():
+              raise SystemExit(f"Missing benchmark output: {csv_path}")
 
-with csv_path.open() as fp:
-    reader = csv.DictReader(fp)
-    rows = list(reader)
+          with csv_path.open() as fp:
+              reader = csv.DictReader(fp)
+              rows = list(reader)
 
-if not rows:
-    summary = "No benchmark rows captured."
-else:
-    header = ["shape", "dims", "parallel_request", "spec_ms", "nd_ms", "ratio", "max_abs_diff"]
-    table = ["| " + " | ".join(header) + " |"]
-    table.append("| " + " | ".join(["---"] * len(header)) + " |")
-    for row in rows:
-        table.append("| " + " | ".join(row[h] for h in header) + " |")
-    summary = "\n".join(table)
+          if not rows:
+              summary = "No benchmark rows captured."
+          else:
+              header = ["shape", "dims", "parallel_request", "spec_ms", "nd_ms", "ratio", "max_abs_diff"]
+              table = ["| " + " | ".join(header) + " |"]
+              table.append("| " + " | ".join(["---"] * len(header)) + " |")
+              for row in rows:
+                  table.append("| " + " | ".join(row[h] for h in header) + " |")
+              summary = "\n".join(table)
 
-summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
-summary_path.write_text("## ND Benchmark Profile\n\n" + summary + "\n")
-PY
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          summary_path.write_text("## ND Benchmark Profile\n\n" + summary + "\n")
+          PY
 
       - name: Upload benchmark CSV
         uses: actions/upload-artifact@v4

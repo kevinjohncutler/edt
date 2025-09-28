@@ -1,3 +1,4 @@
+import platform
 import setuptools
 import sys
 
@@ -13,6 +14,8 @@ class NumpyImport:
 # cython -3 --fast-fail -v --cplus edt.pyx
 
 extra_compile_args = []
+machine = platform.machine().lower()
+is_x86 = machine in ("x86_64", "amd64")
 if sys.platform == 'win32':
   extra_compile_args += [
     '/std:c++17', '/O2'
@@ -24,8 +27,10 @@ else:
     # '-Ofast', '-fno-finite-math-only',
     '-O3','-ffast-math','-fno-finite-math-only','-fno-unsafe-math-optimizations',
     '-fno-math-errno', '-fno-trapping-math',
-    '-march=native', '-mtune=native', '-flto', '-DNDEBUG', '-pthread'
+    '-flto', '-DNDEBUG', '-pthread'
   ]
+  if is_x86:
+    extra_compile_args += ['-march=native', '-mtune=native']
 
 if sys.platform == 'darwin':
   extra_compile_args += [ '-stdlib=libc++', '-mmacosx-version-min=10.9' ]
