@@ -9,10 +9,13 @@ Given a 1d, 2d, or 3d volume of labels, compute the Euclidean
 Distance Transform such that label boundaries are marked as
 distance 1 and 0 is always 0.
 
-Key methods: 
+Key methods:
   edt, edtsq
-  edt1d,   edt2d,   edt3d,
-  edt1dsq, edt2dsq, edt3dsq
+  edt_nd, edtsq_nd
+  feature_transform_nd, expand_labels_nd
+
+Legacy dimension-specific APIs are available through ``edt.original`` when the
+reference repository has been cloned and built locally.
 
 License: GNU 3.0
 
@@ -20,6 +23,7 @@ Author: William Silversmith
 Affiliation: Seung Lab, Princeton Neuroscience Institute
 Date: July 2018 - December 2023
 """
+import importlib.util
 import operator
 from functools import reduce
 from libc.stdint cimport (
@@ -41,10 +45,127 @@ np.import_array()
 
 import numpy as np
 import os
+import pathlib
 import time
+import sys
+import types
 
 
 _nd_profile_last = None
+
+
+class _OriginalModuleProxy(types.ModuleType):
+  """Lazy loader for the legacy dimension-specific EDT extension."""
+
+  def __init__(self):
+    super().__init__('edt.original')
+    self._module = None
+    self._load_error = None
+
+  def _candidate_roots(self):
+    env_path = os.environ.get('EDT_ORIGINAL_PATH')
+    if env_path:
+      path = pathlib.Path(env_path).expanduser()
+      if path.exists():
+        yield path
+    base = pathlib.Path(__file__).resolve()
+    seen = set()
+    for parent in (base.parent,) + tuple(base.parents):
+      candidate = (parent / 'original_repo').resolve()
+      if candidate.exists() and candidate not in seen:
+        seen.add(candidate)
+        yield candidate
+
+  def _iter_extension_candidates(self, roots):
+    patterns = ('**/edt*.so', '**/edt*.pyd', '**/edt*.dll')
+    for root in roots:
+      for pattern in patterns:
+        for path in sorted(root.glob(pattern), reverse=True):
+          if path.is_file():
+            yield path
+
+  def _load(self):
+    if self._module is not None:
+      return self._module
+    if self._load_error is not None:
+      raise self._load_error
+
+    try:
+      module = importlib.import_module('edt_original')
+      module.__name__ = 'edt.original'
+      module.available = lambda: True
+      sys.modules['edt.original'] = module
+      self._module = module
+      self._load_error = None
+      return module
+    except Exception as exc:
+      self._load_error = exc
+
+    # fall back to disk lookup (for developers with external clone)
+    roots = list(self._candidate_roots())
+    candidates = list(self._iter_extension_candidates(roots))
+    errors = []
+
+    for candidate in candidates:
+      try:
+        spec = importlib.util.spec_from_file_location('edt_original_native', candidate)
+        if spec is None or spec.loader is None:
+          raise ImportError(f'Unable to create loader for {candidate}')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.__name__ = 'edt.original'
+        module.available = lambda: True
+        sys.modules['edt.original'] = module
+        self._module = module
+        self._load_error = None
+        return module
+      except Exception as exc:
+        errors.append((candidate, exc))
+
+    if errors:
+      messages = ', '.join(f"{path.name}: {exc}" for path, exc in errors)
+      err = ImportError(f'Failed to load original EDT extension ({messages})')
+      self._load_error = err
+      raise err
+
+    if roots:
+      hint = roots[0]
+      err = ImportError(
+        f'Original EDT extension not built in {hint}. '
+        'Run `pip install -e .` there or build the packaged edt.original._native.'
+      )
+      self._load_error = err
+      raise err
+    err = ImportError(
+      "Original EDT implementation not available. Install the package with the"
+      " bundled edt.original module or provide a build in ./original_repo."
+    )
+    self._load_error = err
+    raise err
+
+  def __getattr__(self, name):
+    module = self._load()
+    return getattr(module, name)
+
+  def __dir__(self):
+    try:
+      module = self._load()
+    except Exception:
+      return sorted(set(super().__dir__()) | {'available'})
+    return sorted(set(super().__dir__()) | set(dir(module)) | {'available'})
+
+  def available(self):
+    """Return True if the legacy module could be loaded."""
+    if self._module is not None:
+      return True
+    try:
+      self._load()
+    except Exception:
+      return False
+    return True
+
+
+original = _OriginalModuleProxy()
 
 @cython.binding(True)
 def nd_tuning(tile=None, prefetch_step=None, chunks_per_thread=None):
@@ -85,25 +206,7 @@ ctypedef fused NUMBER:
 from libc.stddef cimport size_t
 from libc.stdlib cimport malloc, free
 from libc.math cimport isinf, INFINITY
-#
-# Remove duplicate and update _edt2dsq/_edt3dsq for optional features
 cdef extern from "edt.hpp" namespace "pyedt":
-    cdef void _expand2d_u32[T](
-        T* labels, size_t sx, size_t sy,
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        uint32_t* out,
-        const uint32_t* label_values
-    ) nogil
-
-    cdef void _expand3d_u32[T](
-        T* labels, size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        uint32_t* out,
-        const uint32_t* label_values
-    ) nogil
-
     cdef void squared_edt_1d_multi_seg[T](
         T *labels,
         float *dest,
@@ -111,36 +214,6 @@ cdef extern from "edt.hpp" namespace "pyedt":
         int stride,
         float anisotropy,
         native_bool black_border
-        ) nogil
-
-    cdef void squared_edt_1d_parabolic_multi_seg[T](
-        T *labels,
-        float *dest,
-        int n,
-        int stride,
-        float anisotropy,
-        native_bool black_border
-        ) nogil
-
-    cdef void squared_edt_1d_parabolic_with_arg(
-        float *f,
-        int n,
-        int stride,
-        float anisotropy,
-        native_bool black_border_left,
-        native_bool black_border_right,
-        int* arg_out
-        ) nogil
-
-    # Expose variant that returns argmin indices along the processed axis
-    cdef void squared_edt_1d_parabolic_multi_seg_with_arg[T](
-        T *labels,
-        float *dest,
-        int n,
-        int stride,
-        float anisotropy,
-        native_bool black_border,
-        int* arg_out
         ) nogil
 
     # ND expand helpers (threaded per-axis over precomputed bases)
@@ -165,8 +238,7 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t s,
         float anis,
         native_bool black_border,
-        INDEX* feat_in,
-        INDEX* feat_out,
+        INDEX* feat,
         int parallel
     ) nogil
 
@@ -200,60 +272,6 @@ cdef extern from "edt.hpp" namespace "pyedt":
         int parallel
     ) nogil
 
-    # Updated _edt2dsq and _edt3dsq to allow optional feature tracking
-    cdef float* _edt2dsq[T, OUTIDX](
-        T* labels,
-        size_t sx, size_t sy,
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        float* output_dt, OUTIDX* output_feat
-    ) nogil
-
-    cdef float* _edt3dsq[T, OUTIDX](
-        T* labels,
-        size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        float* output_dt, OUTIDX* output_feat
-    ) nogil
-
-    # Feature transform wrappers
-    cdef float* _edt2dsq_features[T](
-        T* labels, size_t sx, size_t sy,
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        float* output_dt, size_t* output_feat
-    ) nogil
-
-    cdef float* _edt3dsq_features[T](
-        T* labels, size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        float* output_dt, size_t* output_feat
-    ) nogil
-
-    cdef float* _edt2dsq_features_u32[T](
-        T* labels, size_t sx, size_t sy,
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        float* output_dt, uint32_t* output_feat
-    ) nogil
-
-    cdef float* _edt3dsq_features_u32[T](
-        T* labels, size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        float* output_dt, uint32_t* output_feat
-    ) nogil
-
-    # Unified EDT+features (internal helpers)
-    cdef float* _edt2dsq_with_features[T, OUTIDX](
-        T* input, size_t sx, size_t sy,
-        float wx, float wy,
-        native_bool black_border, int parallel,
-        float* output_dt, OUTIDX* output_feat
-    ) nogil
-
     # Odometer threaded passes (no base arrays)
     cdef void _nd_pass_multi_odometer[T](
         T* labels, float* dest,
@@ -266,693 +284,70 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t ax, float anis, native_bool black_border, int parallel
     ) nogil
 
-    cdef float* _edt3dsq_with_features[T, OUTIDX](
-        T* input, size_t sx, size_t sy, size_t sz,
-        float wx, float wy, float wz,
-        native_bool black_border, int parallel,
-        float* output_dt, OUTIDX* output_feat
-    ) nogil
-
-    # ND threaded axis helpers
-    cdef void _nd_pass_multi[T](
-        T* labels, float* dest,
-        size_t dims, size_t* shape, size_t* strides,
-        size_t ax, float anis, native_bool black_border, int parallel
-    ) nogil
-    cdef void _nd_pass_parabolic[T](
-        T* labels, float* dest,
-        size_t dims, size_t* shape, size_t* strides,
-        size_t ax, float anis, native_bool black_border, int parallel
-    ) nogil
-
-    # Deprecated base-enumeration ND passes removed in favor of odometer passes
-
-
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
-  cdef float* _edt2dsq_voxel_graph[T,GRAPH_TYPE](
-    T* labels, GRAPH_TYPE* graph,
-    size_t sx, size_t sy,
-    float wx, float wy,
-    native_bool black_border, float* workspace
-  ) nogil 
-  cdef float* _edt3dsq_voxel_graph[T,GRAPH_TYPE](
-    T* labels, GRAPH_TYPE* graph,
-    size_t sx, size_t sy, size_t sz, 
-    float wx, float wy, float wz,
-    native_bool black_border, float* workspace
-  ) nogil
-  cdef mapcpp[T, vector[cpp_pair[size_t,size_t]]] extract_runs[T](
+  cdef mapcpp[T, vector[cpp_pair[size_t, size_t]]] extract_runs[T](
     T* labels, size_t voxels
   )
-  void set_run_voxels[T](
+  cdef void set_run_voxels[T](
     T key,
     vector[cpp_pair[size_t, size_t]] all_runs,
     T* labels, size_t voxels
   ) except +
-  void transfer_run_voxels[T](
+  cdef void transfer_run_voxels[T](
     vector[cpp_pair[size_t, size_t]] all_runs,
     T* src, T* dest,
     size_t voxels
   ) except +
 
-# Compact tuning chooser for ND (dims >= 4) based on effective threads.
-cdef inline void _nd_pick_tuning(int p_eff, size_t* tile, size_t* pref, size_t* chunks) nogil:
-  if p_eff < 16:
-    if p_eff > 2:
-      tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
-    else:
-      tile[0] = <size_t>16; pref[0] = <size_t>2; chunks[0] = <size_t>3
-  elif p_eff < 20:
-    tile[0] = <size_t>32; pref[0] = <size_t>2; chunks[0] = <size_t>3
-  else:
-    tile[0] = <size_t>16; pref[0] = <size_t>0; chunks[0] = <size_t>3
 
-# Dim/size-aware tuning (compact) for 2D/3D and general ND
-cdef inline void _nd_pick_tuning_dim(int dims, int sc, int p_eff, size_t* tile, size_t* pref, size_t* chunks) nogil:
-  # sc: size class (2D: 0=tiny<=64^2,1=small<=128^2,2=med<=512^2,3=large; 3D: 0<=32,1<=48,2<=64,3=large)
-  if dims == 2:
-    if sc <= 2:  # tiny/small/medium
-      tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
-    else:  # large
-      if p_eff >= 16:
-        tile[0] = <size_t>32; pref[0] = <size_t>2; chunks[0] = <size_t>3
-      else:
-        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
-  elif dims == 3:
-    if sc == 0:  # <=32
-      if p_eff >= 12:
-        tile[0] = <size_t>32; pref[0] = <size_t>1; chunks[0] = <size_t>1
-      elif p_eff <= 4:
-        tile[0] = <size_t>16; pref[0] = <size_t>2; chunks[0] = <size_t>3
-      else:
-        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>2
-    elif sc <= 2:  # <=48 or <=64
-      if p_eff >= 12:
-        tile[0] = <size_t>32; pref[0] = <size_t>1; chunks[0] = <size_t>1
-      else:
-        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>2
-    else:  # large
-      if p_eff >= 16:
-        tile[0] = <size_t>32; pref[0] = <size_t>2; chunks[0] = <size_t>3
-      else:
-        tile[0] = <size_t>8; pref[0] = <size_t>2; chunks[0] = <size_t>1
-  else:
-    _nd_pick_tuning(p_eff, tile, pref, chunks)
-
-def nvl(val, default_val):
-  if val is None:
-    return default_val
-  return val
-
-def _adaptive_thread_limit_2d(parallel, total_elements):
-  """Apply adaptive thread limiting for 2D arrays to prevent performance regressions."""
-  # Check if adaptive limiting is disabled
+def _adaptive_thread_limit_nd(parallel, shape):
+  """General ND limiter that matches 2D/3D heuristics and scales for higher dims."""
   try:
     if not bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1'))):
       return parallel
   except Exception:
     pass
 
-  if total_elements <= 16384:  # 128x128 or smaller
-    return min(parallel, 4)
-  elif total_elements <= 262144:  # 512x512 or smaller
-    return min(parallel, 8)
-  elif parallel >= 16:  # Large 2D with high threads
-    return min(parallel, 12)
-  return parallel
+  dims = len(shape)
+  if dims <= 1:
+    return parallel
 
-def _adaptive_thread_limit_3d(parallel, shape):
-  """Apply adaptive thread limiting for 3D arrays to prevent performance regressions."""
-  # Check if adaptive limiting is disabled
-  try:
-    if not bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1'))):
-      return parallel
-  except Exception:
-    pass
-
-  max_dim = max(shape[0], max(shape[1], shape[2]))
-  if max_dim <= 32:  # Very small 3D (32^3 or smaller)
-    return min(parallel, 4)
-  elif max_dim <= 48:  # Small 3D (48^3 or smaller)
-    return min(parallel, 8)
-  elif max_dim <= 64:  # Medium 3D (64^3 or smaller)
-    return min(parallel, 12)
-  return parallel
-
-@cython.binding(True)
-def sdf(
-  data, anisotropy=None, black_border=False,
-  int parallel = 1, voxel_graph=None, order=None
-):
-  """
-  Computes the anisotropic Signed Distance Function (SDF) using the Euclidean
-  Distance Transform (EDT) of up to 3D numpy arrays. The SDF is the same as the
-  EDT except that the background (zero) color is also processed and assigned a 
-  negative distance.
-
-  Supported Data Types:
-    (u)int8, (u)int16, (u)int32, (u)int64, 
-     float32, float64, and boolean
-
-  Required:
-    data: a 1d, 2d, or 3d numpy array with a supported data type.
-  Optional:
-    anisotropy:
-      1D: scalar (default: 1.0)
-      2D: (x, y) (default: (1.0, 1.0) )
-      3D: (x, y, z) (default: (1.0, 1.0, 1.0) )
-    black_border: (boolean) if true, consider the edge of the
-      image to be surrounded by zeros.
-    parallel: number of threads to use (only applies to 2D and 3D)
-    order: no longer functional, for backwards compatibility
-  Returns: SDF of data
-  """
-  def fn(labels):
-    return edt(
-      labels,
-      anisotropy=anisotropy,
-      black_border=black_border,
-      parallel=parallel,
-      voxel_graph=voxel_graph,
-    )
-  return fn(data) - fn(data == 0)
-
-@cython.binding(True)
-def sdfsq(
-  data, anisotropy=None, black_border=False,
-  int parallel = 1, voxel_graph=None
-):
-  """
-  sdfsq(data, anisotropy=None, black_border=False, order="K", parallel=1)
-
-  Computes the squared anisotropic Signed Distance Function (SDF) using the Euclidean
-  Distance Transform (EDT) of up to 3D numpy arrays. The SDF is the same as the
-  EDT except that the background (zero) color is also processed and assigned a 
-  negative distance.
-
-  data is assumed to be memory contiguous in either C (XYZ) or Fortran (ZYX) order. 
-  The algorithm works both ways, however you'll want to reverse the order of the
-  anisotropic arguments for Fortran order.
-
-  Supported Data Types:
-    (u)int8, (u)int16, (u)int32, (u)int64, 
-     float32, float64, and boolean
-
-  Required:
-    data: a 1d, 2d, or 3d numpy array with a supported data type.
-  Optional:
-    anisotropy:
-      1D: scalar (default: 1.0)
-      2D: (x, y) (default: (1.0, 1.0) )
-      3D: (x, y, z) (default: (1.0, 1.0, 1.0) )
-    black_border: (boolean) if true, consider the edge of the
-      image to be surrounded by zeros.
-    parallel: number of threads to use (only applies to 2D and 3D)
-
-  Returns: squared SDF of data
-  """
-  def fn(labels):
-    return edtsq(
-      labels,
-      anisotropy=anisotropy,
-      black_border=black_border,
-      parallel=parallel,
-      voxel_graph=voxel_graph,
-    )
-  return fn(data) - fn(data == 0)
-
-@cython.binding(True)
-def edt(
-    data, anisotropy=None, black_border=False, 
-    int parallel=1, voxel_graph=None, order=None,
-  ):
-  """
-  Computes the anisotropic Euclidean Distance Transform (EDT) of 1D, 2D, or 3D numpy arrays.
-
-  data is assumed to be memory contiguous in either C (XYZ) or Fortran (ZYX) order. 
-  The algorithm works both ways, however you'll want to reverse the order of the
-  anisotropic arguments for Fortran order.
-
-  Supported Data Types:
-    (u)int8, (u)int16, (u)int32, (u)int64, 
-     float32, float64, and boolean
-
-  Required:
-    data: a 1d, 2d, or 3d numpy array with a supported data type.
-  Optional:
-    anisotropy:
-      1D: scalar (default: 1.0)
-      2D: (x, y) (default: (1.0, 1.0) )
-      3D: (x, y, z) (default: (1.0, 1.0, 1.0) )
-    black_border: (boolean) if true, consider the edge of the
-      image to be surrounded by zeros.
-    parallel: number of threads to use (only applies to 2D and 3D)
-    voxel_graph: A numpy array where each voxel contains a  bitfield that 
-      represents a directed graph of the allowed directions for transit 
-      between voxels. If a connection is allowed, the respective direction 
-      is set to 1 else it set to 0.
-
-      See https://github.com/seung-lab/connected-components-3d/blob/master/cc3d.pyx#L743-L783
-      for details.
-    order: no longer functional, for backwards compatibility
-
-  Returns: EDT of data
-  """
-  dt = edtsq(data, anisotropy, black_border, parallel, voxel_graph)
-  return np.sqrt(dt,dt)
-
-@cython.binding(True)
-def edtsq(
-  data, anisotropy=None, native_bool black_border=False, 
-  int parallel=1, voxel_graph=None, order=None,
-):
-  """
-  Computes the squared anisotropic Euclidean Distance Transform (EDT) of 1D, 2D, or 3D numpy arrays.
-
-  Squaring allows for omitting an sqrt operation, so may be faster if your use case allows for it.
-
-  data is assumed to be memory contiguous in either C (XYZ) or Fortran (ZYX) order. 
-  The algorithm works both ways, however you'll want to reverse the order of the
-  anisotropic arguments for Fortran order.
-
-  Supported Data Types:
-    (u)int8, (u)int16, (u)int32, (u)int64, 
-     float32, float64, and boolean
-
-  Required:
-    data: a 1d, 2d, or 3d numpy array with a supported data type.
-  Optional:
-    anisotropy:
-      1D: scalar (default: 1.0)
-      2D: (x, y) (default: (1.0, 1.0) )
-      3D: (x, y, z) (default: (1.0, 1.0, 1.0) )
-    black_border: (boolean) if true, consider the edge of the
-      image to be surrounded by zeros.
-    parallel: number of threads to use (only applies to 2D and 3D)
-    order: no longer functional, for backwards compatibility
-
-  Returns: Squared EDT of data
-  """
-  global _nd_profile_last
-  _nd_profile_last = None
-  profile_env = os.environ.get('EDT_ND_PROFILE', '')
-  profile_enabled = False
-  if profile_env:
-    try:
-      profile_enabled = bool(int(profile_env))
-    except Exception:
-      profile_enabled = True
-  requested_parallel = parallel
-  profile_data = None
-  profile_sections = None
-  profile_axes = None
-  t_total_start = 0.0
-  if profile_enabled:
-    t_total_start = time.perf_counter()
-
-  if isinstance(data, list):
-    data = np.array(data)
-
-  dims = len(data.shape)
-
-  if data.size == 0:
-    return np.zeros(shape=data.shape, dtype=np.float32)
-
-  order = 'F' if data.flags.f_contiguous else 'C'
-  if not data.flags.c_contiguous and not data.flags.f_contiguous:
-    data = np.ascontiguousarray(data)
-
-  if parallel <= 0:
-    parallel = multiprocessing.cpu_count()
-  else:
-    # Cap to physical cores to avoid oversubscription with MKL/BLAS
-    try:
-      parallel = max(1, min(parallel, multiprocessing.cpu_count()))
-    except Exception:
-      parallel = max(1, parallel)
-
-  if voxel_graph is not None and dims not in (2,3):
-    raise TypeError("Voxel connectivity graph is only supported for 2D and 3D. Got {}.".format(dims))
-
-  if voxel_graph is not None:
-    if order == 'C':
-      voxel_graph = np.ascontiguousarray(voxel_graph)
-    else:
-      voxel_graph = np.asfortranarray(voxel_graph)
-
-  if dims == 1:
-    anisotropy = nvl(anisotropy, 1.0)
-    return edt1dsq(data, anisotropy, black_border)
-  elif dims == 2:
-    anisotropy = nvl(anisotropy, (1.0, 1.0))
-    return edt2dsq(data, anisotropy, black_border, parallel=parallel, voxel_graph=voxel_graph)
-  elif dims == 3:
-    anisotropy = nvl(anisotropy, (1.0, 1.0, 1.0))
-    return edt3dsq(data, anisotropy, black_border, parallel=parallel, voxel_graph=voxel_graph)
-  else:
-    raise TypeError("Multi-Label EDT library only supports up to 3 dimensions got {}.".format(dims))
-
-@cython.binding(True)
-def feature_transform(data, anisotropy=None, black_border=False,
-                      int parallel=1, voxel_graph=None,
-                      return_distances=False, features_dtype='auto'):
-  """
-  Feature transform of a label/seed image.
-
-  Nonzero elements are seeds. Returns an array of dtype np.intp (or np.uintp)
-  with the linear index of the nearest seed for every voxel. If
-  return_distances=True, also returns the squared EDT.
-
-  Parameters
-  ----------
-  data : ndarray
-      The input array (nonzero elements are seeds).
-  anisotropy : tuple, optional
-      Voxel size per axis (default 1.0 for each axis).
-  black_border : bool, optional
-      If True, treat the border as background (default False).
-  parallel : int, optional
-      Number of threads for parallel execution.
-  voxel_graph : ndarray, optional
-      Not used.
-  return_distances : bool, optional
-      If True, also return the squared EDT.
-  ties : {'last', 'first', 'scipy', 'left', 'smallest'}, optional
-      Tie-breaking policy for voxels equidistant to multiple seeds.
-      'last' (default): prefers the last site encountered (largest index, matches NumPy).
-      'first', 'scipy', 'left', 'smallest': prefers the first (lexicographically smallest index, matches SciPy).
-      All aliases besides 'last' map to the same behavior ('first').
-  features_dtype : {'auto', 'uint32', 'u32', 'uintp'}, optional
-      Output dtype for the feature (nearest seed) array. 'auto' (default) uses uint32 if the
-      number of voxels fits; otherwise uses uintp. 'uint32' or 'u32' always uses np.uint32,
-      'uintp' always uses np.uintp.
-  Returns
-  -------
-  feat : ndarray of intp or uint32
-      Linear indices of the nearest seed for each voxel.
-  dt : ndarray of float32, optional
-      Squared Euclidean distance, if return_distances=True.
-  """
-  # --- Cython declarations at function top-level ---
-  cdef native_bool bb
-  cdef int dims
-  cdef tuple anis
-  cdef np.ndarray arr
-
-  # 1D
-  cdef np.ndarray[np.uint8_t, ndim=1] seeds1
-  cdef Py_ssize_t n1 = 0
-  cdef np.ndarray[np.float32_t, ndim=1] dt1
-  cdef np.ndarray feat1
-  cdef float wx1
-  cdef Py_ssize_t i1 = 0
-  cdef Py_ssize_t s1 = 0
-  cdef Py_ssize_t k1 = 0
-
-  # 2D
-  cdef np.ndarray[np.uint8_t,  ndim=2] seeds2
-  cdef Py_ssize_t sx2 = 0
-  cdef Py_ssize_t sy2 = 0
-  cdef np.ndarray[np.float32_t, ndim=2] dt2
-  cdef np.ndarray[np.uint32_t, ndim=2] feat2_u32
-  cdef np.ndarray[np.uintp_t,  ndim=2] feat2_up
-  cdef float* dt2_ptr = NULL
-
-  # 3D
-  cdef np.ndarray[np.uint8_t,  ndim=3] seeds3
-  cdef Py_ssize_t sx3 = 0
-  cdef Py_ssize_t sy3 = 0
-  cdef Py_ssize_t sz3 = 0
-  cdef np.ndarray[np.float32_t, ndim=3] dt3
-  cdef np.ndarray[np.uint32_t, ndim=3] feat3_u32
-  cdef np.ndarray[np.uintp_t,  ndim=3] feat3_up
-  cdef float* dt3_ptr = NULL
-
-  # --- Python-level setup after declarations ---
-  bb = black_border
-  arr = np.asarray(data)
-  if arr.ndim not in (1, 2, 3):
-    raise ValueError("Only 1D, 2D, 3D supported")
-  if not arr.flags.c_contiguous:
-    arr = np.ascontiguousarray(arr)
-
-  dims = arr.ndim
-  if anisotropy is None:
-    anis = (1.0,) * dims
-  else:
-    anis = tuple(anisotropy) if hasattr(anisotropy, "__len__") else (float(anisotropy),) * dims
-    if len(anis) != dims:
-      raise ValueError("anisotropy length must match data.ndim")
-
-  # Normalize parallel just like edtsq():
-  if parallel <= 0:
-    try:
-      parallel = multiprocessing.cpu_count()
-    except Exception:
-      parallel = 1
-  else:
-    try:
-      parallel = max(1, min(parallel, multiprocessing.cpu_count()))
-    except Exception:
-      parallel = max(1, parallel)
-
-  # Decide features_dtype
-  voxels = arr.size
-  use_u32 = False
-  if isinstance(features_dtype, str):
-    fd = features_dtype.lower()
-    if fd == 'auto':
-      use_u32 = (voxels < 2**32)
-    elif fd in ('uint32', 'u32'):
-      use_u32 = True
-    else:
-      use_u32 = False  # 'uintp' or anything else
-
-  # 1D path
-  if dims == 1:
-    seeds1 = np.where(arr != 0, 1, 0).astype(np.uint8, order='C', copy=False)
-    n1 = seeds1.shape[0]
-    dt1   = np.empty((n1,), dtype=np.float32)
-    feat1 = np.empty((n1,), dtype=np.uint32 if use_u32 else np.uintp)
-    wx1 = <float>anis[0]
-
-    # compute nearest seed via simple midpoint selection
-    pos = np.flatnonzero(seeds1)
-    if pos.size == 0:
-      for i1 in range(n1):
-        feat1[i1] = i1
-        dt1[i1] = np.inf
-    else:
-      mids = (pos[:-1] + pos[1:]) * 0.5 if pos.size > 1 else np.array([])
-      k1 = 0
-      for i1 in range(n1):
-        while k1 < mids.size and i1 > mids[k1]:
-          k1 += 1
-        s1 = <Py_ssize_t>pos[min(k1, pos.size - 1)]
-        feat1[i1] = s1
-        dt1[i1] = wx1 * wx1 * (i1 - s1) * (i1 - s1)
-
-    return (feat1, dt1) if return_distances else feat1
-
-  # 2D path
+  # Match existing tuned behaviour for 2D and 3D so benchmarks line up.
   if dims == 2:
-    seeds2 = np.where(arr != 0, 1, 0).astype(np.uint8, order='C', copy=False)
-    sx2 = seeds2.shape[0]
-    sy2 = seeds2.shape[1]
-    if return_distances:
-        dt2 = np.empty((sx2, sy2), dtype=np.float32)
-        dt2_ptr = &dt2[0, 0]
+    total = shape[0] * shape[1]
+    if total <= 16384:  # <= 128x128
+      return min(parallel, 4)
+    if total <= 262144:  # <= 512x512
+      return min(parallel, 8)
+    if parallel >= 16:
+      return min(parallel, 12)
+    return parallel
 
-    if use_u32:
-        feat2_u32 = np.empty((sx2, sy2), dtype=np.uint32)
-        _edt2dsq_features_u32[uint8_t](
-            &seeds2[0, 0],
-            <size_t>sx2, <size_t>sy2,
-            <float>anis[0], <float>anis[1],
-            bb, parallel,
-            dt2_ptr, <uint32_t*>&feat2_u32[0, 0]
-        )
-        return (feat2_u32, dt2) if return_distances else feat2_u32
-    else:
-        feat2_up = np.empty((sx2, sy2), dtype=np.uintp)
-        _edt2dsq_features[uint8_t](
-            &seeds2[0, 0],
-            <size_t>sx2, <size_t>sy2,
-            <float>anis[0], <float>anis[1],
-            bb, parallel,
-            dt2_ptr, <size_t*>&feat2_up[0, 0]
-        )
-        return (feat2_up, dt2) if return_distances else feat2_up
-
-  # 3D path
-  seeds3 = np.where(arr != 0, 1, 0).astype(np.uint8, order='C', copy=False)
-  sx3 = seeds3.shape[0]
-  sy3 = seeds3.shape[1]
-  sz3 = seeds3.shape[2]
-  if return_distances:
-      dt3 = np.empty((sx3, sy3, sz3), dtype=np.float32)
-      dt3_ptr = &dt3[0, 0, 0]
-
-  if use_u32:
-      feat3_u32 = np.empty((sx3, sy3, sz3), dtype=np.uint32)
-      _edt3dsq_features_u32[uint8_t](
-          &seeds3[0, 0, 0],
-          <size_t>sx3, <size_t>sy3, <size_t>sz3,
-          <float>anis[0], <float>anis[1], <float>anis[2],
-          bb, parallel,
-          dt3_ptr, <uint32_t*>&feat3_u32[0, 0, 0]
-      )
-      return (feat3_u32, dt3) if return_distances else feat3_u32
-  else:
-      feat3_up = np.empty((sx3, sy3, sz3), dtype=np.uintp)
-      _edt3dsq_features[uint8_t](
-          &seeds3[0, 0, 0],
-          <size_t>sx3, <size_t>sy3, <size_t>sz3,
-          <float>anis[0], <float>anis[1], <float>anis[2],
-          bb, parallel,
-          dt3_ptr, <size_t*>&feat3_up[0, 0, 0]
-      )
-      return (feat3_up, dt3) if return_distances else feat3_up
-
-
-# ================================
-# Fast label expansion (no distances)
-# ================================
-@cython.binding(True)
-def expand_labels(
-    data, anisotropy=None, black_border=False,
-    int parallel=1, voxel_graph=None):
-  """Expand nonzero labels by nearest-neighbor in Euclidean metric (no distances).
-
-  Returns an array of dtype uint32 with labels copied from nearest seed.
-  """
-  cdef native_bool bb = black_border
-  # Enforce C-contiguous np.uint32 input
-  cdef np.ndarray arr = np.require(data, dtype=np.uint32, requirements='C')
-  if arr.ndim not in (1,2,3):
-    raise ValueError('Only 1D, 2D, 3D supported')
-
-  cdef int dims = arr.ndim
-  cdef tuple anis
-  if anisotropy is None:
-    anis = (1.0,) * dims
-  else:
-    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
-    if len(anis) != dims:
-      raise ValueError('anisotropy length must match data.ndim')
-
-  if parallel <= 0:
-    try: parallel = multiprocessing.cpu_count()
-    except Exception: parallel = 1
-  else:
-    try: parallel = max(1, min(parallel, multiprocessing.cpu_count()))
-    except Exception: parallel = max(1, parallel)
-
-  # --- Cython variable declarations for all branches ---
-  cdef Py_ssize_t n1
-  cdef np.ndarray[np.uint32_t, ndim=1] out1
-  cdef np.ndarray seed_pos
-  cdef np.ndarray mids_arr
-  cdef Py_ssize_t i
-  cdef Py_ssize_t k
-  cdef Py_ssize_t s
-
-  cdef Py_ssize_t sx
-  cdef Py_ssize_t sy
-  cdef np.ndarray[np.uint32_t, ndim=2] out2
-  cdef np.ndarray[np.uint8_t, ndim=2] seeds2
-  cdef np.ndarray[np.uint32_t, ndim=2] arr2
-
-  cdef Py_ssize_t sx3
-  cdef Py_ssize_t sy3
-  cdef Py_ssize_t sz3
-  cdef np.ndarray[np.uint32_t, ndim=3] out3
-  cdef np.ndarray[np.uint8_t, ndim=3] seeds3
-  cdef np.ndarray[np.uint32_t, ndim=3] arr3
-  cdef np.ndarray[np.uint32_t, ndim=1] label_values
-  cdef np.ndarray[np.uint32_t, ndim=2] feat_idx2
-  cdef np.ndarray[np.uint32_t, ndim=3] feat_idx3
-  cdef uint32_t[:] label_values_view
-  cdef uint8_t[:, :] seeds2_view
-  cdef uint8_t[:, :, :] seeds3_view
-  cdef uint32_t[:, :] feat_idx2_view
-  cdef uint32_t[:, :, :] feat_idx3_view
-
-
-  # 1D: simple midpoint selection
-  if dims == 1:
-    n1 = arr.shape[0]
-    out1 = np.empty((n1,), dtype=np.uint32)
-    # Detect seeds directly on arr
-    pos = np.flatnonzero(arr)
-    i = 0
-    k = 0
-    if pos.size == 0:
-      out1.fill(0)
-    elif pos.size == 1:
-      out1.fill(<np.uint32_t>arr[int(pos[0])])
-    else:
-      mids = (pos[:-1] + pos[1:]) * 0.5
-      for i in range(n1):
-        while k < mids.size and i >= mids[k]:
-          k += 1
-        s = <Py_ssize_t>pos[min(k, pos.size-1)]
-        out1[i] = <np.uint32_t>arr[s]
-    return out1
-
-  # 2D
-  if dims == 2:
-    # Optimized path using C++ feature transform kernels (like 3D)
-    sx = arr.shape[1]
-    sy = arr.shape[0]
-    out2 = np.empty((sy, sx), dtype=np.uint32)
-    seeds2 = (arr != 0).astype(np.uint8, order='C', copy=False)
-    # Create label_values as a 1D array of the original array values (for indexing)
-    label_values = arr.ravel().astype(np.uint32, order='C')
-    feat_idx2 = np.empty((sy, sx), dtype=np.uint32)
-    seeds2_view = seeds2
-    feat_idx2_view = feat_idx2
-    label_values_view = label_values
-    _expand2d_u32[uint8_t](
-        <uint8_t*>&seeds2_view[0, 0],
-        <size_t>sx, <size_t>sy,
-        <float>anis[1], <float>anis[0],
-        bb, parallel,
-        <uint32_t*>&feat_idx2_view[0, 0],
-        <const uint32_t*>&label_values_view[0]
-    )
-    # Map feature indices to label values
-    out2.ravel()[:] = label_values[feat_idx2.ravel()]
-    return out2
-
-  # 3D
   if dims == 3:
-    # C-order 3D arrays are (z, y, x). Kernels expect sizes (sx=x, sy=y, sz=z).
-    sx3 = arr.shape[2]
-    sy3 = arr.shape[1]
-    sz3 = arr.shape[0]
-    out3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
-    seeds3 = (arr != 0).astype(np.uint8, order='C', copy=False)
-    # Create label_values as a 1D array of the original array values (for indexing)
-    label_values = arr.ravel().astype(np.uint32, order='C')
-    label_values_view = label_values
-    # Allocate a temporary feature index buffer
-    feat_idx3 = np.empty((sz3, sy3, sx3), dtype=np.uint32)
-    seeds3_view = seeds3
-    feat_idx3_view = feat_idx3
-    # label_values_view is already set from 2D case above
-    _expand3d_u32[uint8_t](
-        <uint8_t*>&seeds3_view[0, 0, 0],
-        <size_t>sx3, <size_t>sy3, <size_t>sz3,
-        <float>anis[2], <float>anis[1], <float>anis[0],
-        bb, parallel,
-        <uint32_t*>&feat_idx3_view[0, 0, 0],
-        <const uint32_t*>&label_values_view[0]
-    )
-    # Map feature indices to label values
-    out3.ravel()[:] = label_values[feat_idx3.ravel()]
-  return out3
+    max_dim = max(shape)
+    if max_dim <= 32:
+      return min(parallel, 4)
+    if max_dim <= 48:
+      return min(parallel, 8)
+    if max_dim <= 64:
+      return min(parallel, 12)
+    return parallel
 
+  # Higher-D fallback: ensure every worker processes enough lines and voxels.
+  total = 1
+  for extent in shape:
+    total *= extent
+  longest = max(shape)
+  lines = max(1, total // longest)
+
+  # Require a minimum amount of work per thread to avoid oversubscription.
+  min_lines_per_thread = 64
+  min_voxels_per_thread = 32768
+
+  cap_lines = max(1, lines // min_lines_per_thread)
+  cap_voxels = max(1, total // min_voxels_per_thread)
+  cap = max(cap_lines, cap_voxels)
+  return max(1, min(parallel, cap))
 
 @cython.binding(True)
 def expand_labels_nd(
@@ -998,30 +393,54 @@ def expand_labels_nd(
   cdef Py_ssize_t s
   # Declarations for optional feature-return path
   cdef np.ndarray feat_prev
-  cdef np.ndarray feat_next
-  cdef np.ndarray tmpF
   cdef uint32_t* fprev_u32
-  cdef uint32_t* fnext_u32
   cdef size_t* fprev_sz
-  cdef size_t* fnext_sz
   cdef np.ndarray[np.uint32_t, ndim=1] out_flat
   cdef np.uint32_t* outp
   cdef np.uint32_t* labp2
   cdef size_t idx2
-
-  if parallel <= 0:
-    try:
-      parallel = multiprocessing.cpu_count()
-    except Exception:
-      parallel = 1
-  else:
-    try:
-      parallel = max(1, min(parallel, multiprocessing.cpu_count()))
-    except Exception:
-      parallel = max(1, parallel)
+  cdef Py_ssize_t total_voxels
+  cdef Py_ssize_t thresh8
+  cdef Py_ssize_t thresh12
+  cdef Py_ssize_t thresh16
+  cdef Py_ssize_t max_dim
+  cdef Py_ssize_t total_elems
+  cdef int target
 
   arr = np.require(data, dtype=np.uint32, requirements='C')
   dims = arr.ndim
+
+  cdef bint adapt_threads_enabled = True
+  try:
+    adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
+  except Exception:
+    adapt_threads_enabled = True
+
+  cdef int cpu_cap = 1
+  try:
+    cpu_cap = multiprocessing.cpu_count()
+  except Exception:
+    cpu_cap = max(1, parallel)
+
+  if parallel <= 0:
+    parallel = cpu_cap
+  else:
+    parallel = max(1, min(parallel, cpu_cap))
+
+  if adapt_threads_enabled and dims == 3:
+    total_voxels = arr.size
+    thresh8 = 128 * 128 * 128
+    thresh12 = 192 * 192 * 192
+    thresh16 = 256 * 256 * 256
+    target = 0
+    if total_voxels >= thresh16:
+      target = min(cpu_cap, 16)
+    elif total_voxels >= thresh12:
+      target = min(cpu_cap, 12)
+    elif total_voxels >= thresh8:
+      target = min(cpu_cap, 8)
+    if target > parallel:
+      parallel = target
   # Build anisotropy tuple
   cdef tuple anis
   if anisotropy is None:
@@ -1119,23 +538,15 @@ def expand_labels_nd(
   cdef uint32_t* lprev
   cdef uint32_t* lnext
   feat_prev = None
-  feat_next = None
-  tmpF = None
   fprev_u32 = NULL
-  fnext_u32 = NULL
   fprev_sz = NULL
-  fnext_sz = NULL
   if return_features:
     if use_u32_feat:
       feat_prev = np.empty((total,), dtype=np.uint32)
-      feat_next = np.empty((total,), dtype=np.uint32)
       fprev_u32 = <uint32_t*> np.PyArray_DATA(feat_prev)
-      fnext_u32 = <uint32_t*> np.PyArray_DATA(feat_next)
     else:
       feat_prev = np.empty((total,), dtype=np.uintp)
-      feat_next = np.empty((total,), dtype=np.uintp)
       fprev_sz = <size_t*> np.PyArray_DATA(feat_prev)
-      fnext_sz = <size_t*> np.PyArray_DATA(feat_next)
   else:
     lab_prev = np.empty((total,), dtype=np.uint32)
     lab_next = np.empty((total,), dtype=np.uint32)
@@ -1238,17 +649,9 @@ def expand_labels_nd(
     if return_features:
       with nogil:
         if use_u32_feat:
-          _nd_expand_parabolic_bases[uint32_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_u32, fnext_u32, parallel)
+          _nd_expand_parabolic_bases[uint32_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_u32, parallel)
         else:
-          _nd_expand_parabolic_bases[size_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_sz, fnext_sz, parallel)
-      # swap features
-      tmpF = feat_prev; feat_prev = feat_next; feat_next = tmpF
-      if use_u32_feat:
-        fprev_u32 = <uint32_t*> np.PyArray_DATA(feat_prev)
-        fnext_u32 = <uint32_t*> np.PyArray_DATA(feat_next)
-      else:
-        fprev_sz = <size_t*> np.PyArray_DATA(feat_prev)
-        fnext_sz = <size_t*> np.PyArray_DATA(feat_next)
+          _nd_expand_parabolic_bases[size_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_sz, parallel)
     else:
       with nogil:
         _nd_expand_parabolic_labels_bases(distp, bases, lines, n0, s0, canis[paxes[a]], bb, lprev, lnext, parallel)
@@ -1274,6 +677,14 @@ def expand_labels_nd(
     return out_flat.reshape(arr.shape), feat_prev.reshape(arr.shape)
   else:
     return lab_prev.reshape(arr.shape)
+
+
+@cython.binding(True)
+def expand_labels(
+    data, anisotropy=None, black_border=False,
+    int parallel=1, voxel_graph=None):
+  """Compatibility wrapper that forwards to :func:`expand_labels_nd`."""
+  return expand_labels_nd(data, anisotropy, black_border, parallel, voxel_graph, False)
 
 
 @cython.binding(True)
@@ -1352,549 +763,21 @@ def feature_transform_nd(
   return feats
 
 
-def edt1d(data, anisotropy=1.0, native_bool black_border=False):
-  result = edt1dsq(data, anisotropy, black_border)
-  return np.sqrt(result, result)
-
-def edt1dsq(data, anisotropy=1.0, native_bool black_border=False):
-  cdef uint8_t[:] arr_memview8
-  cdef uint16_t[:] arr_memview16
-  cdef uint32_t[:] arr_memview32
-  cdef uint64_t[:] arr_memview64
-  cdef float[:] arr_memviewfloat
-  cdef double[:] arr_memviewdouble
-
-  cdef size_t voxels = data.size
-  cdef np.ndarray[float, ndim=1] output = np.zeros( (voxels,), dtype=np.float32 )
-  cdef float[:] outputview = output
-
-  if data.dtype in (np.uint8, np.int8):
-    arr_memview8 = data.astype(np.uint8)
-    squared_edt_1d_multi_seg[uint8_t](
-      <uint8_t*>&arr_memview8[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  elif data.dtype in (np.uint16, np.int16):
-    arr_memview16 = data.astype(np.uint16)
-    squared_edt_1d_multi_seg[uint16_t](
-      <uint16_t*>&arr_memview16[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  elif data.dtype in (np.uint32, np.int32):
-    arr_memview32 = data.astype(np.uint32)
-    squared_edt_1d_multi_seg[uint32_t](
-      <uint32_t*>&arr_memview32[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  elif data.dtype in (np.uint64, np.int64):
-    arr_memview64 = data.astype(np.uint64)
-    squared_edt_1d_multi_seg[uint64_t](
-      <uint64_t*>&arr_memview64[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  elif data.dtype == np.float32:
-    arr_memviewfloat = data
-    squared_edt_1d_multi_seg[float](
-      <float*>&arr_memviewfloat[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  elif data.dtype == np.float64:
-    arr_memviewdouble = data
-    squared_edt_1d_multi_seg[double](
-      <double*>&arr_memviewdouble[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  elif data.dtype == bool:
-    arr_memview8 = data.astype(np.uint8)
-    squared_edt_1d_multi_seg[native_bool](
-      <native_bool*>&arr_memview8[0],
-      &outputview[0],
-      data.size,
-      1,
-      anisotropy,
-      black_border
-    )
-  
-  return output
-
-def edt2d(
-    data, anisotropy=(1.0, 1.0), 
-    native_bool black_border=False,
-    parallel=1, voxel_graph=None
-  ):
-  result = edt2dsq(data, anisotropy, black_border, parallel, voxel_graph)
-  return np.sqrt(result, result)
-
-def edt2dsq(
-    data, anisotropy=(1.0, 1.0), 
-    native_bool black_border=False,
-    parallel=1, voxel_graph=None
-  ):
-  if voxel_graph is not None:
-    return __edt2dsq_voxel_graph(data, voxel_graph, anisotropy, black_border)
-  return __edt2dsq(data, anisotropy, black_border, parallel)
-
-def __edt2dsq(
-    data, anisotropy=(1.0, 1.0),
-    native_bool black_border=False,
-    parallel=1
-  ):
-  # Unified adaptive limiting for 2D
-  parallel = _adaptive_thread_limit_2d(parallel, data.size)
-
-  cdef uint8_t[:,:] arr_memview8
-  cdef uint16_t[:,:] arr_memview16
-  cdef uint32_t[:,:] arr_memview32
-  cdef uint64_t[:,:] arr_memview64
-  cdef float[:,:] arr_memviewfloat
-  cdef double[:,:] arr_memviewdouble
-  cdef native_bool[:,:] arr_memviewbool
-
-  cdef size_t sx = data.shape[1] # C: rows
-  cdef size_t sy = data.shape[0] # C: cols
-  cdef float ax = anisotropy[1]
-  cdef float ay = anisotropy[0]
-
-  order = 'C'
-  if data.flags.f_contiguous:
-    sx = data.shape[0] # F: cols
-    sy = data.shape[1] # F: rows
-    ax = anisotropy[0]
-    ay = anisotropy[1]
-    order = 'F'
-
-  cdef size_t voxels = sx * sy
-  cdef np.ndarray[float, ndim=1] output = np.zeros( (voxels,), dtype=np.float32 )
-  cdef float[:] outputview = output
-
-  if data.dtype in (np.uint8, np.int8):
-    arr_memview8 = data.astype(np.uint8)
-    _edt2dsq_with_features[uint8_t, size_t](
-      <uint8_t*>&arr_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-  elif data.dtype in (np.uint16, np.int16):
-    arr_memview16 = data.astype(np.uint16)
-    _edt2dsq_with_features[uint16_t, size_t](
-      <uint16_t*>&arr_memview16[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-  elif data.dtype in (np.uint32, np.int32):
-    arr_memview32 = data.astype(np.uint32)
-    _edt2dsq_with_features[uint32_t, size_t](
-      <uint32_t*>&arr_memview32[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-  elif data.dtype in (np.uint64, np.int64):
-    arr_memview64 = data.astype(np.uint64)
-    _edt2dsq_with_features[uint64_t, size_t](
-      <uint64_t*>&arr_memview64[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-  elif data.dtype == np.float32:
-    arr_memviewfloat = data
-    _edt2dsq_with_features[float, size_t](
-      <float*>&arr_memviewfloat[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-  elif data.dtype == np.float64:
-    arr_memviewdouble = data
-    _edt2dsq_with_features[double, size_t](
-      <double*>&arr_memviewdouble[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-  elif data.dtype == bool:
-    arr_memview8 = data.view(np.uint8)
-    _edt2dsq_with_features[native_bool, size_t](
-      <native_bool*>&arr_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border, parallel,
-      &outputview[0], NULL
-    )
-
-  return output.reshape(data.shape, order=order)
-
-def __edt2dsq_voxel_graph(
-    data, voxel_graph, anisotropy=(1.0, 1.0), 
-    native_bool black_border=False,
-  ):
-  cdef uint8_t[:,:] arr_memview8
-  cdef uint16_t[:,:] arr_memview16
-  cdef uint32_t[:,:] arr_memview32
-  cdef uint64_t[:,:] arr_memview64
-  cdef float[:,:] arr_memviewfloat
-  cdef double[:,:] arr_memviewdouble
-  cdef native_bool[:,:] arr_memviewbool
-
-  cdef uint8_t[:,:] graph_memview8
-  if voxel_graph.dtype in (np.uint8, np.int8):
-    graph_memview8 = voxel_graph.view(np.uint8)
-  else:
-    graph_memview8 = voxel_graph.astype(np.uint8) # we only need first 6 bits
-
-  cdef size_t sx = data.shape[1] # C: rows
-  cdef size_t sy = data.shape[0] # C: cols
-  cdef float ax = anisotropy[1]
-  cdef float ay = anisotropy[0]
-  order = 'C'
-
-  if data.flags.f_contiguous:
-    sx = data.shape[0] # F: cols
-    sy = data.shape[1] # F: rows
-    ax = anisotropy[0]
-    ay = anisotropy[1]
-    order = 'F'
-
-  cdef size_t voxels = sx * sy
-  cdef np.ndarray[float, ndim=1] output = np.zeros( (voxels,), dtype=np.float32 )
-  cdef float[:] outputview = output
-
-  if data.dtype in (np.uint8, np.int8):
-    arr_memview8 = data.astype(np.uint8)
-    _edt2dsq_voxel_graph[uint8_t,uint8_t](
-      <uint8_t*>&arr_memview8[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]
-    )
-  elif data.dtype in (np.uint16, np.int16):
-    arr_memview16 = data.astype(np.uint16)
-    _edt2dsq_voxel_graph[uint16_t,uint8_t](
-      <uint16_t*>&arr_memview16[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]      
-    )
-  elif data.dtype in (np.uint32, np.int32):
-    arr_memview32 = data.astype(np.uint32)
-    _edt2dsq_voxel_graph[uint32_t,uint8_t](
-      <uint32_t*>&arr_memview32[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]      
-    )
-  elif data.dtype in (np.uint64, np.int64):
-    arr_memview64 = data.astype(np.uint64)
-    _edt2dsq_voxel_graph[uint64_t,uint8_t](
-      <uint64_t*>&arr_memview64[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]      
-    )
-  elif data.dtype == np.float32:
-    arr_memviewfloat = data
-    _edt2dsq_voxel_graph[float,uint8_t](
-      <float*>&arr_memviewfloat[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]      
-    )
-  elif data.dtype == np.float64:
-    arr_memviewdouble = data
-    _edt2dsq_voxel_graph[double,uint8_t](
-      <double*>&arr_memviewdouble[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]      
-    )
-  elif data.dtype == bool:
-    arr_memview8 = data.view(np.uint8)
-    _edt2dsq_voxel_graph[native_bool,uint8_t](
-      <native_bool*>&arr_memview8[0,0],
-      <uint8_t*>&graph_memview8[0,0],
-      sx, sy,
-      ax, ay,
-      black_border,
-      &outputview[0]      
-    )
-
-  return output.reshape( data.shape, order=order)
-
-def edt3d(
-    data, anisotropy=(1.0, 1.0, 1.0), 
-    native_bool black_border=False,
-    parallel=1, voxel_graph=None
-  ):
-  result = edt3dsq(data, anisotropy, black_border, parallel, voxel_graph)
-  return np.sqrt(result, result)
-
-def edt3dsq(
-    data, anisotropy=(1.0, 1.0, 1.0), 
-    native_bool black_border=False,
-    int parallel=1, voxel_graph=None
-  ):
-  if voxel_graph is not None:
-    return __edt3dsq_voxel_graph(data, voxel_graph, anisotropy, black_border)
-  return __edt3dsq(data, anisotropy, black_border, parallel)
-
-def __edt3dsq(
-    data, anisotropy=(1.0, 1.0, 1.0),
-    native_bool black_border=False,
-    int parallel=1
-  ):
-  # Unified adaptive limiting for 3D
-  parallel = _adaptive_thread_limit_3d(parallel, data.shape)
-
-  cdef uint8_t[:,:,:] arr_memview8
-  cdef uint16_t[:,:,:] arr_memview16
-  cdef uint32_t[:,:,:] arr_memview32
-  cdef uint64_t[:,:,:] arr_memview64
-  cdef float[:,:,:] arr_memviewfloat
-  cdef double[:,:,:] arr_memviewdouble
-
-  cdef size_t sx = data.shape[2]
-  cdef size_t sy = data.shape[1]
-  cdef size_t sz = data.shape[0]
-  cdef float ax = anisotropy[2]
-  cdef float ay = anisotropy[1]
-  cdef float az = anisotropy[0]
-
-  order = 'C'
-  if data.flags.f_contiguous:
-    sx, sy, sz = sz, sy, sx
-    ax = anisotropy[0]
-    ay = anisotropy[1]
-    az = anisotropy[2]
-    order = 'F'
-
-  cdef size_t voxels = sx * sy * sz
-  cdef np.ndarray[float, ndim=1] output = np.zeros( (voxels,), dtype=np.float32 )
-  cdef float[:] outputview = output
-
-  if data.dtype in (np.uint8, np.int8):
-    arr_memview8 = data.astype(np.uint8)
-    _edt3dsq_with_features[uint8_t, size_t](
-      <uint8_t*>&arr_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-  elif data.dtype in (np.uint16, np.int16):
-    arr_memview16 = data.astype(np.uint16)
-    _edt3dsq_with_features[uint16_t, size_t](
-      <uint16_t*>&arr_memview16[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-  elif data.dtype in (np.uint32, np.int32):
-    arr_memview32 = data.astype(np.uint32)
-    _edt3dsq_with_features[uint32_t, size_t](
-      <uint32_t*>&arr_memview32[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-  elif data.dtype in (np.uint64, np.int64):
-    arr_memview64 = data.astype(np.uint64)
-    _edt3dsq_with_features[uint64_t, size_t](
-      <uint64_t*>&arr_memview64[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-  elif data.dtype == np.float32:
-    arr_memviewfloat = data
-    _edt3dsq_with_features[float, size_t](
-      <float*>&arr_memviewfloat[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-  elif data.dtype == np.float64:
-    arr_memviewdouble = data
-    _edt3dsq_with_features[double, size_t](
-      <double*>&arr_memviewdouble[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-  elif data.dtype == bool:
-    arr_memview8 = data.view(np.uint8)
-    _edt3dsq_with_features[native_bool, size_t](
-      <native_bool*>&arr_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border, parallel,
-      <float*>&outputview[0], NULL
-    )
-
-  return output.reshape( data.shape, order=order)
-
-def __edt3dsq_voxel_graph(
-    data, voxel_graph, 
-    anisotropy=(1.0, 1.0, 1.0), 
-    native_bool black_border=False,
-  ):
-  cdef uint8_t[:,:,:] arr_memview8
-  cdef uint16_t[:,:,:] arr_memview16
-  cdef uint32_t[:,:,:] arr_memview32
-  cdef uint64_t[:,:,:] arr_memview64
-  cdef float[:,:,:] arr_memviewfloat
-  cdef double[:,:,:] arr_memviewdouble
-
-  cdef uint8_t[:,:,:] graph_memview8
-  if voxel_graph.dtype in (np.uint8, np.int8):
-    graph_memview8 = voxel_graph.view(np.uint8)
-  else:
-    graph_memview8 = voxel_graph.astype(np.uint8) # we only need first 6 bits
-
-  cdef size_t sx = data.shape[2]
-  cdef size_t sy = data.shape[1]
-  cdef size_t sz = data.shape[0]
-  cdef float ax = anisotropy[2]
-  cdef float ay = anisotropy[1]
-  cdef float az = anisotropy[0]
-  order = 'C'
-
-  if data.flags.f_contiguous:
-    sx, sy, sz = sz, sy, sx
-    ax = anisotropy[0]
-    ay = anisotropy[1]
-    az = anisotropy[2]
-    order = 'F'
-
-  cdef size_t voxels = sx * sy * sz
-  cdef np.ndarray[float, ndim=1] output = np.zeros( (voxels,), dtype=np.float32 )
-  cdef float[:] outputview = output
-
-  if data.dtype in (np.uint8, np.int8):
-    arr_memview8 = data.astype(np.uint8)
-    _edt3dsq_voxel_graph[uint8_t,uint8_t](
-      <uint8_t*>&arr_memview8[0,0,0],
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-  elif data.dtype in (np.uint16, np.int16):
-    arr_memview16 = data.astype(np.uint16)
-    _edt3dsq_voxel_graph[uint16_t,uint8_t](
-      <uint16_t*>&arr_memview16[0,0,0], 
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-  elif data.dtype in (np.uint32, np.int32):
-    arr_memview32 = data.astype(np.uint32)
-    _edt3dsq_voxel_graph[uint32_t,uint8_t](
-      <uint32_t*>&arr_memview32[0,0,0],
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-  elif data.dtype in (np.uint64, np.int64):
-    arr_memview64 = data.astype(np.uint64)
-    _edt3dsq_voxel_graph[uint64_t,uint8_t](
-      <uint64_t*>&arr_memview64[0,0,0],
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-  elif data.dtype == np.float32:
-    arr_memviewfloat = data
-    _edt3dsq_voxel_graph[float,uint8_t](
-      <float*>&arr_memviewfloat[0,0,0],
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-  elif data.dtype == np.float64:
-    arr_memviewdouble = data
-    _edt3dsq_voxel_graph[double,uint8_t](
-      <double*>&arr_memviewdouble[0,0,0],
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-  elif data.dtype == bool:
-    arr_memview8 = data.view(np.uint8)
-    _edt3dsq_voxel_graph[native_bool,uint8_t](
-      <native_bool*>&arr_memview8[0,0,0],
-      <uint8_t*>&graph_memview8[0,0,0],
-      sx, sy, sz,
-      ax, ay, az,
-      black_border,
-      <float*>&outputview[0]
-    )
-
-  return output.reshape(data.shape, order=order)
-
-
-
-
+@cython.binding(True)
+def feature_transform(data, anisotropy=None, black_border=False,
+                      int parallel=1, voxel_graph=None,
+                      return_distances=False, features_dtype='auto'):
+  """Compatibility wrapper that forwards to :func:`feature_transform_nd`."""
+  return feature_transform_nd(data, anisotropy, black_border, parallel, voxel_graph,
+                              return_distances, features_dtype)
+def __getattr__(name):
+  """Forward unknown attributes to the packaged legacy module."""
+  try:
+    attr = getattr(original, name)
+  except AttributeError as exc:
+    raise AttributeError(name) from exc
+  setattr(sys.modules[__name__], name, attr)
+  return attr
 
 
 @cython.binding(True)
@@ -1919,6 +802,11 @@ def edtsq_nd(
   cdef dict profile_data = {}
   cdef dict profile_sections = {}
   cdef list profile_axes = []
+  cdef Py_ssize_t total_voxels
+  cdef Py_ssize_t thresh8
+  cdef Py_ssize_t thresh12
+  cdef Py_ssize_t thresh16
+  cdef int target
 
   profile_env = os.environ.get('EDT_ND_PROFILE')
   if profile_env:
@@ -1971,15 +859,40 @@ def edtsq_nd(
     profile_sections = profile_data['sections']
     profile_sections['prep'] = time.perf_counter() - t_total_start
 
-  cdef int p = parallel
+  cdef bint adapt_threads_enabled = True
   try:
-    if p <= 0:
-      p = multiprocessing.cpu_count()
-    else:
-      p = max(1, min(p, multiprocessing.cpu_count()))
+    adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
   except Exception:
-    p = max(1, parallel)
-  parallel = p
+    adapt_threads_enabled = True
+
+  cdef int cpu_cap = 1
+  try:
+    cpu_cap = multiprocessing.cpu_count()
+  except Exception:
+    cpu_cap = max(1, parallel)
+
+  cdef int p = parallel
+  if p <= 0:
+    p = cpu_cap
+  else:
+    p = max(1, min(p, cpu_cap))
+
+  if adapt_threads_enabled and dims == 3:
+    total_voxels = arr.size
+    thresh8 = 128 * 128 * 128
+    thresh12 = 192 * 192 * 192
+    thresh16 = 256 * 256 * 256
+    target = 0
+    if total_voxels >= thresh16:
+      target = min(cpu_cap, 16)
+    elif total_voxels >= thresh12:
+      target = min(cpu_cap, 12)
+    elif total_voxels >= thresh8:
+      target = min(cpu_cap, 8)
+    if target > p:
+      p = target
+
+  parallel = _adaptive_thread_limit_nd(p, arr.shape)
 
   if profile_enabled:
     profile_data['parallel_used'] = parallel
@@ -2009,6 +922,37 @@ def edtsq_nd(
       cstrides[i] = cstrides[i-1] * cshape[i-1]
   for i in range(nd):
     total *= cshape[i]
+
+  cdef size_t tune_tile = 0
+  cdef size_t tune_prefetch = 0
+  cdef size_t tune_chunks = 0
+  if parallel > 1:
+    if dims == 3:
+      max_dim = max(arr.shape)
+      if max_dim >= 256:
+        tune_tile = 64; tune_prefetch = 4; tune_chunks = <size_t>max(1, parallel // 2)
+      elif max_dim >= 128:
+        tune_tile = 32; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
+      elif max_dim >= 64:
+        tune_tile = 16; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
+      else:
+        tune_tile = 8; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel)
+    elif dims == 2:
+      total_elems = arr.shape[0] * arr.shape[1]
+      if total_elems >= 1024 * 1024:
+        tune_tile = 64; tune_prefetch = 3; tune_chunks = <size_t>max(1, parallel // 2)
+      elif total_elems >= 256 * 256:
+        tune_tile = 32; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
+      elif total_elems >= 128 * 128:
+        tune_tile = 16; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
+      else:
+        tune_tile = 8; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel)
+    else:
+      tune_tile = 16 if dims <= 4 else 8
+      tune_prefetch = 2
+      tune_chunks = <size_t>max(1, parallel // 2)
+    with nogil:
+      nd_set_tuning(tune_tile, tune_prefetch, tune_chunks)
 
   cdef np.ndarray out = np.zeros((<Py_ssize_t> total,), dtype=np.float32)
   cdef float* outp = <float*> np.PyArray_DATA(out)
@@ -2088,10 +1032,9 @@ def edtsq_nd(
   if not black_border:
     if profile_enabled:
       t_tmp = time.perf_counter()
-    with nogil:
-      for i in range(total):
-        if isinf(outp[i]):
-          outp[i] = 3.4028234e+38
+    mask_inf = np.isinf(out)
+    if mask_inf.any():
+      out[mask_inf] = np.finfo(np.float32).max
     if profile_enabled:
       profile_sections['multi_fix'] = time.perf_counter() - t_tmp
   elif profile_enabled:
@@ -2122,10 +1065,9 @@ def edtsq_nd(
   if not black_border:
     if profile_enabled:
       t_tmp = time.perf_counter()
-    with nogil:
-      for i in range(total):
-        if outp[i] >= 3.4028234e+38:
-          outp[i] = INFINITY
+    mask_max = out >= np.finfo(np.float32).max
+    if mask_max.any():
+      out[mask_max] = np.inf
     if profile_enabled:
       profile_sections['post_fix'] = time.perf_counter() - t_tmp
   elif profile_enabled:

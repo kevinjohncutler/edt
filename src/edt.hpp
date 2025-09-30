@@ -328,14 +328,15 @@ void squared_edt_1d_parabolic(
 }
 
 // Variant that also records the true argmin index per element (v[k]).
-inline void squared_edt_1d_parabolic_with_arg(
+inline void squared_edt_1d_parabolic_with_arg_stride(
     float* f,
     const long int n,
     const long int stride,
     const float anisotropy,
     const bool black_border_left,
     const bool black_border_right,
-    int* arg_out
+    int* arg_out,
+    const long int arg_stride
   ) {
   if (n == 0) return;
   const float w2 = anisotropy * anisotropy;
@@ -370,7 +371,7 @@ inline void squared_edt_1d_parabolic_with_arg(
   for (long int i = 0; i < n; i++) {
     while (ranges[k + 1] < i) k++;
     f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
-    arg_out[i * stride] = v[k];
+    arg_out[i * arg_stride] = v[k];
     if (black_border_left && black_border_right) {
       envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
       f[i * stride] = std::fminf(envelope, f[i * stride]);
@@ -380,6 +381,21 @@ inline void squared_edt_1d_parabolic_with_arg(
       f[i * stride] = std::fminf(w2 * sq(n - i), f[i * stride]);
     }
   }
+}
+
+inline void squared_edt_1d_parabolic_with_arg(
+    float* f,
+    const long int n,
+    const long int stride,
+    const float anisotropy,
+    const bool black_border_left,
+    const bool black_border_right,
+    int* arg_out
+  ) {
+  squared_edt_1d_parabolic_with_arg_stride(
+      f, n, stride, anisotropy,
+      black_border_left, black_border_right,
+      arg_out, stride);
 }
 
 inline void squared_edt_1d_parabolic_with_arg(
@@ -1653,7 +1669,10 @@ inline void _nd_expand_init_bases(
           any_zero |= (!seeded);
         }
         if (any_zero) {
-          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+          squared_edt_1d_parabolic_with_arg_stride(
+              dist + base, (int)n, (long)s, anis,
+              black_border, black_border,
+              arg.data(), 1);
         } else {
           // all seeded: arg is identity
           for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
@@ -1676,31 +1695,38 @@ inline void _nd_expand_parabolic_bases(
     const size_t s,
     const float anis,
     const bool black_border,
-    const INDEX* feat_in,
-    INDEX* feat_out,
+    INDEX* feat,
     const int parallel
 ) {
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
-  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+  size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
     pool.enqueue([=]() {
       std::vector<int> arg(n);
+      std::vector<INDEX> feat_line(n);
       for (size_t i = start; i < end; ++i) {
         const size_t base = bases[i];
         bool any_nonzero = false;
-        for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
+        for (size_t j = 0; j < n; ++j) {
+          const float val = dist[base + j * s];
+          any_nonzero |= (val != 0.0f);
+          feat_line[j] = feat[base + j * s];
+        }
         if (any_nonzero) {
-          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+          squared_edt_1d_parabolic_with_arg_stride(
+              dist + base, (int)n, (long)s, anis,
+              black_border, black_border,
+              arg.data(), 1);
         } else {
           // all zeros: keep current feature mapping
           for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
         }
         for (size_t j = 0; j < n; ++j) {
-          feat_out[base + j * s] = feat_in[base + (size_t)arg[j] * s];
+          feat[base + j * s] = feat_line[(size_t)arg[j]];
         }
       }
     });
@@ -1740,7 +1766,10 @@ inline void _nd_expand_init_labels_bases(
           any_nonseed |= (!seeded);
         }
         if (any_nonseed) {
-          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+          squared_edt_1d_parabolic_with_arg_stride(
+              dist + base, (int)n, (long)s, anis,
+              black_border, black_border,
+              arg.data(), 1);
         } else {
           for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
         }
@@ -1779,7 +1808,10 @@ inline void _nd_expand_parabolic_labels_bases(
         bool any_nonzero = false;
         for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
         if (any_nonzero) {
-          squared_edt_1d_parabolic_with_arg(dist + base, (int)n, (long)s, anis, black_border, black_border, arg.data());
+          squared_edt_1d_parabolic_with_arg_stride(
+              dist + base, (int)n, (long)s, anis,
+              black_border, black_border,
+              arg.data(), 1);
         } else {
           for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
         }

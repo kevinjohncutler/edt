@@ -41,20 +41,31 @@ if sys.platform != 'win32':
   extra_link_args += ['-flto']
 
 
+extensions = [
+  setuptools.Extension(
+    'edt',
+    sources=['src/edt.pyx'],
+    language='c++',
+    include_dirs=['src', str(NumpyImport())],
+    extra_compile_args=extra_compile_args,
+    extra_link_args=extra_link_args,
+    define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
+  ),
+  setuptools.Extension(
+    'edt_original',
+    sources=['src_old/edt.pyx'],
+    language='c++',
+    include_dirs=['src_old', str(NumpyImport())],
+    extra_compile_args=extra_compile_args,
+    extra_link_args=extra_link_args,
+    define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
+  ),
+]
+
 setuptools.setup(
   setup_requires=['cython', 'setuptools_scm'],
   python_requires=">=3.8,<4",
   use_scm_version=True,
-  ext_modules=[
-    setuptools.Extension(
-      'edt',
-      sources=[ 'src/edt.pyx' ],
-      language='c++',
-      include_dirs=[ 'src', str(NumpyImport()) ],
-      extra_compile_args=extra_compile_args,
-      extra_link_args=extra_link_args,
-      define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-    ),
-  ],
+  ext_modules=extensions,
   long_description_content_type='text/markdown',
 )

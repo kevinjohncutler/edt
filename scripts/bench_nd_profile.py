@@ -21,6 +21,24 @@ sys.path.insert(0, str(ROOT / 'src'))
 import edt  # noqa: E402
 
 
+def resolve_specialized(dims: int):
+    if dims == 2:
+        if hasattr(edt, 'original'):
+            orig = getattr(edt, 'original')
+            if getattr(orig, 'available', lambda: False)():
+                return orig.edt2dsq, (1.0, 1.0)
+        if hasattr(edt, 'edt2dsq'):
+            return edt.edt2dsq, (1.0, 1.0)
+    elif dims == 3:
+        if hasattr(edt, 'original'):
+            orig = getattr(edt, 'original')
+            if getattr(orig, 'available', lambda: False)():
+                return orig.edt3dsq, (1.0, 1.0, 1.0)
+        if hasattr(edt, 'edt3dsq'):
+            return edt.edt3dsq, (1.0, 1.0, 1.0)
+    raise ValueError(f"No specialized EDT available for {dims}D.")
+
+
 def parse_int_list(spec: str) -> List[int]:
     return [int(x.strip()) for x in spec.split(',') if x.strip()]
 
@@ -58,8 +76,9 @@ def make_array(rng: np.random.Generator, shape: Tuple[int, ...], dtype: np.dtype
 
 
 def bench_pair(arr: np.ndarray, parallel: int, reps: int) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    spec_fn, anis = resolve_specialized(arr.ndim)
     # warmup
-    edt.edtsq(arr, parallel=parallel)
+    spec_fn(arr, anisotropy=anis, black_border=False, parallel=parallel)
     edt.edtsq_nd(arr, parallel=parallel)
 
     spec_best = float('inf')
@@ -67,7 +86,7 @@ def bench_pair(arr: np.ndarray, parallel: int, reps: int) -> Tuple[float, float,
     spec_out: np.ndarray | None = None
     nd_out: np.ndarray | None = None
     for _ in range(reps):
-        t0 = time.perf_counter(); spec_tmp = edt.edtsq(arr, parallel=parallel); t1 = time.perf_counter()
+        t0 = time.perf_counter(); spec_tmp = spec_fn(arr, anisotropy=anis, black_border=False, parallel=parallel); t1 = time.perf_counter()
         t2 = time.perf_counter(); nd_tmp = edt.edtsq_nd(arr, parallel=parallel); t3 = time.perf_counter()
         spec_best = min(spec_best, t1 - t0)
         nd_best = min(nd_best, t3 - t2)
@@ -102,20 +121,28 @@ def main() -> None:
     parser.add_argument('--reps', type=int, default=5, help='Number of repetitions per timing')
     parser.add_argument('--dtype', default='uint8', help='NumPy dtype for test arrays')
     parser.add_argument('--output', default=str(ROOT / 'benchmarks' / 'nd_profile_runs.csv'), help='Output CSV path')
-    parser.add_argument('--no-header', action='store_true', help='Skip CSV header when appending to existing file')
+    parser.add_argument('--no-header', action='store_true', help='Skip CSV header in the output file')
+    parser.add_argument('--disable-tuning', action='store_true', help='Disable adaptive tuning for specialized and ND paths')
     args = parser.parse_args()
 
     parallels = parse_int_list(args.parallels)
     dims_requested = parse_int_list(args.dims)
     dtype = np.dtype(args.dtype)
     shapes = default_shapes(dims_requested)
-    min_time = float(os.environ.get('EDT_BENCH_MIN_TIME', '0.5'))
-    max_time = float(os.environ.get('EDT_BENCH_MAX_TIME', '10.0'))
+    # Use quicker defaults so a single sweep stays snappy unless overridden by env vars.
+    min_time = float(os.environ.get('EDT_BENCH_MIN_TIME', '0.05'))
+    max_time = float(os.environ.get('EDT_BENCH_MAX_TIME', '1.0'))
     min_samples = int(os.environ.get('EDT_BENCH_MIN_REPEAT', '1'))
     rng = np.random.default_rng(0)
 
-    os.environ.pop('EDT_ND_AUTOTUNE', None)
-    os.environ.pop('EDT_ND_THREAD_CAP', None)
+    if args.disable_tuning:
+        os.environ['EDT_ADAPTIVE_THREADS'] = '0'
+        os.environ['EDT_ND_AUTOTUNE'] = '0'
+        os.environ['EDT_ND_THREAD_CAP'] = '0'
+    else:
+        os.environ.pop('EDT_ADAPTIVE_THREADS', None)
+        os.environ.pop('EDT_ND_AUTOTUNE', None)
+        os.environ.pop('EDT_ND_THREAD_CAP', None)
     os.environ['EDT_ND_PROFILE'] = '1'
 
     rows = []
@@ -169,13 +196,13 @@ def main() -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0].keys()) if rows else []
-    write_header = not args.no_header and (not output_path.exists() or output_path.stat().st_size == 0)
-    with output_path.open('a', newline='') as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nWrote {len(rows)} rows to {output_path}")
+    with output_path.open('w', newline='') as fp:
+        if fieldnames:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            if not args.no_header:
+                writer.writeheader()
+            writer.writerows(rows)
+    print(f"\nWrote {len(rows)} rows to {output_path} (overwritten)")
 
 
 if __name__ == '__main__':
