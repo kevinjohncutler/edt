@@ -11,6 +11,8 @@ import csv
 import os
 import sys
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -22,20 +24,46 @@ import edt  # noqa: E402
 
 
 def resolve_specialized(dims: int):
+    if dims == 1:
+        fn = getattr(edt, "edt1dsq", None)
+
+        def spec(arr, anisotropy, black_border, parallel):
+            scalar = anisotropy[0] if isinstance(anisotropy, (tuple, list)) else float(anisotropy)
+            if fn is not None:
+                return fn(arr, anisotropy=scalar, black_border=black_border)
+            return edt.edtsq(arr, anisotropy=scalar, black_border=black_border, parallel=parallel)
+
+        return spec, (1.0,)
+
     if dims == 2:
-        if hasattr(edt, 'original'):
+        try:
             orig = getattr(edt, 'original')
             if getattr(orig, 'available', lambda: False)():
-                return orig.edt2dsq, (1.0, 1.0)
-        if hasattr(edt, 'edt2dsq'):
-            return edt.edt2dsq, (1.0, 1.0)
-    elif dims == 3:
-        if hasattr(edt, 'original'):
+                def spec(arr, anisotropy, black_border, parallel):
+                    return orig.edt2dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+                return spec, (1.0, 1.0)
+        except Exception:
+            pass
+        spec_fn = getattr(edt, 'edt2dsq', None)
+        if spec_fn is not None:
+            def spec(arr, anisotropy, black_border, parallel):
+                return spec_fn(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+            return spec, (1.0, 1.0)
+
+    if dims == 3:
+        try:
             orig = getattr(edt, 'original')
             if getattr(orig, 'available', lambda: False)():
-                return orig.edt3dsq, (1.0, 1.0, 1.0)
-        if hasattr(edt, 'edt3dsq'):
-            return edt.edt3dsq, (1.0, 1.0, 1.0)
+                def spec(arr, anisotropy, black_border, parallel):
+                    return orig.edt3dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+                return spec, (1.0, 1.0, 1.0)
+        except Exception:
+            pass
+        spec_fn = getattr(edt, 'edt3dsq', None)
+        if spec_fn is not None:
+            def spec(arr, anisotropy, black_border, parallel):
+                return spec_fn(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+            return spec, (1.0, 1.0, 1.0)
     raise ValueError(f"No specialized EDT available for {dims}D.")
 
 
@@ -45,8 +73,17 @@ def parse_int_list(spec: str) -> List[int]:
 
 def default_shapes(dims: Sequence[int]) -> List[Tuple[int, ...]]:
     shapes: List[Tuple[int, ...]] = []
+    if 1 in dims:
+        shapes.extend([(256,), (1024,), (4096,)])
     if 2 in dims:
-        shapes.extend([(128, 128), (256, 256), (512, 512), (1024, 1024)])
+        shapes.extend([
+            (96, 96),
+            (128, 128),
+            (256, 256),
+            (512, 512),
+            (1024, 1024),
+            (2048, 2048),
+        ])
     if 3 in dims:
         shapes.extend([
             (48, 48, 48),
@@ -55,14 +92,19 @@ def default_shapes(dims: Sequence[int]) -> List[Tuple[int, ...]]:
             (128, 128, 128),
             (256, 256, 256),
             (384, 384, 384),
-            (512, 512, 512),
         ])
     return shapes
 
 
 def make_array(rng: np.random.Generator, shape: Tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     arr = rng.integers(0, 3, size=shape, dtype=dtype)
-    if arr.ndim == 2:
+    if arr.ndim == 1:
+        length = shape[0]
+        if length > 8:
+            arr[: length // 4] = 0
+            arr[length // 4 : length // 2] = 1
+            arr[3 * length // 4 :] = 2
+    elif arr.ndim == 2:
         y, x = shape
         if y > 20 and x > 20:
             arr[y // 4 : y // 2, x // 4 : x // 2] = 1
@@ -75,25 +117,116 @@ def make_array(rng: np.random.Generator, shape: Tuple[int, ...], dtype: np.dtype
     return arr
 
 
-def bench_pair(arr: np.ndarray, parallel: int, reps: int) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    spec_fn, anis = resolve_specialized(arr.ndim)
+@dataclass
+class BenchmarkSample:
+    spec_times: list[float]
+    nd_times: list[float]
+    max_diff: float
+    profile: dict | None
+
+
+def run_once(
+    arr: np.ndarray,
+    parallel: int,
+    reps: int,
+    spec_fn,
+    anis: Tuple[float, ...],
+) -> BenchmarkSample:
     # warmup
     spec_fn(arr, anisotropy=anis, black_border=False, parallel=parallel)
     edt.edtsq_nd(arr, parallel=parallel)
 
-    spec_best = float('inf')
-    nd_best = float('inf')
-    spec_out: np.ndarray | None = None
-    nd_out: np.ndarray | None = None
-    for _ in range(reps):
-        t0 = time.perf_counter(); spec_tmp = spec_fn(arr, anisotropy=anis, black_border=False, parallel=parallel); t1 = time.perf_counter()
-        t2 = time.perf_counter(); nd_tmp = edt.edtsq_nd(arr, parallel=parallel); t3 = time.perf_counter()
-        spec_best = min(spec_best, t1 - t0)
-        nd_best = min(nd_best, t3 - t2)
-        spec_out = spec_tmp
-        nd_out = nd_tmp
-    assert spec_out is not None and nd_out is not None
-    return spec_best, nd_best, spec_out, nd_out
+    spec_times: list[float] = []
+    nd_times: list[float] = []
+    max_diff = 0.0
+    last_profile: dict | None = None
+
+    for _ in range(max(1, reps)):
+        t0 = time.perf_counter()
+        spec_tmp = spec_fn(arr, anisotropy=anis, black_border=False, parallel=parallel)
+        t1 = time.perf_counter()
+
+        t2 = time.perf_counter()
+        nd_tmp = edt.edtsq_nd(arr, parallel=parallel)
+        t3 = time.perf_counter()
+
+        spec_times.append(t1 - t0)
+        nd_times.append(t3 - t2)
+
+        diff = float(np.max(np.abs(spec_tmp - nd_tmp)))
+        if diff > max_diff:
+            max_diff = diff
+
+        if os.environ.get('EDT_ND_PROFILE'):
+            last_profile = edt.edtsq_nd_last_profile()
+
+    return BenchmarkSample(spec_times, nd_times, max_diff, last_profile)
+
+
+@contextmanager
+def temporary_env(overrides: dict[str, str | None]):
+    sentinel = object()
+    previous: dict[str, object] = {}
+    try:
+        for key, value in overrides.items():
+            previous[key] = os.environ.get(key, sentinel)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, old in previous.items():
+            if old is sentinel:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old  # type: ignore[arg-type]
+
+
+def measure_variant(
+    arr: np.ndarray,
+    parallel: int,
+    reps: int,
+    spec_fn,
+    anis: Tuple[float, ...],
+    min_samples: int,
+    min_time: float,
+    max_time: float,
+    overrides: dict[str, str | None],
+) -> Tuple[float, float, float, dict]:
+    def run_sample() -> BenchmarkSample:
+        with temporary_env(overrides):
+            return run_once(arr, parallel, reps, spec_fn, anis)
+
+    sample = run_sample()
+    spec_times = list(sample.spec_times)
+    nd_times = list(sample.nd_times)
+    max_diff = sample.max_diff
+    profile = sample.profile
+
+    nd_time = min(nd_times) if nd_times else float('inf')
+    repeat_count = adaptive_repeat(nd_time, min_samples=min_samples, min_time=min_time, max_time=max_time)
+    if repeat_count > 1:
+        for _ in range(repeat_count - 1):
+            sample_r = run_sample()
+            spec_times.extend(sample_r.spec_times)
+            nd_times.extend(sample_r.nd_times)
+            if sample_r.max_diff > max_diff:
+                max_diff = sample_r.max_diff
+            if sample_r.profile:
+                profile = sample_r.profile
+        spec_time_val = float(np.mean(spec_times))
+        nd_time_val = float(np.mean(nd_times))
+    else:
+        spec_time_val = min(spec_times)
+        nd_time_val = nd_time
+
+    if profile is None:
+        with temporary_env(overrides):
+            profile = edt.edtsq_nd_last_profile() or {}
+    else:
+        profile = profile or {}
+    return spec_time_val, nd_time_val, max_diff, profile
 
 
 def adaptive_repeat(time_s: float, min_samples: int, min_time: float, max_time: float) -> int:
@@ -117,7 +250,7 @@ def extract_axes(profile: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark ND profiling scenarios")
     parser.add_argument('--parallels', default='4,8,16', help='Comma separated list of parallel values')
-    parser.add_argument('--dims', default='2,3', help='Comma separated dimensions to test (e.g. "2,3")')
+    parser.add_argument('--dims', default='1,2,3', help='Comma separated dimensions to test (e.g. "1,2,3")')
     parser.add_argument('--reps', type=int, default=5, help='Number of repetitions per timing')
     parser.add_argument('--dtype', default='uint8', help='NumPy dtype for test arrays')
     parser.add_argument('--output', default=str(ROOT / 'benchmarks' / 'nd_profile_runs.csv'), help='Output CSV path')
@@ -146,52 +279,117 @@ def main() -> None:
     os.environ['EDT_ND_PROFILE'] = '1'
 
     rows = []
+    adaptive_overrides = {
+        'EDT_ADAPTIVE_THREADS': None,
+        'EDT_ND_AUTOTUNE': None,
+        'EDT_ND_THREAD_CAP': None,
+    }
+    exact_overrides = {
+        'EDT_ADAPTIVE_THREADS': '0',
+        'EDT_ND_AUTOTUNE': '0',
+        'EDT_ND_THREAD_CAP': '0',
+    }
     for parallel in parallels:
         for shape in shapes:
             arr = make_array(rng, shape, dtype)
-            spec_time, nd_time, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
-            diff = float(np.max(np.abs(spec_out - nd_out)))
-            del spec_out, nd_out
+            spec_fn, anis = resolve_specialized(arr.ndim)
 
-            repeat_count = adaptive_repeat(nd_time, min_samples=min_samples, min_time=min_time, max_time=max_time)
-            if repeat_count > 1:
-                spec_times = [spec_time]
-                nd_times = [nd_time]
-                max_diff = diff
-                for _ in range(repeat_count - 1):
-                    spec_time_r, nd_time_r, spec_out, nd_out = bench_pair(arr, parallel, args.reps)
-                    spec_times.append(spec_time_r)
-                    nd_times.append(nd_time_r)
-                    max_diff = max(max_diff, float(np.max(np.abs(spec_out - nd_out))))
-                    del spec_out, nd_out
-                spec_time = float(np.mean(spec_times))
-                nd_time = float(np.mean(nd_times))
-                diff = max_diff
-            profile = edt.edtsq_nd_last_profile() or {}
-            sections = profile.get('sections', {})
+            if args.disable_tuning:
+                spec_ad = spec_exact = 0.0  # placeholder will be overwritten below
+                spec_exact, nd_exact, diff_exact, profile_exact = measure_variant(
+                    arr,
+                    parallel,
+                    args.reps,
+                    spec_fn,
+                    anis,
+                    min_samples,
+                    min_time,
+                    max_time,
+                    exact_overrides,
+                )
+                spec_ad = spec_exact
+                adaptive_summary = {
+                    'nd_ms': nd_exact * 1000.0,
+                    'ratio': nd_exact / spec_exact if spec_exact else float('inf'),
+                    'parallel_used': profile_exact.get('parallel_used') if profile_exact else None,
+                    'diff': diff_exact,
+                }
+                exact_summary = adaptive_summary
+            else:
+                spec_ad, nd_ad, diff_ad, profile_ad = measure_variant(
+                    arr,
+                    parallel,
+                    args.reps,
+                    spec_fn,
+                    anis,
+                    min_samples,
+                    min_time,
+                    max_time,
+                    adaptive_overrides,
+                )
+                spec_exact, nd_exact, diff_exact, profile_exact = measure_variant(
+                    arr,
+                    parallel,
+                    args.reps,
+                    spec_fn,
+                    anis,
+                    min_samples,
+                    min_time,
+                    max_time,
+                    exact_overrides,
+                )
+                adaptive_summary = {
+                    'nd_ms': nd_ad * 1000.0,
+                    'ratio': nd_ad / spec_ad if spec_ad else float('inf'),
+                    'parallel_used': profile_ad.get('parallel_used') if profile_ad else None,
+                    'diff': diff_ad,
+                }
+                exact_summary = {
+                    'nd_ms': nd_exact * 1000.0,
+                    'ratio': nd_exact / spec_exact if spec_exact else float('inf'),
+                    'parallel_used': profile_exact.get('parallel_used') if profile_exact else None,
+                    'diff': diff_exact,
+                }
+            profile_exact = profile_exact or {}
+            sections = profile_exact.get('sections', {})
             row = {
                 'shape': 'x'.join(str(s) for s in shape),
                 'dims': len(shape),
                 'parallel_request': parallel,
-                'spec_ms': spec_time * 1000.0,
-                'nd_ms': nd_time * 1000.0,
-                'ratio': nd_time / spec_time if spec_time else float('inf'),
-                'parallel_used': profile.get('parallel_used'),
-                'max_abs_diff': diff,
+                'spec_ms_adaptive': spec_ad * 1000.0,
+                'spec_ms_exact': spec_exact * 1000.0,
+                'nd_adaptive_ms': adaptive_summary['nd_ms'],
+                'nd_adaptive_ratio': adaptive_summary['ratio'],
+                'nd_adaptive_parallel_used': adaptive_summary['parallel_used'],
+                'max_abs_diff_adaptive': adaptive_summary['diff'],
+                'nd_exact_ms': exact_summary['nd_ms'],
+                'nd_exact_ratio': exact_summary['ratio'],
+                'nd_exact_parallel_used': exact_summary['parallel_used'],
+                'max_abs_diff_exact': exact_summary['diff'],
                 'total_ms': float(sections.get('total', 0.0)) * 1000.0,
                 'prep_ms': float(sections.get('prep', 0.0)) * 1000.0,
                 'multi_pass_ms': float(sections.get('multi_pass', 0.0)) * 1000.0,
                 'parabolic_pass_ms': float(sections.get('parabolic_pass', 0.0)) * 1000.0,
                 'multi_fix_ms': float(sections.get('multi_fix', 0.0)) * 1000.0,
                 'post_fix_ms': float(sections.get('post_fix', 0.0)) * 1000.0,
-                'axes_detail': extract_axes(profile),
+                'axes_detail': extract_axes(profile_exact),
             }
             rows.append(row)
-            print(
-                f"shape={row['shape']:<12} p={parallel:<3d} spec={row['spec_ms']:.3f}ms "
-                f"nd={row['nd_ms']:.3f}ms ratio={row['ratio']:.3f} diff={row['max_abs_diff']:.3e} "
-                f"multi_ms={row['multi_pass_ms']:.3f} parab_ms={row['parabolic_pass_ms']:.3f}"
-            )
+            if args.disable_tuning:
+                print(
+                    f"shape={row['shape']:<12} p={parallel:<3d} spec={row['spec_ms_exact']:.3f}ms "
+                    f"exact={row['nd_exact_ms']:.3f}ms exact/spec={row['nd_exact_ratio']:.3f} "
+                    f"used={row['nd_exact_parallel_used']} diff={row['max_abs_diff_exact']:.3e}"
+                )
+            else:
+                print(
+                    f"shape={row['shape']:<12} p={parallel:<3d} spec_ad={row['spec_ms_adaptive']:.3f}ms "
+                    f"adapt={row['nd_adaptive_ms']:.3f}ms adapt/spec={row['nd_adaptive_ratio']:.3f} "
+                    f"used={row['nd_adaptive_parallel_used']} spec_ex={row['spec_ms_exact']:.3f}ms "
+                    f"exact={row['nd_exact_ms']:.3f}ms "
+                    f"exact/spec={row['nd_exact_ratio']:.3f} used={row['nd_exact_parallel_used']} "
+                    f"diff_adapt={row['max_abs_diff_adaptive']:.3e} diff_exact={row['max_abs_diff_exact']:.3e}"
+                )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

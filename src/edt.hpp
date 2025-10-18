@@ -75,6 +75,8 @@ inline void toinfinite(float *f, const size_t voxels) {
   }
 }
 
+#include "compiled_nd/loop.hpp"
+
 /* 1D Euclidean Distance Transform for Multiple Segids
  *
  * Map a row of segids to a euclidean distance transform.
@@ -477,6 +479,33 @@ void squared_edt_1d_parabolic_multi_seg(
   const bool black_border=false,
   int* arg_out=nullptr
 ) {
+  constexpr int SMALL_THRESHOLD = 8;
+  const float anis_sq = anisotropy * anisotropy;
+
+  auto process_small_run = [&](long int start, int len, bool left_border, bool right_border) {
+    float original[SMALL_THRESHOLD];
+    for (int q = 0; q < len; ++q) {
+      original[q] = f[(start + q) * stride];
+    }
+    for (int j = 0; j < len; ++j) {
+      float best = original[j];
+      if (left_border) {
+        const float cap_left = anis_sq * static_cast<float>((j + 1) * (j + 1));
+        if (cap_left < best) best = cap_left;
+      }
+      if (right_border) {
+        const float cap_right = anis_sq * static_cast<float>((len - j) * (len - j));
+        if (cap_right < best) best = cap_right;
+      }
+      for (int q = 0; q < len; ++q) {
+        const float delta = static_cast<float>(j - q);
+        const float candidate = original[q] + anis_sq * delta * delta;
+        if (candidate < best) best = candidate;
+      }
+      f[(start + j) * stride] = best;
+    }
+  };
+
   T working_segid = segids[0];
   T segid;
   long int last = 0;
@@ -485,7 +514,12 @@ void squared_edt_1d_parabolic_multi_seg(
     segid = segids[i * stride];
     if (segid != working_segid) {
       if (working_segid != 0) {
-        if (arg_out) {
+        const int run_len = i - last;
+        const bool left_border = (black_border || last > 0);
+        const bool right_border = true;
+        if (arg_out == nullptr && run_len <= SMALL_THRESHOLD) {
+          process_small_run(last, run_len, left_border, right_border);
+        } else if (arg_out) {
           // true argmin indices (relative to run), then offset to absolute
           squared_edt_1d_parabolic_with_arg(
             f + last * stride,
@@ -510,7 +544,12 @@ void squared_edt_1d_parabolic_multi_seg(
   }
 
   if (working_segid != 0 && last < n) {
-    if (arg_out) {
+    const int run_len = n - last;
+    const bool left_border = (black_border || last > 0);
+    const bool right_border = black_border;
+    if (arg_out == nullptr && run_len <= SMALL_THRESHOLD) {
+      process_small_run(last, run_len, left_border, right_border);
+    } else if (arg_out) {
       squared_edt_1d_parabolic_with_arg(
         f + last * stride,
         n - last, stride, anisotropy,
@@ -1448,13 +1487,22 @@ inline void _nd_pass_multi_bases(
 ) {
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
-  ThreadPool pool(threads);
+  if (threads <= 1 || num_lines == 1) {
+    for (size_t i = 0; i < num_lines; ++i) {
+      const size_t base = bases[i];
+      squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+    }
+    return;
+  }
+  auto& pool = ::pyedt::compiled2::shared_pool_for(static_cast<size_t>(threads));
+  std::vector<std::future<void>> pending;
+  pending.reserve(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
   const size_t TILE = ND_TILE;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
-    pool.enqueue([=]() {
+    pending.push_back(pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
         for (size_t j = i; j < t_end; ++j) {
@@ -1468,9 +1516,11 @@ inline void _nd_pass_multi_bases(
           squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
         }
       }
-    });
+    }));
   }
-  pool.join();
+  for (auto& f : pending) {
+    f.get();
+  }
 }
 
 template <typename T>
@@ -1484,13 +1534,22 @@ inline void _nd_pass_parabolic_bases(
 ) {
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
-  ThreadPool pool(threads);
+  const size_t TILE = ND_TILE;
+  if (threads <= 1 || num_lines == 1) {
+    for (size_t i = 0; i < num_lines; ++i) {
+      const size_t base = bases[i];
+      squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+    }
+    return;
+  }
+  auto& pool = ::pyedt::compiled2::shared_pool_for(static_cast<size_t>(threads));
+  std::vector<std::future<void>> pending;
+  pending.reserve(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
-  const size_t TILE = ND_TILE;
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
-    pool.enqueue([=]() {
+    pending.push_back(pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
         for (size_t j = i; j < t_end; ++j) {
@@ -1504,9 +1563,191 @@ inline void _nd_pass_parabolic_bases(
           squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
         }
       }
-    });
+    }));
   }
-  pool.join();
+  for (auto& f : pending) {
+    f.get();
+  }
+}
+
+template <typename T>
+inline bool _nd_pass_multi_compiled(
+    T* labels,
+    float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel) {
+  if (dims == 0 || dims > 5) {
+    return false;
+  }
+  const size_t n = shape[ax];
+  if (n <= 1) {
+    return true;
+  }
+  if (parallel <= 1) {
+    return false;
+  }
+
+  size_t extents_buf[5] = {0, 0, 0, 0, 0};
+  size_t stride_buf[5] = {0, 0, 0, 0, 0};
+  size_t m = 0;
+  for (size_t i = 0; i < dims; ++i) {
+    if (i == ax) continue;
+    extents_buf[m] = shape[i];
+    stride_buf[m] = strides[i];
+    ++m;
+  }
+
+  size_t num_lines = 1;
+  for (size_t i = 0; i < m; ++i) {
+    if (extents_buf[i] == 0) {
+      num_lines = 0;
+      break;
+    }
+    num_lines *= extents_buf[i];
+  }
+  if (num_lines == 0) {
+    return true;
+  }
+
+  std::vector<size_t> bases(num_lines);
+  size_t idx = 0;
+  auto record_base = [&](size_t base) {
+    if (idx < num_lines) {
+      bases[idx++] = base;
+    }
+  };
+
+  switch (m) {
+    case 0:
+      bases[0] = 0;
+      break;
+    case 1:
+      ::pyedt::compiled2::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    case 2:
+      ::pyedt::compiled2::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    case 3:
+      ::pyedt::compiled2::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    case 4:
+      ::pyedt::compiled2::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    default:
+      return false;
+  }
+
+  if (idx != num_lines) {
+    return false;
+  }
+
+  const size_t stride_ax = strides[ax];
+  _nd_pass_multi_bases<T>(
+      labels,
+      dest,
+      bases.data(),
+      num_lines,
+      n,
+      stride_ax,
+      anis,
+      black_border,
+      parallel);
+  return true;
+}
+
+template <typename T>
+inline bool _nd_pass_parabolic_compiled(
+    T* labels,
+    float* dest,
+    const size_t dims,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ax,
+    const float anis,
+    const bool black_border,
+    const int parallel) {
+  if (dims == 0 || dims > 5) {
+    return false;
+  }
+  const size_t n = shape[ax];
+  if (n <= 1) {
+    return true;
+  }
+  if (parallel <= 1) {
+    return false;
+  }
+
+  size_t extents_buf[5] = {0, 0, 0, 0, 0};
+  size_t stride_buf[5] = {0, 0, 0, 0, 0};
+  size_t m = 0;
+  for (size_t i = 0; i < dims; ++i) {
+    if (i == ax) continue;
+    extents_buf[m] = shape[i];
+    stride_buf[m] = strides[i];
+    ++m;
+  }
+
+  size_t num_lines = 1;
+  for (size_t i = 0; i < m; ++i) {
+    if (extents_buf[i] == 0) {
+      num_lines = 0;
+      break;
+    }
+    num_lines *= extents_buf[i];
+  }
+  if (num_lines == 0) {
+    return true;
+  }
+
+  std::vector<size_t> bases(num_lines);
+  size_t idx = 0;
+  auto record_base = [&](size_t base) {
+    if (idx < num_lines) {
+      bases[idx++] = base;
+    }
+  };
+
+  switch (m) {
+    case 0:
+      bases[0] = 0;
+      break;
+    case 1:
+      ::pyedt::compiled2::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    case 2:
+      ::pyedt::compiled2::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    case 3:
+      ::pyedt::compiled2::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    case 4:
+      ::pyedt::compiled2::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
+      break;
+    default:
+      return false;
+  }
+
+  if (idx != num_lines) {
+    return false;
+  }
+
+  const size_t stride_ax = strides[ax];
+  _nd_pass_parabolic_bases<T>(
+      labels,
+      dest,
+      bases.data(),
+      num_lines,
+      n,
+      stride_ax,
+      anis,
+      black_border,
+      parallel);
+  return true;
 }
 
 // Odometer-style threaded pass (no base array; per-chunk init, then incrementally update base)
@@ -1541,63 +1782,71 @@ inline void _nd_pass_odometer(
   for (size_t i = 0; i < m; ++i) rad[i] = shape[ord[i]];
 
   const int threads = std::max(1, parallel);
-  ThreadPool pool(threads);
+  const size_t tile_size = ND_TILE > 0 ? ND_TILE : 8;
+
+  auto process_range = [&](size_t start, size_t end) {
+    size_t tmp = start;
+    std::vector<size_t> idx(m, 0);
+    std::vector<size_t> sim_idx(m, 0);
+    std::vector<size_t> bases_tile(tile_size);
+    size_t base = 0;
+    for (size_t i = 0; i < m; ++i) {
+      if (rad[i] > 0) {
+        idx[i] = tmp % rad[i];
+        tmp /= rad[i];
+        base += idx[i] * strides[ord[i]];
+      }
+    }
+    const size_t count = end - start;
+    size_t cdone = 0;
+    while (cdone < count) {
+      const size_t tcount = std::min(tile_size, count - cdone);
+      size_t sim_base = base;
+      sim_idx = idx;
+      for (size_t t = 0; t < tcount; ++t) {
+        bases_tile[t] = sim_base;
+        for (size_t i = 0; i < m; ++i) {
+          ++sim_idx[i];
+          sim_base += strides[ord[i]];
+          if (sim_idx[i] < rad[i]) break;
+          sim_base -= strides[ord[i]] * rad[i];
+          sim_idx[i] = 0;
+        }
+      }
+      for (size_t t = 0; t < tcount; ++t) {
+        if (ND_PREFETCH_STEP > 0) {
+          const size_t pre = t + ND_PREFETCH_STEP;
+          if (pre < tcount) {
+            EDT_PREFETCH(labels + bases_tile[pre]);
+          }
+        }
+        const size_t b = bases_tile[t];
+        kernel_call(labels + b, dest + b, (int)n, (long int)s, anis, black_border);
+      }
+      base = sim_base;
+      idx.swap(sim_idx);
+      cdone += tcount;
+    }
+  };
+
+  if (threads <= 1) {
+    process_range(0, lines);
+    return;
+  }
+
+  ThreadPool& pool = ::pyedt::compiled2::shared_pool_for(static_cast<size_t>(threads));
+  std::vector<std::future<void>> pending;
+  pending.reserve(static_cast<size_t>(threads));
   size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));
   const size_t chunk = (lines + chunks - 1) / chunks;
 
   for (size_t start = 0; start < lines; start += chunk) {
     const size_t end = std::min(lines, start + chunk);
-    pool.enqueue([=]() {
-      // Initial index vector and base for this chunk
-      size_t tmp = start;
-      const size_t TILE = ND_TILE > 0 ? ND_TILE : 8;
-      std::vector<size_t> idx(m, 0);
-      std::vector<size_t> sim_idx(m, 0);
-      std::vector<size_t> bases_tile(TILE);
-      size_t base = 0;
-      for (size_t i = 0; i < m; ++i) {
-        if (rad[i] > 0) {
-          idx[i] = tmp % rad[i];
-          tmp /= rad[i];
-          base += idx[i] * strides[ord[i]];
-        }
-      }
-      const size_t count = end - start;
-      size_t cdone = 0;
-      while (cdone < count) {
-        const size_t tcount = std::min(TILE, count - cdone);
-        size_t sim_base = base;
-        sim_idx = idx;
-        for (size_t t = 0; t < tcount; ++t) {
-          bases_tile[t] = sim_base;
-          // increment sim state
-          for (size_t i = 0; i < m; ++i) {
-            ++sim_idx[i];
-            sim_base += strides[ord[i]];
-            if (sim_idx[i] < rad[i]) break;
-            sim_base -= strides[ord[i]] * rad[i];
-            sim_idx[i] = 0;
-          }
-        }
-        // Execute tile with optional prefetch
-        for (size_t t = 0; t < tcount; ++t) {
-          if (ND_PREFETCH_STEP > 0) {
-            const size_t pre = t + ND_PREFETCH_STEP;
-            if (pre < tcount) {
-              EDT_PREFETCH(labels + bases_tile[pre]);
-            }
-          }
-          const size_t b = bases_tile[t];
-          kernel_call(labels + b, dest + b, (int)n, (long int)s, anis, black_border);
-        }
-        // Commit sim state for next tile
-        base = sim_base;
-        idx.swap(sim_idx);
-        cdone += tcount;
-      }
-    });
+    pending.push_back(pool.enqueue([=]() { process_range(start, end); }));
   }
-  pool.join();
+  for (auto& f : pending) {
+    f.get();
+  }
 }
 
 template <typename T>
@@ -1700,6 +1949,35 @@ inline void _nd_expand_parabolic_bases(
 ) {
   if (n <= 1 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
+  auto process_line = [&](size_t base) {
+    std::vector<int> arg(n);
+    std::vector<INDEX> feat_line(n);
+    bool any_nonzero = false;
+    for (size_t j = 0; j < n; ++j) {
+      const float val = dist[base + j * s];
+      any_nonzero |= (val != 0.0f);
+      feat_line[j] = feat[base + j * s];
+    }
+    if (any_nonzero) {
+      squared_edt_1d_parabolic_with_arg_stride(
+          dist + base, (int)n, (long)s, anis,
+          black_border, black_border,
+          arg.data(), 1);
+    } else {
+      for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+    }
+    for (size_t j = 0; j < n; ++j) {
+      feat[base + j * s] = feat_line[(size_t)arg[j]];
+    }
+  };
+
+  if (threads <= 1 || num_lines == 1) {
+    for (size_t i = 0; i < num_lines; ++i) {
+      process_line(bases[i]);
+    }
+    return;
+  }
+
   ThreadPool pool(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (num_lines + chunks - 1) / chunks;
@@ -1722,7 +2000,6 @@ inline void _nd_expand_parabolic_bases(
               black_border, black_border,
               arg.data(), 1);
         } else {
-          // all zeros: keep current feature mapping
           for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
         }
         for (size_t j = 0; j < n; ++j) {

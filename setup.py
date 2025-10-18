@@ -53,9 +53,9 @@ extensions = [
   ),
   setuptools.Extension(
     'edt_original',
-    sources=['src_old/edt.pyx'],
+    sources=['legacy/edt.pyx'],
     language='c++',
-    include_dirs=['src_old', str(NumpyImport())],
+    include_dirs=['legacy', str(NumpyImport())],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
     define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],

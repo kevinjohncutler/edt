@@ -13,6 +13,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from debug_utils import make_label_matrix
 import edt
 
+def _make_bench_array(shape, seed=0):
+    rng = np.random.default_rng(seed)
+    arr = rng.integers(0, 3, size=shape, dtype=np.uint8)
+    if arr.ndim == 2:
+        y, x = shape
+        if y > 20 and x > 20:
+            arr[y // 4 : y // 2, x // 4 : x // 2] = 1
+            arr[3 * y // 5 : 4 * y // 5, 3 * x // 5 : 4 * x // 5] = 2
+    elif arr.ndim == 3:
+        z, y, x = shape
+        if z > 10 and y > 20 and x > 20:
+            arr[z // 4 : z // 3, y // 4 : y // 2, x // 4 : x // 2] = 1
+            arr[3 * z // 5 : 4 * z // 5, 3 * y // 5 : 4 * y // 5, 3 * x // 5 : 4 * x // 5] = 2
+    return arr
+
 def test_nd_correctness_2d():
     """Test ND EDT correctness for 2D cases."""
     for M in [50, 100, 200]:
@@ -76,9 +91,35 @@ def test_nd_threading_consistency():
     # Compare serial vs threaded
     r_serial = edt.edt_nd(masks, parallel=1)
     r_threaded = edt.edt_nd(masks, parallel=-1)
-    
+
     np.testing.assert_allclose(r_serial, r_threaded, rtol=1e-6, atol=1e-6,
                                err_msg="Threading consistency failed")
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (96, 96),
+        (128, 128),
+        (48, 48, 48),
+        (64, 64, 64),
+    ],
+)
+def test_nd_random_label_bench_patterns(shape):
+    """Ensure ND path matches specialized kernels on benchmark-style random labels."""
+    arr = _make_bench_array(shape, seed=0)
+    assert arr.ndim in (2, 3), "Benchmark patterns currently cover 2D/3D cases"
+
+    for parallel in (1, 4):
+        spec = edt.edtsq(arr, parallel=parallel)
+        nd = edt.edtsq_nd(arr, parallel=parallel)
+
+        assert np.all(np.isfinite(spec)), "Specialized EDT produced non-finite values"
+        assert np.all(np.isfinite(nd)), "ND EDT produced non-finite values"
+
+        np.testing.assert_allclose(
+            spec, nd, rtol=1e-6, atol=1e-6,
+            err_msg=f"Random benchmark array mismatch for shape={shape} parallel={parallel}"
+        )
 
 if __name__ == "__main__":
     test_nd_correctness_2d()

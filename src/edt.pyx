@@ -273,6 +273,21 @@ cdef extern from "edt.hpp" namespace "pyedt":
     ) nogil
 
     # Odometer threaded passes (no base arrays)
+    cdef bint _nd_pass_multi_compiled[T](
+        T* labels, float* dest,
+        size_t dims, size_t* shape, size_t* strides,
+        size_t ax, float anis, native_bool black_border, int parallel
+    ) nogil
+    cdef bint _nd_pass_parabolic_compiled[T](
+        T* labels, float* dest,
+        size_t dims, size_t* shape, size_t* strides,
+        size_t ax, float anis, native_bool black_border, int parallel
+    ) nogil
+    cdef void squared_edt_1d_parabolic_multi_seg[T](
+        T* segids, float* f,
+        int n, long stride, float anisotropy,
+        native_bool black_border
+    ) nogil
     cdef void _nd_pass_multi_odometer[T](
         T* labels, float* dest,
         size_t dims, size_t* shape, size_t* strides,
@@ -283,6 +298,8 @@ cdef extern from "edt.hpp" namespace "pyedt":
         size_t dims, size_t* shape, size_t* strides,
         size_t ax, float anis, native_bool black_border, int parallel
     ) nogil
+    cdef void tofinite(float* data, size_t voxels) nogil
+    cdef void toinfinite(float* data, size_t voxels) nogil
 
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
   cdef mapcpp[T, vector[cpp_pair[size_t, size_t]]] extract_runs[T](
@@ -300,8 +317,10 @@ cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
   ) except +
 
 
-def _adaptive_thread_limit_nd(parallel, shape):
+def _adaptive_thread_limit_nd(parallel, shape, requested=None):
   """General ND limiter that matches 2D/3D heuristics and scales for higher dims."""
+  if requested is not None and requested > 0:
+    return parallel
   try:
     if not bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1'))):
       return parallel
@@ -422,25 +441,25 @@ def expand_labels_nd(
   except Exception:
     cpu_cap = max(1, parallel)
 
+  cdef int requested_parallel = parallel
   if parallel <= 0:
     parallel = cpu_cap
+    if adapt_threads_enabled and dims == 3:
+      total_voxels = arr.size
+      thresh8 = 128 * 128 * 128
+      thresh12 = 192 * 192 * 192
+      thresh16 = 256 * 256 * 256
+      target = 0
+      if total_voxels >= thresh16:
+        target = min(cpu_cap, 16)
+      elif total_voxels >= thresh12:
+        target = min(cpu_cap, 12)
+      elif total_voxels >= thresh8:
+        target = min(cpu_cap, 8)
+      if target > parallel:
+        parallel = target
   else:
     parallel = max(1, min(parallel, cpu_cap))
-
-  if adapt_threads_enabled and dims == 3:
-    total_voxels = arr.size
-    thresh8 = 128 * 128 * 128
-    thresh12 = 192 * 192 * 192
-    thresh16 = 256 * 256 * 256
-    target = 0
-    if total_voxels >= thresh16:
-      target = min(cpu_cap, 16)
-    elif total_voxels >= thresh12:
-      target = min(cpu_cap, 12)
-    elif total_voxels >= thresh8:
-      target = min(cpu_cap, 8)
-    if target > parallel:
-      parallel = target
   # Build anisotropy tuple
   cdef tuple anis
   if anisotropy is None:
@@ -835,7 +854,7 @@ def edtsq_nd(
         'axes': []
       }
     return np.zeros_like(arr, dtype=np.float32)
-  if not arr.flags.c_contiguous and not arr.flags.f_contiguous:
+  if not arr.flags.c_contiguous:
     arr = np.ascontiguousarray(arr)
 
   dims = arr.ndim
@@ -874,25 +893,24 @@ def edtsq_nd(
   cdef int p = parallel
   if p <= 0:
     p = cpu_cap
+    if adapt_threads_enabled and dims == 3:
+      total_voxels = arr.size
+      thresh8 = 128 * 128 * 128
+      thresh12 = 192 * 192 * 192
+      thresh16 = 256 * 256 * 256
+      target = 0
+      if total_voxels >= thresh16:
+        target = min(cpu_cap, 16)
+      elif total_voxels >= thresh12:
+        target = min(cpu_cap, 12)
+      elif total_voxels >= thresh8:
+        target = min(cpu_cap, 8)
+      if target > p:
+        p = target
   else:
     p = max(1, min(p, cpu_cap))
 
-  if adapt_threads_enabled and dims == 3:
-    total_voxels = arr.size
-    thresh8 = 128 * 128 * 128
-    thresh12 = 192 * 192 * 192
-    thresh16 = 256 * 256 * 256
-    target = 0
-    if total_voxels >= thresh16:
-      target = min(cpu_cap, 16)
-    elif total_voxels >= thresh12:
-      target = min(cpu_cap, 12)
-    elif total_voxels >= thresh8:
-      target = min(cpu_cap, 8)
-    if target > p:
-      p = target
-
-  parallel = _adaptive_thread_limit_nd(p, arr.shape)
+  parallel = _adaptive_thread_limit_nd(p, arr.shape, requested_parallel)
 
   if profile_enabled:
     profile_data['parallel_used'] = parallel
@@ -956,7 +974,7 @@ def edtsq_nd(
 
   cdef np.ndarray out = np.zeros((<Py_ssize_t> total,), dtype=np.float32)
   cdef float* outp = <float*> np.PyArray_DATA(out)
-  cdef void* datap = <void*> np.PyArray_DATA(arr.ravel(order='K'))
+  cdef void* datap = <void*> np.PyArray_DATA(arr)
 
   cdef double t_tmp
   cdef double t_axis
@@ -1011,23 +1029,43 @@ def edtsq_nd(
 
   if profile_enabled:
     t_tmp = time.perf_counter()
+  cdef bint used_compiled = False
   if arr.dtype in (np.uint8, np.int8):
-    _nd_pass_multi_odometer[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   elif arr.dtype in (np.uint16, np.int16):
-    _nd_pass_multi_odometer[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   elif arr.dtype in (np.uint32, np.int32):
-    _nd_pass_multi_odometer[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   elif arr.dtype in (np.uint64, np.int64):
-    _nd_pass_multi_odometer[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   elif arr.dtype == np.float32:
-    _nd_pass_multi_odometer[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   elif arr.dtype == np.float64:
-    _nd_pass_multi_odometer[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   elif arr.dtype == bool:
-    _nd_pass_multi_odometer[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    used_compiled = _nd_pass_multi_compiled[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
+    if not used_compiled:
+      _nd_pass_multi_odometer[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
   if profile_enabled:
     multi_elapsed = time.perf_counter() - t_tmp
     profile_axes.append({'axis': int(axes[0]), 'kind': 'multi', 'time': multi_elapsed})
+
+  if os.environ.get('EDT_ND_DEBUG_STAGE') == 'multi':
+    free(cshape); free(cstrides); free(axes)
+    order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
+    return np.reshape(out, arr.shape, order=order_ch2)
 
   if not black_border:
     if profile_enabled:
@@ -1043,24 +1081,44 @@ def edtsq_nd(
   for a in range(1, nd):
     if profile_enabled:
       t_tmp = time.perf_counter()
+    used_compiled = False
     if arr.dtype in (np.uint8, np.int8):
-      _nd_pass_parabolic_odometer[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[uint8_t](<uint8_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     elif arr.dtype in (np.uint16, np.int16):
-      _nd_pass_parabolic_odometer[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[uint16_t](<uint16_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     elif arr.dtype in (np.uint32, np.int32):
-      _nd_pass_parabolic_odometer[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[uint32_t](<uint32_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     elif arr.dtype in (np.uint64, np.int64):
-      _nd_pass_parabolic_odometer[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[uint64_t](<uint64_t*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     elif arr.dtype == np.float32:
-      _nd_pass_parabolic_odometer[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[float](<float*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     elif arr.dtype == np.float64:
-      _nd_pass_parabolic_odometer[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[double](<double*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     elif arr.dtype == bool:
-      _nd_pass_parabolic_odometer[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      used_compiled = _nd_pass_parabolic_compiled[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
+      if not used_compiled:
+        _nd_pass_parabolic_odometer[native_bool](<native_bool*>datap, outp, <size_t>nd, cshape, cstrides, <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
     if profile_enabled:
       t_axis = time.perf_counter() - t_tmp
       parabolic_elapsed += t_axis
       profile_axes.append({'axis': int(axes[a]), 'kind': 'parabolic', 'time': t_axis})
+
+  if os.environ.get('EDT_ND_DEBUG_STAGE') == 'parabolic':
+    free(cshape); free(cstrides); free(axes)
+    order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
+    return np.reshape(out, arr.shape, order=order_ch2)
 
   if not black_border:
     if profile_enabled:
@@ -1087,6 +1145,30 @@ def edtsq_nd(
 def edtsq_nd_last_profile():
   """Return the last ND profile captured when EDT_ND_PROFILE is enabled."""
   return _nd_profile_last
+
+
+@cython.binding(True)
+def _debug_parabolic_multi(labels, values, int stride, anisotropy=1.0, black_border=False):
+  """Internal helper for debugging parabolic pass on a single line."""
+  arr = np.require(labels, dtype=np.uint8, requirements='C')
+  vals = np.require(values, dtype=np.float32, requirements='C')
+  cdef Py_ssize_t n = arr.size
+  if vals.size != n:
+    raise ValueError('values must match labels length')
+  cdef float* valsp = <float*> np.PyArray_DATA(vals)
+  cdef int strd = max(1, stride)
+  cdef void* datap = <void*> np.PyArray_DATA(arr)
+  if arr.dtype == np.uint8:
+    squared_edt_1d_parabolic_multi_seg[uint8_t](<uint8_t*>datap, valsp, <int>n, <long>strd, <float>anisotropy, black_border)
+  elif arr.dtype == np.uint16:
+    squared_edt_1d_parabolic_multi_seg[uint16_t](<uint16_t*>datap, valsp, <int>n, <long>strd, <float>anisotropy, black_border)
+  elif arr.dtype == np.uint32:
+    squared_edt_1d_parabolic_multi_seg[uint32_t](<uint32_t*>datap, valsp, <int>n, <long>strd, <float>anisotropy, black_border)
+  elif arr.dtype == np.uint64:
+    squared_edt_1d_parabolic_multi_seg[uint64_t](<uint64_t*>datap, valsp, <int>n, <long>strd, <float>anisotropy, black_border)
+  else:
+    raise TypeError('labels dtype must be unsigned integer')
+  return vals.copy()
 
 
 
