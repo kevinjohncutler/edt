@@ -429,6 +429,26 @@ def expand_labels_nd(
   arr = np.require(data, dtype=np.uint32, requirements='C')
   dims = arr.ndim
 
+  if anisotropy is None:
+    anis = (1.0,) * dims
+  else:
+    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
+    if len(anis) != dims:
+      raise ValueError('anisotropy length must match data.ndim')
+
+  if profile_enabled:
+    profile_data = {
+      'shape': tuple(arr.shape),
+      'dims': dims,
+      'dtype': str(arr.dtype),
+      'requested_parallel': requested_parallel,
+      'parallel_used': None,
+      'sections': {},
+      'axes': profile_axes,
+    }
+    profile_sections = profile_data['sections']
+    profile_sections['prep'] = time.perf_counter() - t_total_start
+
   cdef bint adapt_threads_enabled = True
   try:
     adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
@@ -801,11 +821,12 @@ def __getattr__(name):
 
 @cython.binding(True)
 def edt_nd(
-    data, anisotropy=None, native_bool black_border=False, 
+    data, anisotropy=None, native_bool black_border=False,
     int parallel=1, voxel_graph=None, order=None,
   ):
   res = edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
   return np.sqrt(res, res)
+
 
 @cython.binding(True)
 def edtsq_nd(
@@ -827,6 +848,13 @@ def edtsq_nd(
   cdef Py_ssize_t thresh16
   cdef int target
 
+  if isinstance(data, list):
+    arr = np.array(data)
+  elif isinstance(data, np.ndarray):
+    arr = data
+  else:
+    arr = np.asarray(data)
+
   profile_env = os.environ.get('EDT_ND_PROFILE')
   if profile_env:
     try:
@@ -838,9 +866,6 @@ def edtsq_nd(
 
   requested_parallel = parallel
 
-  if isinstance(data, list):
-    data = np.array(data)
-  arr = np.asarray(data)
   if arr.size == 0:
     if profile_enabled:
       now = time.perf_counter()
@@ -858,26 +883,6 @@ def edtsq_nd(
     arr = np.ascontiguousarray(arr)
 
   dims = arr.ndim
-  if anisotropy is None:
-    anis = (1.0,) * dims
-  else:
-    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
-    if len(anis) != dims:
-      raise ValueError('anisotropy length must match data.ndim')
-
-  if profile_enabled:
-    profile_data = {
-      'shape': tuple(arr.shape),
-      'dims': dims,
-      'dtype': str(arr.dtype),
-      'requested_parallel': requested_parallel,
-      'parallel_used': None,
-      'sections': {},
-      'axes': profile_axes,
-    }
-    profile_sections = profile_data['sections']
-    profile_sections['prep'] = time.perf_counter() - t_total_start
-
   cdef bint adapt_threads_enabled = True
   try:
     adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
@@ -980,34 +985,6 @@ def edtsq_nd(
   cdef double t_axis
   cdef double multi_elapsed = 0.0
   cdef double parabolic_elapsed = 0.0
-
-  if nd == 1:
-    if profile_enabled:
-      t_tmp = time.perf_counter()
-    if arr.dtype in (np.uint8, np.int8):
-      squared_edt_1d_multi_seg[uint8_t](<uint8_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    elif arr.dtype in (np.uint16, np.int16):
-      squared_edt_1d_multi_seg[uint16_t](<uint16_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    elif arr.dtype in (np.uint32, np.int32):
-      squared_edt_1d_multi_seg[uint32_t](<uint32_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    elif arr.dtype in (np.uint64, np.int64):
-      squared_edt_1d_multi_seg[uint64_t](<uint64_t*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    elif arr.dtype == np.float32:
-      squared_edt_1d_multi_seg[float](<float*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    elif arr.dtype == np.float64:
-      squared_edt_1d_multi_seg[double](<double*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    elif arr.dtype == bool:
-      squared_edt_1d_multi_seg[native_bool](<native_bool*>datap, outp, <int>cshape[0], 1, <float>anis[0], black_border)
-    if profile_enabled:
-      multi_elapsed = time.perf_counter() - t_tmp
-      profile_axes.append({'axis': 0, 'kind': 'multi', 'time': multi_elapsed})
-      profile_sections['multi_pass'] = multi_elapsed
-      profile_sections['parabolic_pass'] = 0.0
-      profile_sections['total'] = time.perf_counter() - t_total_start
-      _nd_profile_last = profile_data
-    free(cshape); free(cstrides)
-    order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
-    return np.reshape(out, arr.shape, order=order_ch2)
 
   cdef Py_ssize_t* axes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
   if axes == NULL:
