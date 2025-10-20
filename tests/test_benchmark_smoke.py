@@ -7,20 +7,43 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import edt  # noqa: E402
 import scripts.bench_nd_profile as mod  # noqa: E402
 
 
 SMOKE_CSV = ROOT / "benchmarks" / "nd_smoke.csv"
 
 
+def _require_original():
+  orig = getattr(edt, 'original', None)
+  if orig is None or not getattr(orig, 'available', lambda: False)():
+    raise RuntimeError(
+        "edt.original must be built for benchmark tests. "
+        "Run `pip install -e .` to compile the legacy extension."
+    )
+  return orig
+
+
 def _generate_smoke_csv(path: Path = SMOKE_CSV):
   """Create a tiny benchmark CSV so CI artifacts can capture the result."""
+  orig = _require_original()
   shapes = [(32, 32), (16, 16, 16)]
   rows = []
   for shape in shapes:
     rng = np.random.default_rng(0)
     arr = mod.make_array(rng, shape, np.uint8)
-    spec_fn, anis = mod.resolve_specialized(len(shape))
+    if len(shape) == 1:
+      spec_fn = lambda a, anisotropy, black_border, parallel: orig.edt1dsq(
+          a, anisotropy=anisotropy[0], black_border=black_border)
+      anis = (1.0,)
+    elif len(shape) == 2:
+      spec_fn = lambda a, anisotropy, black_border, parallel: orig.edt2dsq(
+          a, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+      anis = (1.0, 1.0)
+    else:
+      spec_fn = lambda a, anisotropy, black_border, parallel: orig.edt3dsq(
+          a, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+      anis = (1.0, 1.0, 1.0)
     spec, nd, diff, _ = mod.measure_variant(
         arr,
         parallel=1,
@@ -55,15 +78,17 @@ def _generate_smoke_csv(path: Path = SMOKE_CSV):
 
 
 def test_benchmark_script_import_and_measure():
+  orig = _require_original()
   rng = np.random.default_rng(0)
   arr = mod.make_array(rng, (16, 16), np.uint8)
-  spec_fn, anis = mod.resolve_specialized(2)
+  spec_fn = lambda a, anisotropy, black_border, parallel: orig.edt2dsq(
+      a, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
   spec, nd, diff, _ = mod.measure_variant(
       arr,
       parallel=1,
       reps=1,
       spec_fn=spec_fn,
-      anis=anis,
+      anis=(1.0, 1.0),
       min_samples=1,
       min_time=0.001,
       max_time=0.01,

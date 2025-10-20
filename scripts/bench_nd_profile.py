@@ -23,47 +23,37 @@ sys.path.insert(0, str(ROOT / 'src'))
 import edt  # noqa: E402
 
 
-def resolve_specialized(dims: int):
-    if dims == 1:
-        fn = getattr(edt, "edt1dsq", None)
+def _require_original():
+    orig = getattr(edt, 'original', None)
+    if orig is None or not getattr(orig, 'available', lambda: False)():
+        raise ImportError(
+            "The legacy edt.original extension is required for benchmarking. "
+            "Please build/install the original module (e.g. `pip install -e .`)."
+        )
+    return orig
 
+
+def resolve_specialized(dims: int):
+    orig = _require_original()
+
+    if dims == 1:
         def spec(arr, anisotropy, black_border, parallel):
             scalar = anisotropy[0] if isinstance(anisotropy, (tuple, list)) else float(anisotropy)
-            if fn is not None:
-                return fn(arr, anisotropy=scalar, black_border=black_border)
-            return edt.edtsq(arr, anisotropy=scalar, black_border=black_border, parallel=parallel)
+            return orig.edt1dsq(arr, anisotropy=scalar, black_border=black_border)
 
         return spec, (1.0,)
 
     if dims == 2:
-        try:
-            orig = getattr(edt, 'original')
-            if getattr(orig, 'available', lambda: False)():
-                def spec(arr, anisotropy, black_border, parallel):
-                    return orig.edt2dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
-                return spec, (1.0, 1.0)
-        except Exception:
-            pass
-        spec_fn = getattr(edt, 'edt2dsq', None)
-        if spec_fn is not None:
-            def spec(arr, anisotropy, black_border, parallel):
-                return spec_fn(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
-            return spec, (1.0, 1.0)
+        def spec(arr, anisotropy, black_border, parallel):
+            return orig.edt2dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+
+        return spec, (1.0, 1.0)
 
     if dims == 3:
-        try:
-            orig = getattr(edt, 'original')
-            if getattr(orig, 'available', lambda: False)():
-                def spec(arr, anisotropy, black_border, parallel):
-                    return orig.edt3dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
-                return spec, (1.0, 1.0, 1.0)
-        except Exception:
-            pass
-        spec_fn = getattr(edt, 'edt3dsq', None)
-        if spec_fn is not None:
-            def spec(arr, anisotropy, black_border, parallel):
-                return spec_fn(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
-            return spec, (1.0, 1.0, 1.0)
+        def spec(arr, anisotropy, black_border, parallel):
+            return orig.edt3dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+
+        return spec, (1.0, 1.0, 1.0)
     raise ValueError(f"No specialized EDT available for {dims}D.")
 
 
