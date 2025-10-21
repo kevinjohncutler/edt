@@ -1404,7 +1404,7 @@ inline void _nd_pass_multi(
   size_t total = 1;
   for (size_t d = 0; d < dims; ++d) total *= shape[d];
   const size_t n = shape[ax];
-  if (n <= 1) return;
+  if (n == 0) return;
   const size_t s = strides[ax];
   const size_t lines = total / n;
 
@@ -1446,7 +1446,7 @@ inline void _nd_pass_parabolic(
   size_t total = 1;
   for (size_t d = 0; d < dims; ++d) total *= shape[d];
   const size_t n = shape[ax];
-  if (n <= 1) return;
+  if (n == 0) return;
   const size_t s = strides[ax];
   const size_t lines = total / n;
 
@@ -1485,7 +1485,7 @@ inline void _nd_pass_multi_bases(
     const bool black_border,
     const int parallel
 ) {
-  if (n <= 1 || num_lines == 0) return;
+  if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   if (threads <= 1 || num_lines == 1) {
     for (size_t i = 0; i < num_lines; ++i) {
@@ -1532,7 +1532,7 @@ inline void _nd_pass_parabolic_bases(
     const bool black_border,
     const int parallel
 ) {
-  if (n <= 1 || num_lines == 0) return;
+  if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   const size_t TILE = ND_TILE;
   if (threads <= 1 || num_lines == 1) {
@@ -1585,7 +1585,7 @@ inline bool _nd_pass_multi_compiled(
     return false;
   }
   const size_t n = shape[ax];
-  if (n <= 1) {
+  if (n == 0) {
     return true;
   }
   if (parallel <= 1) {
@@ -1675,7 +1675,7 @@ inline bool _nd_pass_parabolic_compiled(
     return false;
   }
   const size_t n = shape[ax];
-  if (n <= 1) {
+  if (n == 0) {
     return true;
   }
   if (parallel <= 1) {
@@ -1766,7 +1766,7 @@ inline void _nd_pass_odometer(
   size_t total = 1;
   for (size_t d = 0; d < dims; ++d) total *= shape[d];
   const size_t n = shape[ax];
-  if (n <= 1) return;
+  if (n == 0) return;
   const size_t s = strides[ax];
   const size_t lines = total / n;
 
@@ -1900,7 +1900,7 @@ inline void _nd_expand_init_bases(
     INDEX* feat_out,
     const int parallel
 ) {
-  if (n <= 1 || num_lines == 0) return;
+  if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
@@ -1947,7 +1947,7 @@ inline void _nd_expand_parabolic_bases(
     INDEX* feat,
     const int parallel
 ) {
-  if (n <= 1 || num_lines == 0) return;
+  if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   auto process_line = [&](size_t base) {
     std::vector<int> arg(n);
@@ -2025,7 +2025,7 @@ inline void _nd_expand_init_labels_bases(
     uint32_t* label_out,
     const int parallel
 ) {
-  if (n <= 1 || num_lines == 0) return;
+  if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
@@ -2071,7 +2071,7 @@ inline void _nd_expand_parabolic_labels_bases(
     uint32_t* label_out,
     const int parallel
 ) {
-  if (n <= 1 || num_lines == 0) return;
+  if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   ThreadPool pool(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
