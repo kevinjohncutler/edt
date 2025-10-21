@@ -23,35 +23,35 @@ sys.path.insert(0, str(ROOT / 'src'))
 import edt  # noqa: E402
 
 
-def _require_original():
-    orig = getattr(edt, 'original', None)
-    if orig is None or not getattr(orig, 'available', lambda: False)():
+def _require_legacy():
+    legacy = getattr(edt, 'legacy', None)
+    if legacy is None or not getattr(legacy, 'available', lambda: False)():
         raise ImportError(
-            "The legacy edt.original extension is required for benchmarking. "
-            "Please build/install the original module (e.g. `pip install -e .`)."
+            "The legacy edt.legacy extension is required for benchmarking. "
+            "Please build/install the legacy module (e.g. `pip install -e .`)."
         )
-    return orig
+    return legacy
 
 
 def resolve_specialized(dims: int):
-    orig = _require_original()
+    legacy = _require_legacy()
 
     if dims == 1:
         def spec(arr, anisotropy, black_border, parallel):
             scalar = anisotropy[0] if isinstance(anisotropy, (tuple, list)) else float(anisotropy)
-            return orig.edt1dsq(arr, anisotropy=scalar, black_border=black_border)
+            return legacy.edt1dsq(arr, anisotropy=scalar, black_border=black_border)
 
         return spec, (1.0,)
 
     if dims == 2:
         def spec(arr, anisotropy, black_border, parallel):
-            return orig.edt2dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+            return legacy.edt2dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
 
         return spec, (1.0, 1.0)
 
     if dims == 3:
         def spec(arr, anisotropy, black_border, parallel):
-            return orig.edt3dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
+            return legacy.edt3dsq(arr, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
 
         return spec, (1.0, 1.0, 1.0)
     raise ValueError(f"No specialized EDT available for {dims}D.")

@@ -32,8 +32,8 @@ def test_edt_consistency():
     print("="*60)
     
     import edt
-    orig = getattr(edt, "original", None)
-    has_original = bool(orig) and getattr(orig, "available", lambda: False)()
+    legacy = getattr(edt, "legacy", None)
+    has_legacy = bool(legacy) and getattr(legacy, "available", lambda: False)()
     
     for ndim in [1, 2, 3]:
         print(f"\n--- Testing {ndim}D ---")
@@ -46,20 +46,20 @@ def test_edt_consistency():
         print(f"Input size: {masks.size}")
         print(f"Unique labels: {np.unique(masks)}")
         
-        if has_original:
+        if has_legacy:
             if ndim == 1:
-                dt_orig = orig.edt1d(masks)
+                dt_orig = legacy.edt1d(masks)
             elif ndim == 2:
-                dt_orig = orig.edt2d(masks)
+                dt_orig = legacy.edt2d(masks)
             else:
-                dt_orig = orig.edt3d(masks)
+                dt_orig = legacy.edt3d(masks)
 
             print(f"Original edt{ndim}d: range {dt_orig.min():.3f} to {dt_orig.max():.3f}")
             print(f"Expected max: {M} (side length)")
             print(f"Max matches expected: {abs(dt_orig.max() - M) < 1e-6}")
         else:
             dt_orig = None
-            print("Original edt.original module unavailable; skipping legacy comparison.")
+            print("Legacy edt.legacy module unavailable; skipping specialized comparison.")
 
         dt_nd = edt.edt_nd(masks)
         print(f"ND edt_nd: range {dt_nd.min():.3f} to {dt_nd.max():.3f}")

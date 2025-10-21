@@ -95,6 +95,36 @@ def test_nd_threading_consistency():
     np.testing.assert_allclose(r_serial, r_threaded, rtol=1e-6, atol=1e-6,
                                err_msg="Threading consistency failed")
 
+
+def _profile_parallel_used(arr, parallel):
+    os.environ['EDT_ND_PROFILE'] = '1'
+    try:
+        edt.edtsq_nd(arr, parallel=parallel)
+        profile = edt.edtsq_nd_last_profile()
+    finally:
+        os.environ.pop('EDT_ND_PROFILE', None)
+    assert profile is not None, "Expected ND profile to be available"
+    assert profile.get('parallel_requested') == parallel, (
+        "Profile should record requested parallel"
+    )
+    used = profile.get('parallel_used')
+    assert used is not None, "Profile missing parallel_used"
+    return int(used)
+
+
+def test_nd_thread_limit_heuristics():
+    """Verify heuristic caps reduce oversubscription across shapes."""
+    arr_128 = np.zeros((128, 128), dtype=np.uint8)
+    assert _profile_parallel_used(arr_128, 16) == 4
+    assert _profile_parallel_used(arr_128, -1) == 4
+
+    arr_512 = np.zeros((512, 512), dtype=np.uint8)
+    assert _profile_parallel_used(arr_512, 16) == 8
+
+    arr_192 = np.zeros((192, 192, 192), dtype=np.uint8)
+    assert _profile_parallel_used(arr_192, -1) == 16
+    assert _profile_parallel_used(arr_192, 32) == 16
+
 @pytest.mark.parametrize(
     "shape",
     [

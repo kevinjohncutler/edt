@@ -47,7 +47,7 @@ pip install edt --no-binary :all:
 
 Consult `help(edt)` after importing. The module exposes `edt` and `edtsq`, which now delegate to the unified ND backend (`edt_nd` / `edtsq_nd`) and therefore support any dimensionality ≥1 without selecting specialised kernels. Boolean inputs are still handled efficiently.  
 
-Legacy 1D/2D/3D entry points remain available through `edt.original` (clone the upstream repository into `original_repo/` and build it to enable them). For convenience the names (`edt`, `edtsq`, `sdf`, etc.) are re-exported as thin aliases that forward to the packaged legacy module once it is built. For new code, prefer the ND APIs.
+Legacy 1D/2D/3D entry points remain available through `edt.legacy` (clone the upstream repository into `original_repo/` and build it to enable them). For convenience the names (`edt`, `edtsq`, `sdf`, etc.) are re-exported as thin aliases that forward to the packaged legacy module once it is built. For new code, prefer the ND APIs.
 
 The two optional parameters are `anisotropy` and `black_border`. Anisotropy is used to correct for distortions in voxel space, e.g. if X and Y were acquired with a microscope, but the Z axis was cut more corsely. 
 
@@ -75,7 +75,7 @@ for label, image in edt.each(labels, dt, in_place=True):
   process(image) # stand in for whatever you'd like to do
 
 # The legacy 2D/3D implementations exposed a voxel_graph argument for
-# constrained connectivity. That functionality now lives in edt.original.*
+# constrained connectivity. That functionality now lives in edt.legacy.*
 # (clone/build the upstream repo into ./original_repo to enable it).
 # Voxels with an impermissible direction are treated as eroded
 # by 0.5 in that direction instead of being 1 unit from black.

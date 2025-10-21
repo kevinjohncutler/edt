@@ -14,7 +14,7 @@ Key methods:
   edt_nd, edtsq_nd
   feature_transform_nd, expand_labels_nd
 
-Legacy dimension-specific APIs are available through ``edt.original`` when the
+Legacy dimension-specific APIs are available through ``edt.legacy`` when the
 reference repository has been cloned and built locally.
 
 License: GNU 3.0
@@ -49,25 +49,70 @@ import pathlib
 import time
 import sys
 import types
+import warnings
+
+
+_ND_MIN_VOXELS_PER_THREAD_DEFAULT = 32768
+_ND_MIN_LINES_PER_THREAD_DEFAULT = 32
+_ND_2D_THRESHOLDS = (
+  (128 * 128, 4),
+  (512 * 512, 8),
+)
+_ND_2D_MAX_THREADS = 12
+_ND_3D_THRESHOLDS = (
+  (32, 4),
+  (48, 8),
+  (64, 12),
+)
+_ND_3D_MAX_THREADS = 16
 
 
 _nd_profile_last = None
 
 
-class _OriginalModuleProxy(types.ModuleType):
+
+def _env_int(name: str, default: int) -> int:
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  try:
+    return int(value)
+  except Exception:
+    return default
+
+
+cdef inline int _apply_thresholds(int measure, tuple thresholds, int default_cap, int parallel):
+  cdef int capped = parallel
+  cdef int limit
+  cdef int cap
+  for threshold in thresholds:
+    limit = <int>threshold[0]
+    cap = <int>threshold[1]
+    if measure <= limit:
+      if cap > 0 and capped > cap:
+        capped = cap
+      return capped
+  if default_cap > 0 and capped > default_cap:
+    capped = default_cap
+  return capped
+
+
+
+class _LegacyModuleProxy(types.ModuleType):
   """Lazy loader for the legacy dimension-specific EDT extension."""
 
   def __init__(self):
-    super().__init__('edt.original')
+    super().__init__('edt.legacy')
     self._module = None
     self._load_error = None
 
   def _candidate_roots(self):
-    env_path = os.environ.get('EDT_ORIGINAL_PATH')
-    if env_path:
-      path = pathlib.Path(env_path).expanduser()
-      if path.exists():
-        yield path
+    for env_key in ('EDT_LEGACY_PATH', 'EDT_ORIGINAL_PATH'):
+      env_path = os.environ.get(env_key)
+      if env_path:
+        path = pathlib.Path(env_path).expanduser()
+        if path.exists():
+          yield path
     base = pathlib.Path(__file__).resolve()
     seen = set()
     for parent in (base.parent,) + tuple(base.parents):
@@ -77,12 +122,23 @@ class _OriginalModuleProxy(types.ModuleType):
         yield candidate
 
   def _iter_extension_candidates(self, roots):
-    patterns = ('**/edt*.so', '**/edt*.pyd', '**/edt*.dll')
+    patterns = ('**/edt_legacy*.so', '**/edt_legacy*.pyd', '**/edt_legacy*.dll',
+                '**/edt_original*.so', '**/edt_original*.pyd', '**/edt_original*.dll')
     for root in roots:
       for pattern in patterns:
         for path in sorted(root.glob(pattern), reverse=True):
           if path.is_file():
             yield path
+
+  def _register(self, module):
+    module.__name__ = 'edt.legacy'
+    module.available = lambda: True
+    sys.modules['edt.legacy'] = module
+    # Maintain backwards compatibility for any lingering imports.
+    sys.modules.setdefault('edt.original', module)
+    self._module = module
+    self._load_error = None
+    return module
 
   def _load(self):
     if self._module is not None:
@@ -90,55 +146,46 @@ class _OriginalModuleProxy(types.ModuleType):
     if self._load_error is not None:
       raise self._load_error
 
-    try:
-      module = importlib.import_module('edt_original')
-      module.__name__ = 'edt.original'
-      module.available = lambda: True
-      sys.modules['edt.original'] = module
-      self._module = module
-      self._load_error = None
-      return module
-    except Exception as exc:
-      self._load_error = exc
+    errors = []
+    for module_name in ('edt_legacy', 'edt_original'):
+      try:
+        module = importlib.import_module(module_name)
+        return self._register(module)
+      except Exception as exc:
+        errors.append((f'import:{module_name}', exc))
 
     # fall back to disk lookup (for developers with external clone)
     roots = list(self._candidate_roots())
     candidates = list(self._iter_extension_candidates(roots))
-    errors = []
 
     for candidate in candidates:
       try:
-        spec = importlib.util.spec_from_file_location('edt_original_native', candidate)
+        spec = importlib.util.spec_from_file_location('edt_legacy_native', candidate)
         if spec is None or spec.loader is None:
           raise ImportError(f'Unable to create loader for {candidate}')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module.__name__ = 'edt.original'
-        module.available = lambda: True
-        sys.modules['edt.original'] = module
-        self._module = module
-        self._load_error = None
-        return module
+        return self._register(module)
       except Exception as exc:
-        errors.append((candidate, exc))
+        errors.append((str(candidate), exc))
 
     if errors:
-      messages = ', '.join(f"{path.name}: {exc}" for path, exc in errors)
-      err = ImportError(f'Failed to load original EDT extension ({messages})')
+      messages = ', '.join(f"{source}: {exc}" for source, exc in errors)
+      err = ImportError(f'Failed to load legacy EDT extension ({messages})')
       self._load_error = err
       raise err
 
     if roots:
       hint = roots[0]
       err = ImportError(
-        f'Original EDT extension not built in {hint}. '
-        'Run `pip install -e .` there or build the packaged edt.original._native.'
+        f'Legacy EDT extension not built in {hint}. '
+        'Run `pip install -e .` there or build the packaged edt.legacy._native.'
       )
       self._load_error = err
       raise err
     err = ImportError(
-      "Original EDT implementation not available. Install the package with the"
-      " bundled edt.original module or provide a build in ./original_repo."
+      "Legacy EDT implementation not available. Install the package with the"
+      " bundled edt.legacy module or provide a build in ./original_repo."
     )
     self._load_error = err
     raise err
@@ -165,7 +212,7 @@ class _OriginalModuleProxy(types.ModuleType):
     return True
 
 
-original = _OriginalModuleProxy()
+legacy = _LegacyModuleProxy()
 
 @cython.binding(True)
 def nd_tuning(tile=None, prefetch_step=None, chunks_per_thread=None):
@@ -319,54 +366,49 @@ cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
 
 def _adaptive_thread_limit_nd(parallel, shape, requested=None):
   """General ND limiter that matches 2D/3D heuristics and scales for higher dims."""
-  if requested is not None and requested > 0:
-    return parallel
+  parallel = max(1, parallel)
   try:
-    if not bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1'))):
-      return parallel
+    adapt_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
   except Exception:
-    pass
+    adapt_enabled = True
+  if not adapt_enabled:
+    return parallel
 
   dims = len(shape)
   if dims <= 1:
     return parallel
 
-  # Match existing tuned behaviour for 2D and 3D so benchmarks line up.
+  capped = parallel
+
   if dims == 2:
-    total = shape[0] * shape[1]
-    if total <= 16384:  # <= 128x128
-      return min(parallel, 4)
-    if total <= 262144:  # <= 512x512
-      return min(parallel, 8)
-    if parallel >= 16:
-      return min(parallel, 12)
-    return parallel
+    total = <int>(shape[0] * shape[1])
+    capped = _apply_thresholds(total, _ND_2D_THRESHOLDS, _ND_2D_MAX_THREADS, capped)
+    return max(1, capped)
 
   if dims == 3:
-    max_dim = max(shape)
-    if max_dim <= 32:
-      return min(parallel, 4)
-    if max_dim <= 48:
-      return min(parallel, 8)
-    if max_dim <= 64:
-      return min(parallel, 12)
-    return parallel
+    longest = <int>max(shape)
+    capped = _apply_thresholds(longest, _ND_3D_THRESHOLDS, _ND_3D_MAX_THREADS, capped)
+    return max(1, capped)
 
-  # Higher-D fallback: ensure every worker processes enough lines and voxels.
+  min_voxels = _env_int('EDT_ND_MIN_VOXELS_PER_THREAD', _ND_MIN_VOXELS_PER_THREAD_DEFAULT)
+  if min_voxels < 1:
+    min_voxels = _ND_MIN_VOXELS_PER_THREAD_DEFAULT
+  min_lines = _env_int('EDT_ND_MIN_LINES_PER_THREAD', _ND_MIN_LINES_PER_THREAD_DEFAULT)
+  if min_lines < 1:
+    min_lines = _ND_MIN_LINES_PER_THREAD_DEFAULT
+
   total = 1
+  cdef int extent
   for extent in shape:
     total *= extent
   longest = max(shape)
   lines = max(1, total // longest)
 
-  # Require a minimum amount of work per thread to avoid oversubscription.
-  min_lines_per_thread = 64
-  min_voxels_per_thread = 32768
-
-  cap_lines = max(1, lines // min_lines_per_thread)
-  cap_voxels = max(1, total // min_voxels_per_thread)
+  cap_lines = max(1, lines // min_lines)
+  cap_voxels = max(1, total // min_voxels)
   cap = max(cap_lines, cap_voxels)
-  return max(1, min(parallel, cap))
+  capped = min(capped, cap)
+  return max(1, capped)
 
 @cython.binding(True)
 def expand_labels_nd(
@@ -428,26 +470,13 @@ def expand_labels_nd(
 
   arr = np.require(data, dtype=np.uint32, requirements='C')
   dims = arr.ndim
-
+  cdef tuple anis
   if anisotropy is None:
     anis = (1.0,) * dims
   else:
     anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
     if len(anis) != dims:
       raise ValueError('anisotropy length must match data.ndim')
-
-  if profile_enabled:
-    profile_data = {
-      'shape': tuple(arr.shape),
-      'dims': dims,
-      'dtype': str(arr.dtype),
-      'requested_parallel': requested_parallel,
-      'parallel_used': None,
-      'sections': {},
-      'axes': profile_axes,
-    }
-    profile_sections = profile_data['sections']
-    profile_sections['prep'] = time.perf_counter() - t_total_start
 
   cdef bint adapt_threads_enabled = True
   try:
@@ -461,33 +490,10 @@ def expand_labels_nd(
   except Exception:
     cpu_cap = max(1, parallel)
 
-  cdef int requested_parallel = parallel
   if parallel <= 0:
     parallel = cpu_cap
-    if adapt_threads_enabled and dims == 3:
-      total_voxels = arr.size
-      thresh8 = 128 * 128 * 128
-      thresh12 = 192 * 192 * 192
-      thresh16 = 256 * 256 * 256
-      target = 0
-      if total_voxels >= thresh16:
-        target = min(cpu_cap, 16)
-      elif total_voxels >= thresh12:
-        target = min(cpu_cap, 12)
-      elif total_voxels >= thresh8:
-        target = min(cpu_cap, 8)
-      if target > parallel:
-        parallel = target
   else:
     parallel = max(1, min(parallel, cpu_cap))
-  # Build anisotropy tuple
-  cdef tuple anis
-  if anisotropy is None:
-    anis = (1.0,) * dims
-  else:
-    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
-    if len(anis) != dims:
-      raise ValueError('anisotropy length must match data.ndim')
   if dims == 1:
     # reuse 1D midpoint selection from expand_labels 1D branch
     n1 = arr.shape[0]
@@ -809,10 +815,52 @@ def feature_transform(data, anisotropy=None, black_border=False,
   """Compatibility wrapper that forwards to :func:`feature_transform_nd`."""
   return feature_transform_nd(data, anisotropy, black_border, parallel, voxel_graph,
                               return_distances, features_dtype)
+
+
+@cython.binding(True)
+def edtsq(
+    data, anisotropy=None, native_bool black_border=False,
+    int parallel=1, voxel_graph=None, order=None,
+):
+  """Squared EDT that forwards to the ND implementation."""
+  return edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
+
+
+@cython.binding(True)
+def edt(
+    data, anisotropy=None, native_bool black_border=False,
+    int parallel=1, voxel_graph=None, order=None,
+  ):
+  """EDT wrapper that uses the ND core and returns sqrt distances."""
+  dt = edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
+  return np.sqrt(dt, dt)
+
+def _set_nd_aliases():
+  setattr(sys.modules[__name__], 'edtsq', edtsq)
+  setattr(sys.modules[__name__], 'edt', edt)
+
+_set_nd_aliases()
 def __getattr__(name):
   """Forward unknown attributes to the packaged legacy module."""
+  if name == 'edt':
+    obj = globals().get('edt')
+    if obj is not None:
+      setattr(sys.modules[__name__], 'edt', obj)
+      return obj
+  if name == 'edtsq':
+    obj = globals().get('edtsq')
+    if obj is not None:
+      setattr(sys.modules[__name__], 'edtsq', obj)
+      return obj
+  if name == 'legacy':
+    setattr(sys.modules[__name__], 'legacy', legacy)
+    return legacy
+  if name == 'original':
+    warnings.warn("`edt.original` is deprecated; use `edt.legacy` instead.", DeprecationWarning, stacklevel=2)
+    setattr(sys.modules[__name__], 'original', legacy)
+    return legacy
   try:
-    attr = getattr(original, name)
+    attr = getattr(legacy, name)
   except AttributeError as exc:
     raise AttributeError(name) from exc
   setattr(sys.modules[__name__], name, attr)
@@ -883,6 +931,13 @@ def edtsq_nd(
     arr = np.ascontiguousarray(arr)
 
   dims = arr.ndim
+  cdef tuple anis
+  if anisotropy is None:
+    anis = (1.0,) * dims
+  else:
+    anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
+    if len(anis) != dims:
+      raise ValueError('anisotropy length must match data.ndim')
   cdef bint adapt_threads_enabled = True
   try:
     adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
@@ -898,26 +953,13 @@ def edtsq_nd(
   cdef int p = parallel
   if p <= 0:
     p = cpu_cap
-    if adapt_threads_enabled and dims == 3:
-      total_voxels = arr.size
-      thresh8 = 128 * 128 * 128
-      thresh12 = 192 * 192 * 192
-      thresh16 = 256 * 256 * 256
-      target = 0
-      if total_voxels >= thresh16:
-        target = min(cpu_cap, 16)
-      elif total_voxels >= thresh12:
-        target = min(cpu_cap, 12)
-      elif total_voxels >= thresh8:
-        target = min(cpu_cap, 8)
-      if target > p:
-        p = target
   else:
     p = max(1, min(p, cpu_cap))
 
   parallel = _adaptive_thread_limit_nd(p, arr.shape, requested_parallel)
 
   if profile_enabled:
+    profile_data['parallel_requested'] = requested_parallel
     profile_data['parallel_used'] = parallel
 
   if voxel_graph is not None:
@@ -949,6 +991,8 @@ def edtsq_nd(
   cdef size_t tune_tile = 0
   cdef size_t tune_prefetch = 0
   cdef size_t tune_chunks = 0
+
+  # should try getting rid of these tunings 
   if parallel > 1:
     if dims == 3:
       max_dim = max(arr.shape)
