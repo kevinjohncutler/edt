@@ -49,7 +49,7 @@
 // pyedt names are underscored to prevent namespace collisions
 // in the Cython wrapper.
 
-namespace pyedt {
+namespace legacy_pyedt {
 
 template <typename T, typename GRAPH_TYPE = uint8_t>
 float* _edt2dsq_voxel_graph(
@@ -309,7 +309,7 @@ void transfer_run_voxels(
 }
 
 
-} // namespace pyedt
+} // namespace legacy_pyedt
 
 
 

@@ -29,7 +29,7 @@
 // pyedt names are underscored to prevent namespace collisions
 // in the Cython wrapper.
 
-namespace pyedt {
+namespace legacy_pyedt {
 
 #define sq(x) (static_cast<float>(x) * static_cast<float>(x))
 
@@ -788,7 +788,7 @@ float* _edt2d(
 // Should be trivial to make an N-d version
 // if someone asks for it. Might simplify the interface.
 
-} // namespace pyedt
+} // namespace legacy_pyedt
 
 namespace edt {
 
@@ -799,7 +799,7 @@ float* edt(
   const bool black_border=false) {
 
   float* d = new float[sx]();
-  pyedt::squared_edt_1d_multi_seg(labels, d, sx, 1, wx);
+  legacy_pyedt::squared_edt_1d_multi_seg(labels, d, sx, 1, wx);
 
   for (int i = 0; i < sx; i++) {
     d[i] = std::sqrt(d[i]);
@@ -817,7 +817,7 @@ float* edt(
     float* output=NULL
   ) {
 
-  return pyedt::_edt2d(labels, sx, sy, wx, wy, black_border, parallel, output);
+  return legacy_pyedt::_edt2d(labels, sx, sy, wx, wy, black_border, parallel, output);
 }
 
 
@@ -828,7 +828,7 @@ float* edt(
   const float wx, const float wy, const float wz,
   const bool black_border=false, const int parallel=1, float* output=NULL) {
 
-  return pyedt::_edt3d(labels, sx, sy, sz, wx, wy, wz, black_border, parallel, output);
+  return legacy_pyedt::_edt3d(labels, sx, sy, sz, wx, wy, wz, black_border, parallel, output);
 }
 
 template <typename T>
@@ -850,7 +850,7 @@ float* binary_edt(
     float* output=NULL
   ) {
 
-  return pyedt::_binary_edt2d(
+  return legacy_pyedt::_binary_edt2d(
     labels, 
     sx, sy, 
     wx, wy, 
@@ -866,7 +866,7 @@ float* binary_edt(
   const float wx, const float wy, const float wz,
   const bool black_border=false, const int parallel=1, float* output=NULL) {
 
-  return pyedt::_binary_edt3d(labels, sx, sy, sz, wx, wy, wz, black_border, parallel, output);
+  return legacy_pyedt::_binary_edt3d(labels, sx, sy, sz, wx, wy, wz, black_border, parallel, output);
 }
 
 template <typename T>
@@ -876,7 +876,7 @@ float* edtsq(
   const bool black_border=false) {
 
   float* d = new float[sx]();
-  pyedt::squared_edt_1d_multi_seg(labels, d, sx, 1, wx, black_border);
+  legacy_pyedt::squared_edt_1d_multi_seg(labels, d, sx, 1, wx, black_border);
   return d;
 }
 
@@ -889,7 +889,7 @@ float* edtsq(
     float* output=NULL
   ) {
 
-  return pyedt::_edt2dsq(labels, sx, sy, wx, wy, black_border, parallel, output);
+  return legacy_pyedt::_edt2dsq(labels, sx, sy, wx, wy, black_border, parallel, output);
 }
 
 template <typename T>
@@ -901,7 +901,7 @@ float* edtsq(
     float* output=NULL
   ) {
 
-  return pyedt::_edt3dsq(
+  return legacy_pyedt::_edt3dsq(
     labels, 
     sx, sy, sz, 
     wx, wy, wz, 
@@ -925,7 +925,7 @@ float* binary_edtsq(
   const float wx, const float wy,
   const bool black_border=false, const int parallel=1) {
 
-  return pyedt::_binary_edt2dsq(labels, sx, sy, wx, wy, black_border, parallel);
+  return legacy_pyedt::_binary_edt2dsq(labels, sx, sy, wx, wy, black_border, parallel);
 }
 
 template <typename T>
@@ -935,7 +935,7 @@ float* binary_edtsq(
   const float wx, const float wy, const float wz,
   const bool black_border=false, const int parallel=1, float* output=NULL) {
 
-  return pyedt::_binary_edt3dsq(labels, sx, sy, sz, wx, wy, wz, parallel, output);
+  return legacy_pyedt::_binary_edt3dsq(labels, sx, sy, sz, wx, wy, wz, parallel, output);
 }
 
 

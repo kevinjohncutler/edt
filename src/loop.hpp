@@ -8,11 +8,20 @@
 #include <cstdlib>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <vector>
 #include <mutex>
 #include <unordered_map>
 
 #include "threadpool.h"
+
+#ifndef PYEDT_COMPILED_ENABLE_METRICS
+#  if defined(_MSC_VER) && !defined(__clang__)
+#    define PYEDT_COMPILED_ENABLE_METRICS 0
+#  else
+#    define PYEDT_COMPILED_ENABLE_METRICS 1
+#  endif
+#endif
 
 namespace compiled2 {
 
@@ -32,6 +41,7 @@ struct DispatchMetrics {
   size_t max_base = 0;
 };
 
+#if PYEDT_COMPILED_ENABLE_METRICS
 namespace detail {
 struct AtomicMetrics {
   std::atomic<size_t> total_lines{0};
@@ -113,8 +123,31 @@ inline DispatchMetrics metrics_snapshot() {
   out.max_base = m.max_base.load(std::memory_order_relaxed);
   return out;
 }
+#else
+namespace detail {
+inline bool& metrics_flag_stub() {
+  static bool enabled = false;
+  return enabled;
+}
+}  // namespace detail
 
-// TileWalker generates successive base offsets for the non-axis dimensions.
+inline void reset_metrics() {}
+
+inline void enable_metrics(bool enabled) {
+  detail::metrics_flag_stub() = enabled;
+}
+
+inline bool metrics_enabled() {
+  return detail::metrics_flag_stub();
+}
+
+inline void record_tile(size_t, size_t) {}
+
+inline DispatchMetrics metrics_snapshot() {
+  return DispatchMetrics{};
+}
+#endif  // PYEDT_COMPILED_ENABLE_METRICS
+
 template <size_t Dim>
 class TileWalker {
  public:
@@ -174,7 +207,6 @@ class TileWalker {
   size_t base_ = 0;
 };
 
-// Specialisation for Dim == 0 (no remaining dimensions)
 template <>
 class TileWalker<0> {
  public:
@@ -310,11 +342,13 @@ bool dispatch_axis(T* labels, float* dest,
   const bool metrics_on = metrics_enabled();
   if (metrics_on) {
     reset_metrics();
+#if PYEDT_COMPILED_ENABLE_METRICS
     auto& atomic = detail::metrics_atomic();
     atomic.total_lines.store(total_lines, std::memory_order_relaxed);
     atomic.thread_count.store(threads, std::memory_order_relaxed);
     atomic.chunk_units.store(threads, std::memory_order_relaxed);
     atomic.chunk_size.store(lines_per_thread, std::memory_order_relaxed);
+#endif
   }
 
   auto line_kernel = [&](size_t base) {
@@ -405,3 +439,4 @@ inline void report_nonfinite(const float* dest,
 }
 
 }  // namespace compiled2
+

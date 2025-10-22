@@ -59,7 +59,7 @@ ctypedef fused NUMBER:
   float
   double
 
-cdef extern from "edt.hpp" namespace "pyedt":
+cdef extern from "edt.hpp" namespace "legacy_pyedt":
   cdef void squared_edt_1d_multi_seg[T](
     T *labels,
     float *dest,
@@ -85,7 +85,7 @@ cdef extern from "edt.hpp" namespace "pyedt":
     float* output
   ) nogil
 
-cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
+cdef extern from "edt_voxel_graph.hpp" namespace "legacy_pyedt":
   cdef float* _edt2dsq_voxel_graph[T,GRAPH_TYPE](
     T* labels, GRAPH_TYPE* graph,
     size_t sx, size_t sy,
