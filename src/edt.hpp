@@ -24,6 +24,7 @@
 #include <vector>
 #include "threadpool.h"
 
+
 // Portable prefetch macro (no-op if unavailable)
 #if defined(__GNUC__) || defined(__clang__)
 #  define EDT_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
@@ -45,7 +46,6 @@
 
 namespace pyedt {
     
-
 #define sq(x) (static_cast<float>(x) * static_cast<float>(x))
 
 // ND tuning knobs
@@ -76,6 +76,8 @@ inline void toinfinite(float *f, const size_t voxels) {
 }
 
 #include "loop.hpp"
+
+namespace nd_dispatch = nd_internal;
 
 /* 1D Euclidean Distance Transform for Multiple Segids
  *
@@ -689,7 +691,7 @@ inline void _nd_pass_multi_bases(
     }
     return;
   }
-  auto& pool = ::pyedt::compiled2::shared_pool_for(static_cast<size_t>(threads));
+  auto& pool = ::pyedt::nd_dispatch::shared_pool_for(static_cast<size_t>(threads));
   std::vector<std::future<void>> pending;
   pending.reserve(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
@@ -737,7 +739,7 @@ inline void _nd_pass_parabolic_bases(
     }
     return;
   }
-  auto& pool = ::pyedt::compiled2::shared_pool_for(static_cast<size_t>(threads));
+  auto& pool = ::pyedt::nd_dispatch::shared_pool_for(static_cast<size_t>(threads));
   std::vector<std::future<void>> pending;
   pending.reserve(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
@@ -822,16 +824,16 @@ inline bool _nd_pass_multi_compiled(
       bases[0] = 0;
       break;
     case 1:
-      ::pyedt::compiled2::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     case 2:
-      ::pyedt::compiled2::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     case 3:
-      ::pyedt::compiled2::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     case 4:
-      ::pyedt::compiled2::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     default:
       return false;
@@ -912,16 +914,16 @@ inline bool _nd_pass_parabolic_compiled(
       bases[0] = 0;
       break;
     case 1:
-      ::pyedt::compiled2::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     case 2:
-      ::pyedt::compiled2::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     case 3:
-      ::pyedt::compiled2::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     case 4:
-      ::pyedt::compiled2::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
       break;
     default:
       return false;
@@ -1029,7 +1031,7 @@ inline void _nd_pass_odometer(
     return;
   }
 
-  ThreadPool& pool = ::pyedt::compiled2::shared_pool_for(static_cast<size_t>(threads));
+  ThreadPool& pool = ::pyedt::nd_dispatch::shared_pool_for(static_cast<size_t>(threads));
   std::vector<std::future<void>> pending;
   pending.reserve(static_cast<size_t>(threads));
   size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads));

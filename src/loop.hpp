@@ -1,19 +1,6 @@
 #pragma once
 
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <cstddef>
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <limits>
-#include <memory>
-#include <vector>
-#include <mutex>
-#include <unordered_map>
 
-#include "threadpool.h"
 
 #ifndef PYEDT_COMPILED_ENABLE_METRICS
 #  if defined(_MSC_VER) && !defined(__clang__)
@@ -23,7 +10,7 @@
 #  endif
 #endif
 
-namespace compiled2 {
+namespace nd_internal {
 
 constexpr size_t DEFAULT_TILE = 8;
 constexpr size_t PYEDT_COMPILED_MAX_BASES = size_t{1} << 20;
@@ -438,5 +425,4 @@ inline void report_nonfinite(const float* dest,
                static_cast<unsigned long long>(dims));
 }
 
-}  // namespace compiled2
-
+}  // namespace nd_internal
