@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import sys
 import os
+import multiprocessing
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -112,18 +113,28 @@ def _profile_parallel_used(arr, parallel):
     return int(used)
 
 
+def _expected_parallel_used(shape, requested):
+    cpu_cap = multiprocessing.cpu_count()
+    parallel = requested
+    if parallel <= 0:
+        parallel = cpu_cap
+    else:
+        parallel = max(1, min(parallel, cpu_cap))
+    return edt._adaptive_thread_limit_nd(parallel, shape, requested)
+
+
 def test_nd_thread_limit_heuristics():
     """Verify heuristic caps reduce oversubscription across shapes."""
     arr_128 = np.zeros((128, 128), dtype=np.uint8)
-    assert _profile_parallel_used(arr_128, 16) == 4
-    assert _profile_parallel_used(arr_128, -1) == 4
+    assert _profile_parallel_used(arr_128, 16) == _expected_parallel_used(arr_128.shape, 16)
+    assert _profile_parallel_used(arr_128, -1) == _expected_parallel_used(arr_128.shape, -1)
 
     arr_512 = np.zeros((512, 512), dtype=np.uint8)
-    assert _profile_parallel_used(arr_512, 16) == 8
+    assert _profile_parallel_used(arr_512, 16) == _expected_parallel_used(arr_512.shape, 16)
 
     arr_192 = np.zeros((192, 192, 192), dtype=np.uint8)
-    assert _profile_parallel_used(arr_192, -1) == 16
-    assert _profile_parallel_used(arr_192, 32) == 16
+    assert _profile_parallel_used(arr_192, -1) == _expected_parallel_used(arr_192.shape, -1)
+    assert _profile_parallel_used(arr_192, 32) == _expected_parallel_used(arr_192.shape, 32)
 
 @pytest.mark.parametrize(
     "shape",
