@@ -26,7 +26,7 @@ jobs:
         env:
           OUTPUT_CSV: benchmarks/legacy_vs_nd_explicit_ci.csv
         run: |
-          python scripts/bench_explicit_threads.py --parallels 1,2,4 --reps 3 --output "$OUTPUT_CSV"
+          python scripts/bench_explicit_threads.py --parallels 1,2,4,8 --reps 3 --output "$OUTPUT_CSV"
 
       - name: Summarize results
         env:
