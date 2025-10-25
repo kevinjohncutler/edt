@@ -26,7 +26,7 @@ jobs:
         env:
           OUTPUT_CSV: benchmarks/legacy_vs_nd_explicit_ci.csv
         run: |
-          python scripts/bench_explicit_threads.py --parallels 1,4,16 --reps 3 --output "$OUTPUT_CSV"
+          python scripts/bench_explicit_threads.py --parallels 1,2,4 --reps 3 --output "$OUTPUT_CSV"
 
       - name: Summarize results
         env:
@@ -48,7 +48,17 @@ jobs:
           if not rows:
               summary = "No benchmark rows captured."
           else:
-              header = ["shape", "dims", "parallel", "legacy_ms", "nd_ms", "ratio", "max_abs_diff"]
+              header = [
+                  "shape",
+                  "dims",
+                  "parallel",
+                  "legacy_ms",
+                  "nd_ms",
+                  "ratio",
+                  "legacy_threads_used",
+                  "nd_parallel_used",
+                  "max_abs_diff",
+              ]
               table = ["| " + " | ".join(header) + " |"]
               table.append("| " + " | ".join(["---"] * len(header)) + " |")
               for row in rows:
