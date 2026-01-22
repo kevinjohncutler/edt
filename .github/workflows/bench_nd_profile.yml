@@ -55,7 +55,6 @@ jobs:
                   "legacy_ms",
                   "nd_ms",
                   "ratio",
-                  "legacy_threads_used",
                   "nd_parallel_used",
                   "max_abs_diff",
               ]
