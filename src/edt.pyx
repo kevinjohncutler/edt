@@ -357,33 +357,6 @@ ctypedef fused nd_t:
   double
   native_bool
 
-ctypedef enum _DTypeCode:
-  DT_U8 = 0
-  DT_U16 = 1
-  DT_U32 = 2
-  DT_U64 = 3
-  DT_F32 = 4
-  DT_F64 = 5
-  DT_BOOL = 6
-  DT_UNKNOWN = -1
-
-cdef inline int _dtype_code(object dt):
-  if dt == np.uint8 or dt == np.int8:
-    return DT_U8
-  if dt == np.uint16 or dt == np.int16:
-    return DT_U16
-  if dt == np.uint32 or dt == np.int32:
-    return DT_U32
-  if dt == np.uint64 or dt == np.int64:
-    return DT_U64
-  if dt == np.float32:
-    return DT_F32
-  if dt == np.float64:
-    return DT_F64
-  if dt == bool:
-    return DT_BOOL
-  return DT_UNKNOWN
-
 cdef void _run_multi_pass(nd_t* datap, float* outp,
                           size_t nd, size_t* cshape, size_t* cstrides,
                           size_t axis, float anisotropy,
@@ -408,55 +381,147 @@ cdef void _run_parabolic_pass(nd_t* datap, float* outp,
         datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel
     )
 
-cdef void _dispatch_multi_pass(int code, void* datap, float* outp,
-                               size_t nd, size_t* cshape, size_t* cstrides,
-                               size_t axis, float anisotropy,
-                               native_bool black_border, int parallel) nogil:
-  if code == DT_U8:
-    _run_multi_pass(<uint8_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_U16:
-    _run_multi_pass(<uint16_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_U32:
-    _run_multi_pass(<uint32_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_U64:
-    _run_multi_pass(<uint64_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_F32:
-    _run_multi_pass(<float*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_F64:
-    _run_multi_pass(<double*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_BOOL:
-    _run_multi_pass(<native_bool*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
+cpdef np.ndarray _edtsq_nd_typed(
+    nd_t[::1] data,
+    tuple shape,
+    tuple anis,
+    bint c_contig,
+    native_bool black_border,
+    int parallel,
+    bint profile_enabled,
+    dict profile_sections,
+    list profile_axes,
+    object debug_stage,
+  ):
+  cdef Py_ssize_t nd = len(shape)
+  cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
+  cdef size_t* cstrides = <size_t*> malloc(nd * sizeof(size_t))
+  cdef float* canis = <float*> malloc(nd * sizeof(float))
+  if cshape == NULL or cstrides == NULL or canis == NULL:
+    if cshape != NULL:
+      free(cshape)
+    if cstrides != NULL:
+      free(cstrides)
+    if canis != NULL:
+      free(canis)
+    raise MemoryError('Allocation failure')
 
-cdef void _dispatch_parabolic_pass(int code, void* datap, float* outp,
-                                   size_t nd, size_t* cshape, size_t* cstrides,
-                                   size_t axis, float anisotropy,
-                                   native_bool black_border, int parallel) nogil:
-  if code == DT_U8:
-    _run_parabolic_pass(<uint8_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_U16:
-    _run_parabolic_pass(<uint16_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_U32:
-    _run_parabolic_pass(<uint32_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_U64:
-    _run_parabolic_pass(<uint64_t*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_F32:
-    _run_parabolic_pass(<float*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_F64:
-    _run_parabolic_pass(<double*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
-  elif code == DT_BOOL:
-    _run_parabolic_pass(<native_bool*>datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel)
+  cdef size_t total = 1
+  cdef Py_ssize_t i
+  for i in range(nd):
+    cshape[i] = <size_t>shape[i]
+    canis[i] = <float>anis[i]
+  if c_contig:
+    cstrides[nd-1] = 1
+    for i in range(nd-2, -1, -1):
+      cstrides[i] = cstrides[i+1] * cshape[i+1]
+  else:
+    cstrides[0] = 1
+    for i in range(1, nd):
+      cstrides[i] = cstrides[i-1] * cshape[i-1]
+  for i in range(nd):
+    total *= cshape[i]
 
-cdef void _dispatch_1d_parabolic(int code, void* datap, float* valsp,
-                                 int n, long stride, float anisotropy,
-                                 native_bool black_border) nogil:
-  if code == DT_U8:
-    squared_edt_1d_parabolic_multi_seg[uint8_t](<uint8_t*>datap, valsp, n, stride, anisotropy, black_border)
-  elif code == DT_U16:
-    squared_edt_1d_parabolic_multi_seg[uint16_t](<uint16_t*>datap, valsp, n, stride, anisotropy, black_border)
-  elif code == DT_U32:
-    squared_edt_1d_parabolic_multi_seg[uint32_t](<uint32_t*>datap, valsp, n, stride, anisotropy, black_border)
-  elif code == DT_U64:
-    squared_edt_1d_parabolic_multi_seg[uint64_t](<uint64_t*>datap, valsp, n, stride, anisotropy, black_border)
+  cdef np.ndarray out = np.zeros((<Py_ssize_t> total,), dtype=np.float32)
+  cdef float* outp = <float*> np.PyArray_DATA(out)
+  cdef nd_t* datap = &data[0]
+
+  cdef Py_ssize_t* axes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
+  if axes == NULL:
+    free(cshape); free(cstrides); free(canis)
+    raise MemoryError('Allocation failure')
+  for i in range(nd):
+    axes[i] = i
+  cdef Py_ssize_t a, j, key
+  for a in range(1, nd):
+    key = axes[a]
+    j = a - 1
+    while j >= 0 and (
+      cstrides[axes[j]] > cstrides[key]
+      or (cstrides[axes[j]] == cstrides[key] and cshape[axes[j]] < cshape[key])
+    ):
+      axes[j+1] = axes[j]
+      j -= 1
+    axes[j+1] = key
+
+  cdef double t_tmp
+  cdef double t_axis
+  cdef double multi_elapsed = 0.0
+  cdef double parabolic_elapsed = 0.0
+
+  if profile_enabled:
+    t_tmp = time.perf_counter()
+  with nogil:
+    _run_multi_pass(datap, outp, <size_t>nd, cshape, cstrides,
+                    <size_t>axes[0], canis[axes[0]], black_border, parallel)
+  if profile_enabled:
+    multi_elapsed = time.perf_counter() - t_tmp
+    profile_axes.append({'axis': int(axes[0]), 'kind': 'multi', 'time': multi_elapsed})
+
+  if debug_stage == 'multi':
+    free(cshape); free(cstrides); free(canis); free(axes)
+    order_ch2 = 'C' if c_contig else 'F'
+    return np.reshape(out, shape, order=order_ch2)
+
+  if not black_border:
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    mask_inf = np.isinf(out)
+    if mask_inf.any():
+      out[mask_inf] = np.finfo(np.float32).max
+    if profile_enabled:
+      profile_sections['multi_fix'] = time.perf_counter() - t_tmp
+  elif profile_enabled:
+    profile_sections['multi_fix'] = 0.0
+
+  for a in range(1, nd):
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    with nogil:
+      _run_parabolic_pass(datap, outp, <size_t>nd, cshape, cstrides,
+                          <size_t>axes[a], canis[axes[a]], black_border, parallel)
+    if profile_enabled:
+      t_axis = time.perf_counter() - t_tmp
+      parabolic_elapsed += t_axis
+      profile_axes.append({'axis': int(axes[a]), 'kind': 'parabolic', 'time': t_axis})
+
+  if debug_stage == 'parabolic':
+    free(cshape); free(cstrides); free(canis); free(axes)
+    order_ch2 = 'C' if c_contig else 'F'
+    return np.reshape(out, shape, order=order_ch2)
+
+  if not black_border:
+    if profile_enabled:
+      t_tmp = time.perf_counter()
+    mask_max = out >= np.finfo(np.float32).max
+    if mask_max.any():
+      out[mask_max] = np.inf
+    if profile_enabled:
+      profile_sections['post_fix'] = time.perf_counter() - t_tmp
+  elif profile_enabled:
+    profile_sections['post_fix'] = 0.0
+
+  free(cshape); free(cstrides); free(canis); free(axes)
+  if profile_enabled:
+    profile_sections['multi_pass'] = multi_elapsed
+    profile_sections['parabolic_pass'] = parabolic_elapsed
+
+  order_ch2 = 'C' if c_contig else 'F'
+  return np.reshape(out, shape, order=order_ch2)
+
+
+cpdef void _parabolic_1d_typed(
+    nd_t[::1] data,
+    float[::1] vals,
+    int n,
+    long stride,
+    float anisotropy,
+    native_bool black_border,
+  ):
+  cdef nd_t* datap = &data[0]
+  cdef float* valsp = &vals[0]
+  with nogil:
+    squared_edt_1d_parabolic_multi_seg(datap, valsp, n, stride, anisotropy, black_border)
 
 cdef extern from "edt_voxel_graph.hpp" namespace "pyedt":
   cdef mapcpp[T, vector[cpp_pair[size_t, size_t]]] extract_runs[T](
@@ -1075,36 +1140,21 @@ def edtsq_nd(
   if voxel_graph is not None:
     raise TypeError('voxel_graph is only supported by 2D/3D specialized APIs')
 
+  if arr.dtype == np.int8:
+    arr = arr.view(np.uint8)
+  elif arr.dtype == np.int16:
+    arr = arr.view(np.uint16)
+  elif arr.dtype == np.int32:
+    arr = arr.view(np.uint32)
+  elif arr.dtype == np.int64:
+    arr = arr.view(np.uint64)
+  elif arr.dtype not in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64, bool):
+    raise TypeError(f"Unsupported dtype: {arr.dtype}")
+
   cdef Py_ssize_t nd = dims
-  cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
-  cdef size_t* cstrides = <size_t*> malloc(nd * sizeof(size_t))
-  if cshape == NULL or cstrides == NULL:
-    if cshape != NULL: free(cshape)
-    if cstrides != NULL: free(cstrides)
-    raise MemoryError('Allocation failure')
-
-  cdef size_t total = 1
-  cdef Py_ssize_t i
-  for i in range(nd):
-    cshape[i] = <size_t>arr.shape[i]
-  if arr.flags.c_contiguous:
-    cstrides[nd-1] = 1
-    for i in range(nd-2, -1, -1):
-      cstrides[i] = cstrides[i+1] * cshape[i+1]
-  else:
-    cstrides[0] = 1
-    for i in range(1, nd):
-      cstrides[i] = cstrides[i-1] * cshape[i-1]
-  for i in range(nd):
-    total *= cshape[i]
-
   cdef size_t tune_tile = 0
   cdef size_t tune_prefetch = 0
   cdef size_t tune_chunks = 0
-  cdef int dtype_code = _dtype_code(arr.dtype)
-  if dtype_code == DT_UNKNOWN:
-    free(cshape); free(cstrides)
-    raise TypeError(f"Unsupported dtype: {arr.dtype}")
 
   # should try getting rid of these tunings 
   if parallel > 1:
@@ -1135,94 +1185,21 @@ def edtsq_nd(
     with nogil:
       nd_set_tuning(tune_tile, tune_prefetch, tune_chunks)
 
-  cdef np.ndarray out = np.zeros((<Py_ssize_t> total,), dtype=np.float32)
-  cdef float* outp = <float*> np.PyArray_DATA(out)
-  cdef void* datap = <void*> np.PyArray_DATA(arr)
+  cdef object debug_stage = os.environ.get('EDT_ND_DEBUG_STAGE')
+  cdef np.ndarray out = (<object>_edtsq_nd_typed)(
+      arr.reshape(-1), arr.shape, anis, arr.flags.c_contiguous,
+      black_border, parallel, profile_enabled,
+      profile_sections, profile_axes, debug_stage
+  )
 
-  cdef double t_tmp
-  cdef double t_axis
-  cdef double multi_elapsed = 0.0
-  cdef double parabolic_elapsed = 0.0
-
-  cdef Py_ssize_t* axes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
-  if axes == NULL:
-    free(cshape); free(cstrides)
-    raise MemoryError('Allocation failure')
-  for i in range(nd):
-    axes[i] = i
-  cdef Py_ssize_t a, j, key
-  for a in range(1, nd):
-    key = axes[a]
-    j = a - 1
-    while j >= 0 and (
-      cstrides[axes[j]] > cstrides[key]
-      or (cstrides[axes[j]] == cstrides[key] and cshape[axes[j]] < cshape[key])
-    ):
-      axes[j+1] = axes[j]
-      j -= 1
-    axes[j+1] = key
+  if debug_stage in ('multi', 'parabolic'):
+    return out
 
   if profile_enabled:
-    t_tmp = time.perf_counter()
-  cdef bint used_compiled = False
-  _dispatch_multi_pass(dtype_code, datap, outp, <size_t>nd, cshape, cstrides,
-                       <size_t>axes[0], <float>anis[axes[0]], black_border, parallel)
-  if profile_enabled:
-    multi_elapsed = time.perf_counter() - t_tmp
-    profile_axes.append({'axis': int(axes[0]), 'kind': 'multi', 'time': multi_elapsed})
-
-  if os.environ.get('EDT_ND_DEBUG_STAGE') == 'multi':
-    free(cshape); free(cstrides); free(axes)
-    order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
-    return np.reshape(out, arr.shape, order=order_ch2)
-
-  if not black_border:
-    if profile_enabled:
-      t_tmp = time.perf_counter()
-    mask_inf = np.isinf(out)
-    if mask_inf.any():
-      out[mask_inf] = np.finfo(np.float32).max
-    if profile_enabled:
-      profile_sections['multi_fix'] = time.perf_counter() - t_tmp
-  elif profile_enabled:
-    profile_sections['multi_fix'] = 0.0
-
-  for a in range(1, nd):
-    if profile_enabled:
-      t_tmp = time.perf_counter()
-    used_compiled = False
-    _dispatch_parabolic_pass(dtype_code, datap, outp, <size_t>nd, cshape, cstrides,
-                             <size_t>axes[a], <float>anis[axes[a]], black_border, parallel)
-    if profile_enabled:
-      t_axis = time.perf_counter() - t_tmp
-      parabolic_elapsed += t_axis
-      profile_axes.append({'axis': int(axes[a]), 'kind': 'parabolic', 'time': t_axis})
-
-  if os.environ.get('EDT_ND_DEBUG_STAGE') == 'parabolic':
-    free(cshape); free(cstrides); free(axes)
-    order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
-    return np.reshape(out, arr.shape, order=order_ch2)
-
-  if not black_border:
-    if profile_enabled:
-      t_tmp = time.perf_counter()
-    mask_max = out >= np.finfo(np.float32).max
-    if mask_max.any():
-      out[mask_max] = np.inf
-    if profile_enabled:
-      profile_sections['post_fix'] = time.perf_counter() - t_tmp
-  elif profile_enabled:
-    profile_sections['post_fix'] = 0.0
-
-  free(cshape); free(cstrides); free(axes)
-  if profile_enabled:
-    profile_sections['multi_pass'] = multi_elapsed
-    profile_sections['parabolic_pass'] = parabolic_elapsed
     profile_sections['total'] = time.perf_counter() - t_total_start
     _nd_profile_last = profile_data
 
-  order_ch2 = 'C' if arr.flags.c_contiguous else 'F'
-  return np.reshape(out, arr.shape, order=order_ch2)
+  return out
 
 @cython.binding(True)
 def edtsq_nd_last_profile():
@@ -1238,13 +1215,8 @@ def _debug_parabolic_multi(labels, values, int stride, anisotropy=1.0, black_bor
   cdef Py_ssize_t n = arr.size
   if vals.size != n:
     raise ValueError('values must match labels length')
-  cdef float* valsp = <float*> np.PyArray_DATA(vals)
   cdef int strd = max(1, stride)
-  cdef void* datap = <void*> np.PyArray_DATA(arr)
-  cdef int dtype_code = _dtype_code(arr.dtype)
-  if dtype_code == DT_UNKNOWN:
-    raise TypeError('labels dtype must be unsigned integer')
-  _dispatch_1d_parabolic(dtype_code, datap, valsp, <int>n, <long>strd, <float>anisotropy, black_border)
+  (<object>_parabolic_1d_typed)(arr, vals, <int>n, <long>strd, <float>anisotropy, black_border)
   return vals.copy()
 
 

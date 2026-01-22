@@ -13,32 +13,40 @@ class NumpyImport:
 # NOTE: If edt.cpp does not exist:
 # cython -3 --fast-fail -v --cplus edt.pyx
 
-extra_compile_args = []
+extra_compile_args_nd = []
+extra_compile_args_legacy = []
 machine = platform.machine().lower()
 is_x86 = machine in ("x86_64", "amd64")
 if sys.platform == 'win32':
-  extra_compile_args += [
-    '/std:c++17', '/O2'
-  ]
+  common_win = ['/std:c++17', '/O2']
+  extra_compile_args_nd += common_win
+  extra_compile_args_legacy += common_win
 else:
-  extra_compile_args += [
-    '-std=c++17', 
-    # '-Ofast', #'-ffast-math', 
+  extra_compile_args_nd += [
+    '-std=c++17',
+    # '-Ofast', #'-ffast-math',
     # '-Ofast', '-fno-finite-math-only',
-    '-O3','-ffast-math','-fno-finite-math-only','-fno-unsafe-math-optimizations',
+    '-O3', '-ffast-math', '-fno-finite-math-only', '-fno-unsafe-math-optimizations',
     '-fno-math-errno', '-fno-trapping-math',
     '-flto', '-DNDEBUG', '-pthread'
   ]
   if is_x86:
-    extra_compile_args += ['-march=native', '-mtune=native']
+    extra_compile_args_nd += ['-march=native', '-mtune=native']
+
+  # Match upstream legacy flags to minimize divergence.
+  extra_compile_args_legacy += [
+    '-std=c++17', '-O3', '-ffast-math', '-pthread'
+  ]
 
 if sys.platform == 'darwin':
-  extra_compile_args += [ '-stdlib=libc++', '-mmacosx-version-min=10.9' ]
+  extra_compile_args_nd += [ '-stdlib=libc++', '-mmacosx-version-min=10.9' ]
+  extra_compile_args_legacy += [ '-stdlib=libc++', '-mmacosx-version-min=10.9' ]
 
-# Add extra_link_args for LTO if not Windows
-extra_link_args = []
+# Add extra_link_args for LTO if not Windows (ND only)
+extra_link_args_nd = []
+extra_link_args_legacy = []
 if sys.platform != 'win32':
-  extra_link_args += ['-flto']
+  extra_link_args_nd += ['-flto']
 
 
 extensions = [
@@ -47,8 +55,8 @@ extensions = [
     sources=['src/edt.pyx'],
     language='c++',
     include_dirs=['src', str(NumpyImport())],
-    extra_compile_args=extra_compile_args,
-    extra_link_args=extra_link_args,
+    extra_compile_args=extra_compile_args_nd,
+    extra_link_args=extra_link_args_nd,
     define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
   ),
   setuptools.Extension(
@@ -56,8 +64,8 @@ extensions = [
     sources=['legacy/edt.pyx'],
     language='c++',
     include_dirs=['legacy', str(NumpyImport())],
-    extra_compile_args=extra_compile_args,
-    extra_link_args=extra_link_args,
+    extra_compile_args=extra_compile_args_legacy,
+    extra_link_args=extra_link_args_legacy,
     define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
   ),
 ]
