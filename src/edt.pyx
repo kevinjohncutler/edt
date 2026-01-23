@@ -974,7 +974,41 @@ def edtsq(
     data, anisotropy=None, native_bool black_border=False,
     int parallel=1, voxel_graph=None, order=None,
 ):
-  """Squared EDT that forwards to the ND implementation."""
+  """
+  Computes the squared anisotropic Euclidean Distance Transform (EDT) of
+  N-dimensional numpy arrays.
+
+  Squaring avoids the sqrt operation, so this can be faster if squared
+  distances are acceptable.
+
+  The input is made C-contiguous if needed. If you pass a Fortran-ordered
+  array, it will be copied to C order; anisotropy is always specified in
+  axis order (length == data.ndim).
+
+  Supported dtypes:
+    (u)int8, (u)int16, (u)int32, (u)int64,
+    float32, float64, and boolean
+
+  Parameters
+  ----------
+  data : ndarray
+      N-dimensional input array (any supported dtype).
+  anisotropy : float or sequence of float, optional
+      Per-axis voxel size (default 1.0 for all axes).
+  black_border : bool, optional
+      If True, treat the border as background (default False).
+  parallel : int, optional
+      Number of threads; if <= 0, uses cpu_count().
+  voxel_graph : ignored
+      Voxel graph support is only available in the legacy 2D/3D paths.
+  order : ignored
+      Retained for backwards compatibility.
+
+  Returns
+  -------
+  ndarray, float32
+      Squared Euclidean distances for each voxel.
+  """
   return edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
 
 
@@ -983,7 +1017,38 @@ def edt(
     data, anisotropy=None, native_bool black_border=False,
     int parallel=1, voxel_graph=None, order=None,
   ):
-  """EDT wrapper that uses the ND core and returns sqrt distances."""
+  """
+  Computes the anisotropic Euclidean Distance Transform (EDT) of
+  N-dimensional numpy arrays.
+
+  The input is made C-contiguous if needed. If you pass a Fortran-ordered
+  array, it will be copied to C order; anisotropy is always specified in
+  axis order (length == data.ndim).
+
+  Supported dtypes:
+    (u)int8, (u)int16, (u)int32, (u)int64,
+    float32, float64, and boolean
+
+  Parameters
+  ----------
+  data : ndarray
+      N-dimensional input array (any supported dtype).
+  anisotropy : float or sequence of float, optional
+      Per-axis voxel size (default 1.0 for all axes).
+  black_border : bool, optional
+      If True, treat the border as background (default False).
+  parallel : int, optional
+      Number of threads; if <= 0, uses cpu_count().
+  voxel_graph : ignored
+      Voxel graph support is only available in the legacy 2D/3D paths.
+  order : ignored
+      Retained for backwards compatibility.
+
+  Returns
+  -------
+  ndarray, float32
+      Euclidean distances for each voxel.
+  """
   dt = edtsq_nd(data, anisotropy, black_border, parallel, voxel_graph, order)
   return np.sqrt(dt, dt)
 
@@ -1033,7 +1098,16 @@ def edtsq_nd(
   data, anisotropy=None, native_bool black_border=False,
   int parallel=1, voxel_graph=None, order=None,
 ):
-  """General ND squared EDT using a dimension-agnostic pass schedule."""
+  """
+  General ND squared EDT using a dimension-agnostic pass schedule.
+
+  This is the core ND implementation used by `edtsq` and `edt`.
+  The input is made C-contiguous if needed; anisotropy is always specified
+  in axis order (length == data.ndim).
+
+  Voxel-graph constraints are not supported in the ND core and are only
+  available in the legacy 2D/3D path.
+  """
   global _nd_profile_last
   _nd_profile_last = None
 
