@@ -1,28 +1,33 @@
 import numpy as np
 
-def make_label_matrix(N: int, M: int) -> np.ndarray:
+
+def make_label_matrix(ndim: int, size: int) -> np.ndarray:
     """
     General ND label matrix.
-    
-    Shape = (2*M,)*N
-    Each axis is split into two halves of length M.
+
+    Shape = (2*size,)*ndim
+    Each axis is split into two halves of length size.
     The label is the binary code of the half-indices.
-    
+
     Example:
-      N=1 → [0...0,1...1]
-      N=2 → quadrants labeled 0..3
-      N=3 → octants labeled 0..7
-      N=4 → 16 hyper-quadrants labeled 0..15
+      ndim=1 → [0...0,1...1]
+      ndim=2 → quadrants labeled 0..3
+      ndim=3 → octants labeled 0..7
+      ndim=4 → 16 hyper-quadrants labeled 0..15
     """
-    if N < 1:
-        raise ValueError("N must be >=1")
-    # build index grids
-    grids = np.ogrid[tuple(slice(0,2*M) for _ in range(N))]
-    labels = np.zeros((2*M,)*N, dtype=int)
+    if ndim < 1:
+        raise ValueError("ndim must be >=1")
+    grids = np.ogrid[tuple(slice(0, 2 * size) for _ in range(ndim))]
+    labels = np.zeros((2 * size,) * ndim, dtype=int)
     for axis, g in enumerate(grids):
-        half = (g // M).astype(int)     # 0 or 1
-        labels += half << axis          # bit-shift
+        half = (g // size).astype(int)  # 0 or 1
+        labels += half << axis
     return labels
+
+
+def then(N: int, M: int) -> np.ndarray:
+    """Backwards-compatible alias for make_label_matrix."""
+    return make_label_matrix(N, M)
 
 def test_edt_consistency():
     """Test that edt functions give consistent results across dimensions"""

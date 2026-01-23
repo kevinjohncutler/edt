@@ -587,7 +587,7 @@ def _adaptive_thread_limit_nd(parallel, shape, requested=None):
 
 @cython.binding(True)
 def expand_labels(
-    data, anisotropy=None, black_border=False,
+    data, anisotropy=None,
     int parallel=1, voxel_graph=None, return_features=False
   ):
   """Expand nonzero labels to zeros by nearest-neighbor in Euclidean metric (ND).
@@ -604,12 +604,14 @@ def expand_labels(
       Any integer dtype is accepted; internally cast to uint32 for labels.
   anisotropy : float or sequence of float, optional
       Per-axis voxel size (default 1.0 for all axes).
-  black_border : bool, optional
-      If True, treat the border as background (default False).
   parallel : int, optional
       Number of threads; if <= 0, uses cpu_count().
-  voxel_graph : ignored
-      Present for API parity; not used in ND path.
+  voxel_graph : ndarray, optional
+      Per-voxel bitfield describing allowed +axis connections. Bit layout
+      matches legacy (x/y/z ordering): bit = 1 << (2*(ndim-1-axis)).
+      For 2D: axis0 uses bit 4, axis1 uses bit 1. For 3D: axis0 uses bit 16,
+      axis1 uses bit 4, axis2 uses bit 1. If provided, labels are expanded
+      with voxel-graph barriers using the legacy doubling scheme generalized to ND.
   return_features : bool, optional
       If True, also return the feature (nearest-seed linear index) array.
 
@@ -663,6 +665,52 @@ def expand_labels(
     parallel = cpu_cap
   else:
     parallel = max(1, min(parallel, cpu_cap))
+
+  if voxel_graph is not None:
+    graph = np.asarray(voxel_graph)
+    if graph.shape != arr.shape:
+      raise ValueError('voxel_graph must have the same shape as data')
+    if not graph.flags.c_contiguous:
+      graph = np.ascontiguousarray(graph)
+    graph_u64 = graph.astype(np.uint64, copy=False)
+    max_bits = graph_u64.dtype.itemsize * 8
+    if (dims - 1) * 2 >= max_bits:
+      raise ValueError('voxel_graph dtype does not have enough bits for data.ndim')
+
+    labels = arr
+    dbl = labels
+    for ax_vg in range(dims):
+      dbl = np.repeat(dbl, 2, axis=ax_vg)
+
+    for ax_vg in range(dims):
+      bit = 2 * (dims - 1 - ax_vg)
+      mask = ((graph_u64 >> bit) & 1).astype(np.uint32, copy=False)
+      slc = [slice(0, None, 2)] * dims
+      slc[ax_vg] = slice(1, None, 2)
+      dbl[tuple(slc)] = labels & mask
+
+    anis2 = tuple(val / 2.0 for val in anis)
+    if return_features:
+      lbl2, feat2 = expand_labels(dbl, anis2, 1, None, True)
+    else:
+      lbl2 = expand_labels(dbl, anis2, 1, None, False)
+
+    slc = tuple(slice(0, None, 2) for _ in range(dims))
+    labels_out = lbl2[slc]
+
+    if not return_features:
+      return labels_out
+
+    if return_features:
+      feat2 = np.asarray(feat2)[slc]
+      shape2 = dbl.shape
+      coords = np.unravel_index(feat2.ravel().astype(np.int64, copy=False), shape2)
+      coords = tuple(c // 2 for c in coords)
+      feat = np.ravel_multi_index(coords, arr.shape).astype(
+        np.uint32 if arr.size < 2**32 else np.uintp,
+        copy=False
+      )
+      return labels_out, feat.reshape(arr.shape)
   if dims == 1:
     # reuse 1D midpoint selection from expand_labels 1D branch
     n1 = arr.shape[0]
@@ -670,7 +718,9 @@ def expand_labels(
     seed_pos = np.flatnonzero(arr)
     if seed_pos.size == 0:
       out1.fill(0)
-      return (out1, np.zeros((n1,), dtype=np.uintp)) if return_features else out1
+      if return_features:
+        return out1, np.zeros((n1,), dtype=np.uintp)
+      return out1
     if seed_pos.size == 1:
       out1.fill(<np.uint32_t>arr[int(seed_pos[0])])
       if return_features:
@@ -698,7 +748,7 @@ def expand_labels(
     pass  # general ND implementation
 
   # General ND implementation (dims >= 2)
-  cdef native_bool bb = black_border
+  cdef native_bool bb = False
   # Work with C-contiguous buffer
   if not arr.flags.c_contiguous:
     arr = np.ascontiguousarray(arr)
@@ -889,8 +939,7 @@ def expand_labels(
         idx2 = fprev_sz[il]
         outp[il] = labp2[idx2]
     return out_flat.reshape(arr.shape), feat_prev.reshape(arr.shape)
-  else:
-    return lab_prev.reshape(arr.shape)
+  return lab_prev.reshape(arr.shape)
 
 
 @cython.binding(True)
@@ -911,8 +960,13 @@ def feature_transform(
       If True, treat the border as background (default False).
   parallel : int, optional
       Number of threads; if <= 0, uses cpu_count().
-  voxel_graph : ignored
-      Present for API parity; not used in ND path.
+  voxel_graph : ndarray, optional
+      Per-voxel bitfield describing allowed +axis connections. Bit layout
+      matches legacy (x/y/z ordering): bit = 1 << (2*(ndim-1-axis)).
+      For 2D: axis0 uses bit 4, axis1 uses bit 1. For 3D: axis0 uses bit 16,
+      axis1 uses bit 4, axis2 uses bit 1. If provided, feature indices and
+      distances respect the voxel-graph barriers using the legacy doubling
+      scheme generalized to ND.
   return_distances : bool, optional
       If True, also return squared EDT of the seed mask.
   features_dtype : {'auto','uint32','u32','uintp'}, optional
@@ -951,7 +1005,7 @@ def feature_transform(
       parallel = max(1, parallel)
 
   # Use ND expand path with feature return on original array (nonzero=seeds)
-  labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, black_border, parallel, voxel_graph, True)
+  labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, parallel, voxel_graph, True)
 
   voxels = arr.size
   if isinstance(features_dtype, str):
@@ -999,8 +1053,12 @@ def edtsq(
       If True, treat the border as background (default False).
   parallel : int, optional
       Number of threads; if <= 0, uses cpu_count().
-  voxel_graph : ignored
-      Voxel graph support is only available in the legacy 2D/3D paths.
+  voxel_graph : ndarray, optional
+      Per-voxel bitfield describing allowed +axis connections. Bit layout
+      matches legacy (x/y/z ordering): bit = 1 << (2*(ndim-1-axis)).
+      For 2D: axis0 uses bit 4, axis1 uses bit 1. For 3D: axis0 uses bit 16,
+      axis1 uses bit 4, axis2 uses bit 1. If provided, distances respect the
+      voxel-graph barriers using the legacy doubling scheme generalized to ND.
   order : ignored
       Retained for backwards compatibility.
 
@@ -1039,8 +1097,12 @@ def edt(
       If True, treat the border as background (default False).
   parallel : int, optional
       Number of threads; if <= 0, uses cpu_count().
-  voxel_graph : ignored
-      Voxel graph support is only available in the legacy 2D/3D paths.
+  voxel_graph : ndarray, optional
+      Per-voxel bitfield describing allowed +axis connections. Bit layout
+      matches legacy (x/y/z ordering): bit = 1 << (2*(ndim-1-axis)).
+      For 2D: axis0 uses bit 4, axis1 uses bit 1. For 3D: axis0 uses bit 16,
+      axis1 uses bit 4, axis2 uses bit 1. If provided, distances respect the
+      voxel-graph barriers using the legacy doubling scheme generalized to ND.
   order : ignored
       Retained for backwards compatibility.
 
@@ -1105,8 +1167,8 @@ def edtsq_nd(
   The input is made C-contiguous if needed; anisotropy is always specified
   in axis order (length == data.ndim).
 
-  Voxel-graph constraints are not supported in the ND core and are only
-  available in the legacy 2D/3D path.
+  Voxel-graph constraints are handled by constructing a doubled grid using
+  the legacy barrier scheme generalized to ND.
   """
   global _nd_profile_last
   _nd_profile_last = None
@@ -1183,7 +1245,41 @@ def edtsq_nd(
     profile_data['parallel_used'] = parallel
 
   if voxel_graph is not None:
-    raise TypeError('voxel_graph is only supported by 2D/3D specialized APIs')
+    graph = np.asarray(voxel_graph)
+    if graph.shape != arr.shape:
+      raise ValueError('voxel_graph must have the same shape as data')
+    if not graph.flags.c_contiguous:
+      graph = np.ascontiguousarray(graph)
+    graph_u64 = graph.astype(np.uint64, copy=False)
+    max_bits = graph_u64.dtype.itemsize * 8
+    if (dims - 1) * 2 >= max_bits:
+      raise ValueError('voxel_graph dtype does not have enough bits for data.ndim')
+
+    fg = (arr != 0).astype(np.uint8, copy=False)
+
+    # Repeat fg on a doubled grid for all axes (equivalent to all 2^D corners set).
+    dbl = fg
+    for a in range(dims):
+      dbl = np.repeat(dbl, 2, axis=a)
+
+    # Gate the single-axis half-step positions by the voxel_graph bits.
+    for a in range(dims):
+      bit = 2 * (dims - 1 - a)
+      mask = ((graph_u64 >> bit) & 1).astype(np.uint8, copy=False)
+      slc = [slice(0, None, 2)] * dims
+      slc[a] = slice(1, None, 2)
+      dbl[tuple(slc)] = fg & mask
+
+    if black_border:
+      for a in range(dims):
+        slc = [slice(None)] * dims
+        slc[a] = -1
+        dbl[tuple(slc)] = 0
+
+    anis2 = tuple(val / 2.0 for val in anis)
+    transform2 = edtsq_nd(dbl, anis2, black_border, 1, None, order)
+    slc = tuple(slice(0, None, 2) for _ in range(dims))
+    return transform2[slc]
 
   if arr.dtype == np.int8:
     arr = arr.view(np.uint8)

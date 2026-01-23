@@ -8,8 +8,8 @@ import sys
 import os
 import multiprocessing
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+# Add repo root to path for debug_utils
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from debug_utils import make_label_matrix
 import edt
