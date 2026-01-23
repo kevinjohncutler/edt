@@ -48,7 +48,7 @@ jobs:
           CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
           CIBW_ARCHS_MACOS: ${{ matrix.archs_macos }}
           # Avoid date-stamped local versions that can cause wheel filename mismatch.
-          CIBW_ENVIRONMENT: "SETUPTOOLS_SCM_LOCAL_SCHEME=node"
+          CIBW_ENVIRONMENT: "SETUPTOOLS_SCM_LOCAL_SCHEME=no-local-version"
 
       - name: Upload built wheels
         uses: actions/upload-artifact@v4
