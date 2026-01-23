@@ -130,7 +130,7 @@ inline void ThreadPool::join () {
     condition.notify_all();
     for(std::thread &worker: workers) {
         if (worker.joinable()) {
-            try { worker.join(); } catch(...) { /* swallow */ }
+            worker.join();
         }
     }
 

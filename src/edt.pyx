@@ -12,7 +12,7 @@ distance 1 and 0 is always 0.
 Key methods:
   edt, edtsq
   edt_nd, edtsq_nd
-  feature_transform_nd, expand_labels_nd
+  feature_transform, expand_labels
 
 Legacy dimension-specific APIs are available through ``edt.legacy`` when the
 reference repository has been cloned and built locally.
@@ -586,7 +586,7 @@ def _adaptive_thread_limit_nd(parallel, shape, requested=None):
   return max(1, capped)
 
 @cython.binding(True)
-def expand_labels_nd(
+def expand_labels(
     data, anisotropy=None, black_border=False,
     int parallel=1, voxel_graph=None, return_features=False
   ):
@@ -653,12 +653,6 @@ def expand_labels_nd(
     if len(anis) != dims:
       raise ValueError('anisotropy length must match data.ndim')
 
-  cdef bint adapt_threads_enabled = True
-  try:
-    adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
-  except Exception:
-    adapt_threads_enabled = True
-
   cdef int cpu_cap = 1
   try:
     cpu_cap = multiprocessing.cpu_count()
@@ -722,7 +716,7 @@ def expand_labels_nd(
     if cstrides != NULL: free(cstrides)
     if paxes != NULL: free(paxes)
     if canis != NULL: free(canis)
-    raise MemoryError('Allocation failure in expand_labels_nd')
+    raise MemoryError('Allocation failure in expand_labels')
   cdef Py_ssize_t i_ax
   cdef Py_ssize_t ii
   for ii in range(nd):
@@ -900,15 +894,7 @@ def expand_labels_nd(
 
 
 @cython.binding(True)
-def expand_labels(
-    data, anisotropy=None, black_border=False,
-    int parallel=1, voxel_graph=None):
-  """Compatibility wrapper that forwards to :func:`expand_labels_nd`."""
-  return expand_labels_nd(data, anisotropy, black_border, parallel, voxel_graph, False)
-
-
-@cython.binding(True)
-def feature_transform_nd(
+def feature_transform(
     data, anisotropy=None, black_border=False,
     int parallel=1, voxel_graph=None,
     return_distances=False, features_dtype='auto'
@@ -965,7 +951,7 @@ def feature_transform_nd(
       parallel = max(1, parallel)
 
   # Use ND expand path with feature return on original array (nonzero=seeds)
-  labels, feats = expand_labels_nd(arr.astype(np.uint32, copy=False), anis, black_border, parallel, voxel_graph, True)
+  labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, black_border, parallel, voxel_graph, True)
 
   voxels = arr.size
   if isinstance(features_dtype, str):
@@ -981,15 +967,6 @@ def feature_transform_nd(
     dist = edtsq_nd((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel, voxel_graph)
     return feats, dist
   return feats
-
-
-@cython.binding(True)
-def feature_transform(data, anisotropy=None, black_border=False,
-                      int parallel=1, voxel_graph=None,
-                      return_distances=False, features_dtype='auto'):
-  """Compatibility wrapper that forwards to :func:`feature_transform_nd`."""
-  return feature_transform_nd(data, anisotropy, black_border, parallel, voxel_graph,
-                              return_distances, features_dtype)
 
 
 @cython.binding(True)
@@ -1113,12 +1090,6 @@ def edtsq_nd(
     anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
     if len(anis) != dims:
       raise ValueError('anisotropy length must match data.ndim')
-  cdef bint adapt_threads_enabled = True
-  try:
-    adapt_threads_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
-  except Exception:
-    adapt_threads_enabled = True
-
   cdef int cpu_cap = 1
   try:
     cpu_cap = multiprocessing.cpu_count()
