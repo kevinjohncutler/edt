@@ -24,18 +24,16 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
-            archs_linux: "x86_64 aarch64"
+            archs_linux: "x86_64"
           - os: windows-latest
             archs_windows: "AMD64"
           - os: macos-latest
-            archs_macos: "x86_64 arm64"
+            archs_macos: "arm64"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        if:  ${{ matrix.os == 'ubuntu-latest' }}
-        uses: docker/setup-qemu-action@v3
+      # QEMU not required since we're only building x86_64 on Linux.
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
