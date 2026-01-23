@@ -1,3 +1,4 @@
+import os
 import platform
 import setuptools
 import sys
@@ -17,6 +18,11 @@ extra_compile_args_nd = []
 extra_compile_args_legacy = []
 machine = platform.machine().lower()
 is_x86 = machine in ("x86_64", "amd64")
+enable_native = os.environ.get("EDT_MARCH_NATIVE", "1").strip().lower()
+use_native = enable_native not in ("0", "false", "no", "off", "")
+building_wheel = any(arg.startswith("bdist_wheel") or arg == "--wheel" for arg in sys.argv)
+if building_wheel:
+  use_native = False
 if sys.platform == 'win32':
   common_win = ['/std:c++17', '/O2']
   extra_compile_args_nd += common_win
@@ -30,7 +36,7 @@ else:
     '-fno-math-errno', '-fno-trapping-math',
     '-flto', '-DNDEBUG', '-pthread'
   ]
-  if is_x86:
+  if is_x86 and use_native:
     extra_compile_args_nd += ['-march=native', '-mtune=native']
 
   # Match upstream legacy flags to minimize divergence.
