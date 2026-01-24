@@ -232,6 +232,22 @@ def nd_tuning(tile=None, prefetch_step=None, chunks_per_thread=None):
   with nogil:
     nd_set_tuning(t, p, c)
 
+@cython.binding(True)
+def nd_tuning_force(tile, prefetch_step, chunks_per_thread):
+  """Force ND tuning settings, including zero values."""
+  cdef size_t t = <size_t>int(tile)
+  cdef size_t p = <size_t>int(prefetch_step)
+  cdef size_t c = <size_t>int(chunks_per_thread)
+  with nogil:
+    nd_set_tuning_force(t, p, c)
+
+@cython.binding(True)
+def nd_multi_batch(batch):
+  """Set ND multi-seg batch size (1-32)."""
+  cdef size_t b = <size_t>int(batch)
+  with nogil:
+    nd_set_multi_batch(b)
+
 ctypedef fused UINT:
   uint8_t
   uint16_t
@@ -254,6 +270,9 @@ from libc.stddef cimport size_t
 from libc.stdlib cimport malloc, free
 from libc.math cimport isinf, INFINITY
 cdef extern from "edt.hpp" namespace "pyedt":
+    cdef void nd_set_base_block(size_t block) nogil
+    cdef void nd_set_multi_batch(size_t batch) nogil
+    cdef void nd_set_tuning_force(size_t tile, size_t prefetch_step, size_t chunks_per_thread) nogil
     cdef void squared_edt_1d_multi_seg[T](
         T *labels,
         float *dest,
@@ -1200,6 +1219,10 @@ def edtsq_nd(
   if profile_enabled:
     t_total_start = time.perf_counter()
 
+  cdef int base_block = _env_int('EDT_ND_BASE_BLOCK', 0)
+  if base_block > 0:
+    nd_set_base_block(<size_t>base_block)
+
   requested_parallel = parallel
 
   if arr.size == 0:
@@ -1293,38 +1316,6 @@ def edtsq_nd(
     raise TypeError(f"Unsupported dtype: {arr.dtype}")
 
   cdef Py_ssize_t nd = dims
-  cdef size_t tune_tile = 0
-  cdef size_t tune_prefetch = 0
-  cdef size_t tune_chunks = 0
-
-  # should try getting rid of these tunings 
-  if parallel > 1:
-    if dims == 3:
-      max_dim = max(arr.shape)
-      if max_dim >= 256:
-        tune_tile = 64; tune_prefetch = 4; tune_chunks = <size_t>max(1, parallel // 2)
-      elif max_dim >= 128:
-        tune_tile = 32; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
-      elif max_dim >= 64:
-        tune_tile = 16; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
-      else:
-        tune_tile = 8; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel)
-    elif dims == 2:
-      total_elems = arr.shape[0] * arr.shape[1]
-      if total_elems >= 1024 * 1024:
-        tune_tile = 64; tune_prefetch = 3; tune_chunks = <size_t>max(1, parallel // 2)
-      elif total_elems >= 256 * 256:
-        tune_tile = 32; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
-      elif total_elems >= 128 * 128:
-        tune_tile = 16; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel // 2)
-      else:
-        tune_tile = 8; tune_prefetch = 2; tune_chunks = <size_t>max(1, parallel)
-    else:
-      tune_tile = 16 if dims <= 4 else 8
-      tune_prefetch = 2
-      tune_chunks = <size_t>max(1, parallel // 2)
-    with nogil:
-      nd_set_tuning(tune_tile, tune_prefetch, tune_chunks)
 
   cdef object debug_stage = os.environ.get('EDT_ND_DEBUG_STAGE')
   cdef np.ndarray out = (<object>_edtsq_nd_typed)(
@@ -1338,6 +1329,11 @@ def edtsq_nd(
 
   if profile_enabled:
     profile_sections['total'] = time.perf_counter() - t_total_start
+    profile_data['shape'] = tuple(arr.shape)
+    profile_data['dims'] = dims
+    profile_data['dtype'] = str(arr.dtype)
+    profile_data['sections'] = profile_sections
+    profile_data['axes'] = profile_axes
     _nd_profile_last = profile_data
 
   return out

@@ -29,6 +29,138 @@ def then(N: int, M: int) -> np.ndarray:
     """Backwards-compatible alias for make_label_matrix."""
     return make_label_matrix(N, M)
 
+
+def make_tiled_label_grid(base_shape: tuple[int, int], tile: int) -> np.ndarray:
+    """
+    Create a 2D grid where each pixel is a unique label, then upscale by tiling.
+
+    Example:
+      base_shape=(10, 10), tile=100 -> output shape (1000, 1000)
+      labels are 0..99 expanded into 100x100 blocks.
+    """
+    return make_tiled_label_grid_nd(base_shape, tile)
+
+
+def make_tiled_label_grid_nd(base_shape: tuple[int, ...], tile: int) -> np.ndarray:
+    """
+    Create an ND grid where each voxel is a unique label, then upscale by tiling.
+
+    Example:
+      base_shape=(10, 10, 10), tile=20 -> output shape (200, 200, 200)
+      labels are 0..999 expanded into 20x20x20 blocks.
+    """
+    if len(base_shape) < 1:
+        raise ValueError("base_shape must be at least 1D.")
+    if tile < 1:
+        raise ValueError("tile must be >= 1.")
+    base = np.arange(int(np.prod(base_shape)), dtype=int).reshape(base_shape)
+    for axis in range(len(base_shape)):
+        base = np.repeat(base, tile, axis=axis)
+    return base
+
+
+def make_fibonacci_spiral_labels(shape: tuple[int, int]) -> np.ndarray:
+    """
+    Create a 2D Fibonacci-style spiral of filled squares.
+
+    Starts with a 1x1 label at the center, then grows outward with
+    square sizes following the Fibonacci sequence.
+    """
+    if len(shape) != 2:
+        raise ValueError("shape must be 2D for fibonacci spiral.")
+    h, w = shape
+    labels = np.zeros((h, w), dtype=int)
+
+    # Fibonacci sizes
+    sizes = [1, 1]
+    while sizes[-1] < max(h, w):
+        sizes.append(sizes[-1] + sizes[-2])
+
+    # Start center
+    cy, cx = h // 2, w // 2
+    top = bottom = cy
+    left = right = cx
+    label_id = 1
+    labels[cy, cx] = label_id
+
+    # Directions: right, down, left, up
+    directions = ["right", "down", "left", "up"]
+    dir_idx = 0
+
+    for size in sizes[1:]:
+        direction = directions[dir_idx % 4]
+        if direction == "right":
+            new_top = top
+            new_left = right + 1
+        elif direction == "down":
+            new_top = bottom + 1
+            new_left = right - size + 1
+        elif direction == "left":
+            new_top = bottom - size + 1
+            new_left = left - size
+        else:  # up
+            new_top = top - size
+            new_left = left
+
+        new_bottom = new_top + size - 1
+        new_right = new_left + size - 1
+
+        # Clip to image bounds (keep growing to fill the space)
+        clip_top = max(new_top, 0)
+        clip_left = max(new_left, 0)
+        clip_bottom = min(new_bottom, h - 1)
+        clip_right = min(new_right, w - 1)
+
+        if clip_top <= clip_bottom and clip_left <= clip_right:
+            label_id += 1
+            labels[clip_top:clip_bottom + 1, clip_left:clip_right + 1] = label_id
+
+            # Expand bounding box (clipped)
+            top = min(top, clip_top)
+            left = min(left, clip_left)
+            bottom = max(bottom, clip_bottom)
+            right = max(right, clip_right)
+            dir_idx += 1
+
+        # Stop when we've filled the full image
+        if top == 0 and left == 0 and bottom == h - 1 and right == w - 1:
+            break
+
+    return labels
+
+
+def make_random_circles_labels(
+    shape: tuple[int, int],
+    rmin: int,
+    rmax: int,
+    seed: int = 0,
+    coverage: float = 0.3,
+) -> np.ndarray:
+    """
+    Create a 2D label image with random filled circles, each with a unique label.
+
+    Circles may overlap (later circles overwrite earlier ones).
+    """
+    if len(shape) != 2:
+        raise ValueError("shape must be 2D for random circles.")
+    if rmin < 1 or rmax < rmin:
+        raise ValueError("invalid radius range")
+    h, w = shape
+    rng = np.random.default_rng(seed)
+    area = h * w
+    r_mean = (rmin + rmax) / 2.0
+    circle_area = np.pi * r_mean * r_mean
+    count = max(1, int(coverage * area / circle_area))
+    labels = np.zeros((h, w), dtype=int)
+    yy, xx = np.ogrid[:h, :w]
+    for label_id in range(1, count + 1):
+        r = rng.integers(rmin, rmax + 1)
+        cy = rng.integers(r, h - r) if h > 2 * r else rng.integers(0, h)
+        cx = rng.integers(r, w - r) if w > 2 * r else rng.integers(0, w)
+        mask = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+        labels[mask] = label_id
+    return labels
+
 def test_edt_consistency():
     """Test that edt functions give consistent results across dimensions"""
     

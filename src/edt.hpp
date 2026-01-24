@@ -52,11 +52,29 @@ namespace pyedt {
 static size_t ND_TILE = 8;              // lines per inner tile
 static size_t ND_PREFETCH_STEP = 0;     // lookahead lines for prefetch (0 to disable)
 static size_t ND_CHUNKS_PER_THREAD = 1; // chunks per thread
+static size_t ND_BASE_BLOCK = 32;       // block size for base enumeration
+static size_t ND_MULTI_BATCH = 8;       // lines per multi-seg batch (1-32)
 
 inline void nd_set_tuning(size_t tile, size_t prefetch_step, size_t chunks_per_thread) {
   if (tile > 0) ND_TILE = tile;
   if (prefetch_step > 0) ND_PREFETCH_STEP = prefetch_step;
   if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
+}
+
+inline void nd_set_tuning_force(size_t tile, size_t prefetch_step, size_t chunks_per_thread) {
+  ND_TILE = tile;
+  ND_PREFETCH_STEP = prefetch_step;
+  ND_CHUNKS_PER_THREAD = chunks_per_thread;
+}
+
+inline void nd_set_base_block(size_t block) {
+  if (block > 0) ND_BASE_BLOCK = block;
+}
+
+inline void nd_set_multi_batch(size_t batch) {
+  if (batch > 0) {
+    ND_MULTI_BATCH = std::min(batch, static_cast<size_t>(32));
+  }
 }
 
 inline void tofinite(float *f, const size_t voxels) {
@@ -95,49 +113,91 @@ namespace nd_dispatch = nd_internal;
  * Writes output to *d
  */
 template <typename T>
-void squared_edt_1d_multi_seg(
-    T* segids, float *d, const int n, 
-    const long int stride, const float anistropy,
+inline void _squared_edt_1d_multi_seg_run(
+    T* segids, float *d, const int n,
+    const long int stride, const float anisotropy,
+    const bool black_border
+  ) {
+  if (n <= 0) {
+    return;
+  }
+  const float inf = std::numeric_limits<float>::infinity();
+  long int i = 0;
+  while (i < n) {
+    const long int base = i * stride;
+    const T label = segids[base];
+    long int j = i + 1;
+    while (j < n && segids[j * stride] == label) {
+      ++j;
+    }
+    const long int len = j - i;
+
+    if (label == 0) {
+      for (long int k = 0; k < len; ++k) {
+        d[(i + k) * stride] = 0.0f;
+      }
+      i = j;
+      continue;
+    }
+
+    const bool left_boundary = (i > 0) || black_border;
+    const bool right_boundary = (j < n) || black_border;
+
+    if (left_boundary) {
+      for (long int k = 0; k < len; ++k) {
+        d[(i + k) * stride] = (static_cast<float>(k + 1)) * anisotropy;
+      }
+    } else {
+      for (long int k = 0; k < len; ++k) {
+        d[(i + k) * stride] = inf;
+      }
+    }
+
+    if (right_boundary) {
+      for (long int k = len - 1; k >= 0; --k) {
+        const float v = (static_cast<float>(len - k)) * anisotropy;
+        const long int idx = (i + k) * stride;
+        if (v < d[idx]) {
+          d[idx] = v;
+        }
+      }
+    }
+
+    for (long int k = 0; k < len; ++k) {
+      const long int idx = (i + k) * stride;
+      d[idx] *= d[idx];
+    }
+
+    i = j;
+  }
+}
+
+template <typename T>
+inline void squared_edt_1d_multi_seg(
+    T* segids, float *d, const int n,
+    const long int stride, const float anisotropy,
     const bool black_border=false
   ) {
+  _squared_edt_1d_multi_seg_run(segids, d, n, stride, anisotropy, black_border);
+}
 
-  long int i;
-
-  T working_segid = segids[0];
-
-  if (black_border) {
-    d[0] = static_cast<float>(working_segid != 0) * anistropy; // 0 or 1
+template <typename T>
+inline void squared_edt_1d_multi_seg_batch(
+    T** segids,
+    float** d,
+    const size_t batch,
+    const int n,
+    const long int stride,
+    const float anisotropy,
+    const bool black_border=false
+  ) {
+  if (n <= 0 || batch == 0) {
+    return;
   }
-  else {
-    d[0] = working_segid == 0 ? 0 : std::numeric_limits<float>::infinity();
-  }
-
-  for (i = stride; i < n * stride; i += stride) {
-    if (segids[i] == 0) {
-      d[i] = 0.0;
-    }
-    else if (segids[i] == working_segid) {
-      d[i] = d[i - stride] + anistropy;
-    }
-    else {
-      d[i] = anistropy;
-      d[i - stride] = static_cast<float>(segids[i - stride] != 0) * anistropy;
-      working_segid = segids[i];
-    }
-  }
-
-  long int min_bound = 0;
-  if (black_border) {
-    d[n - stride] = static_cast<float>(segids[n - stride] != 0) * anistropy;
-    min_bound = stride;
-  }
-
-  for (i = (n - 2) * stride; i >= min_bound; i -= stride) {
-    d[i] = std::fminf(d[i], d[i + stride] + anistropy);
-  }
-
-  for (i = 0; i < n * stride; i += stride) {
-    d[i] *= d[i];
+  const size_t MAX_BATCH = 32;
+  const size_t b = std::min(batch, MAX_BATCH);
+  for (size_t k = 0; k < b; ++k) {
+    _squared_edt_1d_multi_seg_run(segids[k], d[k], n, stride, anisotropy, black_border);
   }
 }
 
@@ -328,6 +388,89 @@ void squared_edt_1d_parabolic(
     // They are unnecessary if you add a black border around the image.
     envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
     f[i * stride] = std::fminf(envelope, f[i * stride]);
+  }
+}
+
+inline void squared_edt_1d_parabolic_ws(
+    float* f,
+    const int n,
+    const long int stride,
+    const float anisotropy,
+    const bool black_border_left,
+    const bool black_border_right,
+    int* v,
+    float* ff,
+    float* ranges
+  ) {
+  if (n == 0) {
+    return;
+  }
+
+  const float w2 = anisotropy * anisotropy;
+  int k = 0;
+  for (long int i = 0; i < n; i++) {
+    ff[i] = f[i * stride];
+  }
+
+  ranges[0] = -std::numeric_limits<float>::infinity();
+  ranges[1] = std::numeric_limits<float>::infinity();
+
+  float s;
+  float factor1, factor2;
+  for (long int i = 1; i < n; i++) {
+    factor1 = (i - v[k]) * w2;
+    factor2 = i + v[k];
+    s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+
+    while (k > 0 && s <= ranges[k]) {
+      k--;
+      factor1 = (i - v[k]) * w2;
+      factor2 = i + v[k];
+      s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+    }
+
+    k++;
+    v[k] = i;
+    ranges[k] = s;
+    ranges[k + 1] = std::numeric_limits<float>::infinity();
+  }
+
+  k = 0;
+  float envelope;
+  for (long int i = 0; i < n; i++) {
+    while (ranges[k + 1] < i) {
+      k++;
+    }
+
+    f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
+    if (black_border_left && black_border_right) {
+      envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
+      f[i * stride] = std::fminf(envelope, f[i * stride]);
+    }
+    else if (black_border_left) {
+      f[i * stride] = std::fminf(w2 * sq(i + 1), f[i * stride]);
+    }
+    else if (black_border_right) {
+      f[i * stride] = std::fminf(w2 * sq(n - i), f[i * stride]);
+    }
+  }
+}
+
+inline void _squared_edt_1d_parabolic_ws(
+    float* f,
+    const int n,
+    const long int stride,
+    const float anisotropy,
+    const bool black_border_left,
+    const bool black_border_right,
+    int* v,
+    float* ff,
+    float* ranges
+  ) {
+  if (black_border_left && black_border_right) {
+    squared_edt_1d_parabolic_ws(f, n, stride, anisotropy, true, true, v, ff, ranges);
+  } else {
+    squared_edt_1d_parabolic_ws(f, n, stride, anisotropy, black_border_left, black_border_right, v, ff, ranges);
   }
 }
 
@@ -571,6 +714,84 @@ void squared_edt_1d_parabolic_multi_seg(
   }
 }
 
+template <typename T>
+void squared_edt_1d_parabolic_multi_seg_ws(
+  T* segids, float* f,
+  const int n, const long int stride, const float anisotropy,
+  const bool black_border,
+  int* v, float* ff, float* ranges
+) {
+  constexpr int SMALL_THRESHOLD = 8;
+  const float anis_sq = anisotropy * anisotropy;
+
+  auto process_small_run = [&](long int start, int len, bool left_border, bool right_border) {
+    float original[SMALL_THRESHOLD];
+    for (int q = 0; q < len; ++q) {
+      original[q] = f[(start + q) * stride];
+    }
+    for (int j = 0; j < len; ++j) {
+      float best = original[j];
+      if (left_border) {
+        const float cap_left = anis_sq * static_cast<float>((j + 1) * (j + 1));
+        if (cap_left < best) best = cap_left;
+      }
+      if (right_border) {
+        const float cap_right = anis_sq * static_cast<float>((len - j) * (len - j));
+        if (cap_right < best) best = cap_right;
+      }
+      for (int q = 0; q < len; ++q) {
+        const float delta = static_cast<float>(j - q);
+        const float candidate = original[q] + anis_sq * delta * delta;
+        if (candidate < best) best = candidate;
+      }
+      f[(start + j) * stride] = best;
+    }
+  };
+
+  T working_segid = segids[0];
+  T segid;
+  long int last = 0;
+
+  for (int i = 1; i < n; i++) {
+    segid = segids[i * stride];
+    if (segid != working_segid) {
+      if (working_segid != 0) {
+        const int run_len = i - last;
+        const bool left_border = (black_border || last > 0);
+        const bool right_border = true;
+        if (run_len <= SMALL_THRESHOLD) {
+          process_small_run(last, run_len, left_border, right_border);
+        } else {
+          _squared_edt_1d_parabolic_ws(
+            f + last * stride,
+            i - last, stride, anisotropy,
+            (black_border || last > 0), true,
+            v, ff, ranges
+          );
+        }
+      }
+      working_segid = segid;
+      last = i;
+    }
+  }
+
+  if (working_segid != 0 && last < n) {
+    const int run_len = n - last;
+    const bool left_border = (black_border || last > 0);
+    const bool right_border = black_border;
+    if (run_len <= SMALL_THRESHOLD) {
+      process_small_run(last, run_len, left_border, right_border);
+    } else {
+      _squared_edt_1d_parabolic_ws(
+        f + last * stride,
+        n - last, stride, anisotropy,
+        (black_border || last > 0), black_border,
+        v, ff, ranges
+      );
+    }
+  }
+}
+
 // Convenience wrapper to expose arg_out to Cython without changing the original name
 template <typename T>
 inline void squared_edt_1d_parabolic_multi_seg_with_arg(
@@ -606,6 +827,20 @@ inline void _nd_pass_multi(
   const size_t lines = total / n;
 
   const int threads = std::max(1, parallel);
+  if (threads <= 1 || lines == 1) {
+    for (size_t idx_line = 0; idx_line < lines; ++idx_line) {
+      size_t base = 0;
+      size_t tmp = idx_line;
+      for (size_t d = 0; d < dims; ++d) {
+        if (d == ax) continue;
+        const size_t coord = tmp % shape[d];
+        base += coord * strides[d];
+        tmp /= shape[d];
+      }
+      squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+    }
+    return;
+  }
   ThreadPool pool(threads);
   size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
   const size_t chunk = (lines + chunks - 1) / chunks;
@@ -648,6 +883,20 @@ inline void _nd_pass_parabolic(
   const size_t lines = total / n;
 
   const int threads = std::max(1, parallel);
+  if (threads <= 1 || lines == 1) {
+    for (size_t idx_line = 0; idx_line < lines; ++idx_line) {
+      size_t base = 0;
+      size_t tmp = idx_line;
+      for (size_t d = 0; d < dims; ++d) {
+        if (d == ax) continue;
+        const size_t coord = tmp % shape[d];
+        base += coord * strides[d];
+        tmp /= shape[d];
+      }
+      squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+    }
+    return;
+  }
   ThreadPool pool(threads);
   // Allow finer task granularity: more than one chunk per thread when helpful
   size_t chunks = std::max<size_t>(1, std::min<size_t>(lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
@@ -685,9 +934,26 @@ inline void _nd_pass_multi_bases(
   if (n == 0 || num_lines == 0) return;
   const int threads = std::max(1, parallel);
   if (threads <= 1 || num_lines == 1) {
-    for (size_t i = 0; i < num_lines; ++i) {
-      const size_t base = bases[i];
-      squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+    const size_t MAX_BATCH = 32;
+    T* segids[MAX_BATCH];
+    float* outs[MAX_BATCH];
+    size_t i = 0;
+    const size_t batch = std::min(ND_MULTI_BATCH, MAX_BATCH);
+    for (; i < num_lines; ) {
+      const size_t b = std::min(batch, num_lines - i);
+      if (b == 1) {
+        const size_t base = bases[i];
+        squared_edt_1d_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+        i += 1;
+        continue;
+      }
+      for (size_t k = 0; k < b; ++k) {
+        const size_t base = bases[i + k];
+        segids[k] = labels + base;
+        outs[k] = dest + base;
+      }
+      squared_edt_1d_multi_seg_batch<T>(segids, outs, b, (int)n, (long int)s, anis, black_border);
+      i += b;
     }
     return;
   }
@@ -702,7 +968,26 @@ inline void _nd_pass_multi_bases(
     pending.push_back(pool.enqueue([=]() {
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
-        for (size_t j = i; j < t_end; ++j) {
+  const size_t MAX_BATCH = 32;
+        const size_t batch = std::min(ND_MULTI_BATCH, MAX_BATCH);
+        T* segids[MAX_BATCH];
+        float* outs[MAX_BATCH];
+        size_t j = i;
+        for (; j + batch <= t_end; j += batch) {
+          if (ND_PREFETCH_STEP > 0) {
+            const size_t pre = j + ND_PREFETCH_STEP;
+            if (pre < t_end) {
+              EDT_PREFETCH(labels + bases[pre]);
+            }
+          }
+          for (size_t k = 0; k < batch; ++k) {
+            const size_t base = bases[j + k];
+            segids[k] = labels + base;
+            outs[k] = dest + base;
+          }
+          squared_edt_1d_multi_seg_batch<T>(segids, outs, batch, (int)n, (long int)s, anis, black_border);
+        }
+        for (; j < t_end; ++j) {
           if (ND_PREFETCH_STEP > 0) {
             const size_t pre = j + ND_PREFETCH_STEP;
             if (pre < t_end) {
@@ -733,9 +1018,24 @@ inline void _nd_pass_parabolic_bases(
   const int threads = std::max(1, parallel);
   const size_t TILE = ND_TILE;
   if (threads <= 1 || num_lines == 1) {
-    for (size_t i = 0; i < num_lines; ++i) {
+    std::vector<int> v(n);
+    std::vector<float> ff(n);
+    std::vector<float> ranges(n + 1);
+    const size_t UNROLL = 4;
+    size_t i = 0;
+    for (; i + (UNROLL - 1) < num_lines; i += UNROLL) {
+      const size_t b0 = bases[i];
+      const size_t b1 = bases[i + 1];
+      const size_t b2 = bases[i + 2];
+      const size_t b3 = bases[i + 3];
+      squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b0, dest + b0, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+      squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b1, dest + b1, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+      squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b2, dest + b2, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+      squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b3, dest + b3, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+    }
+    for (; i < num_lines; ++i) {
       const size_t base = bases[i];
-      squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+      squared_edt_1d_parabolic_multi_seg_ws<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
     }
     return;
   }
@@ -747,9 +1047,30 @@ inline void _nd_pass_parabolic_bases(
   for (size_t start = 0; start < num_lines; start += chunk) {
     const size_t end = std::min(num_lines, start + chunk);
     pending.push_back(pool.enqueue([=]() {
+      std::vector<int> v(n);
+      std::vector<float> ff(n);
+      std::vector<float> ranges(n + 1);
       for (size_t i = start; i < end; i += TILE) {
         const size_t t_end = std::min(end, i + TILE);
-        for (size_t j = i; j < t_end; ++j) {
+        const size_t UNROLL = 4;
+        size_t j = i;
+        for (; j + (UNROLL - 1) < t_end; j += UNROLL) {
+          if (ND_PREFETCH_STEP > 0) {
+            const size_t pre = j + ND_PREFETCH_STEP;
+            if (pre < t_end) {
+              EDT_PREFETCH(labels + bases[pre]);
+            }
+          }
+          const size_t b0 = bases[j];
+          const size_t b1 = bases[j + 1];
+          const size_t b2 = bases[j + 2];
+          const size_t b3 = bases[j + 3];
+          squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b0, dest + b0, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+          squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b1, dest + b1, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+          squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b2, dest + b2, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+          squared_edt_1d_parabolic_multi_seg_ws<T>(labels + b3, dest + b3, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
+        }
+        for (; j < t_end; ++j) {
           if (ND_PREFETCH_STEP > 0) {
             const size_t pre = j + ND_PREFETCH_STEP;
             if (pre < t_end) {
@@ -757,7 +1078,7 @@ inline void _nd_pass_parabolic_bases(
             }
           }
           const size_t base = bases[j];
-          squared_edt_1d_parabolic_multi_seg<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border);
+          squared_edt_1d_parabolic_multi_seg_ws<T>(labels + base, dest + base, (int)n, (long int)s, anis, black_border, v.data(), ff.data(), ranges.data());
         }
       }
     }));
@@ -785,10 +1106,6 @@ inline bool _nd_pass_multi_compiled(
   if (n == 0) {
     return true;
   }
-  if (parallel <= 1) {
-    return false;
-  }
-
   size_t extents_buf[5] = {0, 0, 0, 0, 0};
   size_t stride_buf[5] = {0, 0, 0, 0, 0};
   size_t m = 0;
@@ -819,21 +1136,22 @@ inline bool _nd_pass_multi_compiled(
     }
   };
 
+  const size_t block = ND_BASE_BLOCK;
   switch (m) {
     case 0:
       bases[0] = 0;
       break;
     case 1:
-      ::pyedt::nd_dispatch::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line_blocked<1>(extents_buf, stride_buf, size_t{0}, block, record_base);
       break;
     case 2:
-      ::pyedt::nd_dispatch::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_block2<2>(extents_buf, stride_buf, size_t{0}, block, block, record_base);
       break;
     case 3:
-      ::pyedt::nd_dispatch::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_block2<3>(extents_buf, stride_buf, size_t{0}, block, block, record_base);
       break;
     case 4:
-      ::pyedt::nd_dispatch::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_block2<4>(extents_buf, stride_buf, size_t{0}, block, block, record_base);
       break;
     default:
       return false;
@@ -875,10 +1193,6 @@ inline bool _nd_pass_parabolic_compiled(
   if (n == 0) {
     return true;
   }
-  if (parallel <= 1) {
-    return false;
-  }
-
   size_t extents_buf[5] = {0, 0, 0, 0, 0};
   size_t stride_buf[5] = {0, 0, 0, 0, 0};
   size_t m = 0;
@@ -909,21 +1223,22 @@ inline bool _nd_pass_parabolic_compiled(
     }
   };
 
+  const size_t block = ND_BASE_BLOCK;
   switch (m) {
     case 0:
       bases[0] = 0;
       break;
     case 1:
-      ::pyedt::nd_dispatch::for_each_line<1>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_line_blocked<1>(extents_buf, stride_buf, size_t{0}, block, record_base);
       break;
     case 2:
-      ::pyedt::nd_dispatch::for_each_line<2>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_block2<2>(extents_buf, stride_buf, size_t{0}, block, block, record_base);
       break;
     case 3:
-      ::pyedt::nd_dispatch::for_each_line<3>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_block2<3>(extents_buf, stride_buf, size_t{0}, block, block, record_base);
       break;
     case 4:
-      ::pyedt::nd_dispatch::for_each_line<4>(extents_buf, stride_buf, size_t{0}, record_base);
+      ::pyedt::nd_dispatch::for_each_block2<4>(extents_buf, stride_buf, size_t{0}, block, block, record_base);
       break;
     default:
       return false;

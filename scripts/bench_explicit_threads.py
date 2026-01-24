@@ -21,6 +21,7 @@ from collections import defaultdict
 
 ROOT = Path(__file__).resolve().parent.parent
 
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'src'))
 
 _override = os.environ.get('EDT_MODULE_PATH')
@@ -28,6 +29,11 @@ if _override:
     sys.path.insert(0, _override)
 
 import edt  # noqa: E402
+from debug_utils import (
+    make_tiled_label_grid_nd,
+    make_fibonacci_spiral_labels,
+    make_random_circles_labels,
+)  # noqa: E402
 
 
 LEGACY_AUTO_CAP = int(os.environ.get('EDT_BENCH_LEGACY_AUTO_CAP', '64'))
@@ -49,18 +55,101 @@ def _default_shapes() -> Sequence[Tuple[int, ...]]:
     ]
 
 
-def _make_array(seed: int, shape: Tuple[int, ...], dtype: np.dtype) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    arr = rng.integers(0, 3, size=shape, dtype=dtype)
-    if arr.ndim == 2 and arr.shape[0] > 32 and arr.shape[1] > 32:
-        y, x = arr.shape
-        arr[y // 4 : y // 2, x // 4 : x // 2] = 1
-        arr[3 * y // 5 : 4 * y // 5, 3 * x // 5 : 4 * x // 5] = 2
-    if arr.ndim == 3 and min(arr.shape) > 24:
-        z, y, x = arr.shape
-        arr[z // 4 : z // 3, y // 4 : y // 2, x // 4 : x // 2] = 1
-        arr[3 * z // 5 : 4 * z // 5, 3 * y // 5 : 4 * y // 5, 3 * x // 5 : 4 * x // 5] = 2
-    return arr
+def _parse_shape2d(text: str) -> Tuple[int, int]:
+    parts = tuple(int(x) for x in text.split('x') if x)
+    if len(parts) != 2:
+        raise ValueError(f"Expected 2D shape like '10x10', got: {text}")
+    return parts  # type: ignore[return-value]
+
+
+def _make_structured_grid_base(
+    base_shape: Tuple[int, ...],
+) -> np.ndarray:
+    return np.arange(int(np.prod(base_shape)), dtype=int).reshape(base_shape)
+
+
+def _tile_grid(base: np.ndarray, shape: Tuple[int, ...], tile: int | None) -> np.ndarray:
+    if tile is None:
+        tiles = []
+        for s, b in zip(shape, base.shape):
+            if s % b != 0:
+                raise ValueError(f"Shape {shape} not divisible by base {base.shape}")
+            tiles.append(s // b)
+        if len(set(tiles)) != 1:
+            raise ValueError(f"Non-uniform tile sizes for shape {shape} and base {base.shape}")
+        tile = tiles[0]
+    out = base
+    for axis in range(out.ndim):
+        out = np.repeat(out, tile, axis=axis)
+    if out.shape != shape:
+        raise ValueError(f"Structured grid shape {out.shape} does not match requested {shape}")
+    return out
+
+
+def _make_structured_grid(
+    shape: Tuple[int, ...],
+    base_shape: Tuple[int, ...],
+    tile: int | None,
+    dtype: np.dtype,
+) -> np.ndarray:
+    if len(shape) != len(base_shape):
+        raise ValueError(f"Shape {shape} dims do not match base {base_shape}")
+    base = _make_structured_grid_base(base_shape)
+    grid = _tile_grid(base, shape, tile)
+    return grid.astype(dtype, copy=False)
+
+
+def _apply_label_mod_mask(base: np.ndarray, mod: int) -> np.ndarray:
+    if mod <= 1:
+        return base
+    coords = np.indices(base.shape, dtype=np.uint64)
+    h = np.zeros(base.shape, dtype=np.uint64)
+    for ax in range(base.ndim):
+        h ^= coords[ax] * np.uint64(0x9e3779b97f4a7c15 + ax * 0x85ebca6b)
+        h ^= (h >> np.uint64(30))
+        h *= np.uint64(0xbf58476d1ce4e5b9)
+        h ^= (h >> np.uint64(27))
+        h *= np.uint64(0x94d049bb133111eb)
+        h ^= (h >> np.uint64(31))
+    mask = (h % np.uint64(mod)) == 0
+    out = base.copy()
+    out[~mask] = 0
+    return out
+
+
+def _make_template_array(
+    template: str,
+    shape: Tuple[int, ...],
+    seed: int,
+    dtype: np.dtype,
+    grid_base: Tuple[int, ...],
+    grid_tile: int | None,
+) -> np.ndarray:
+    if template == 'structured':
+        return _make_structured_grid(shape, grid_base, grid_tile, dtype)
+    if template.startswith('structured_mod'):
+        mod = int(template.replace('structured_mod', ''))
+        base = _make_structured_grid_base(grid_base)
+        base_masked = _apply_label_mod_mask(base, mod)
+        arr = _tile_grid(base_masked, shape, grid_tile)
+        return arr.astype(dtype, copy=False)
+    if template == 'fib_spiral':
+        if len(shape) != 2:
+            raise ValueError('fib_spiral template only supported for 2D shapes.')
+        return make_fibonacci_spiral_labels(shape).astype(dtype, copy=False)
+    if template in ('circles_small', 'circles_large'):
+        if len(shape) != 2:
+            raise ValueError('circle templates only supported for 2D shapes.')
+        min_dim = min(shape)
+        if template == 'circles_small':
+            rmin = max(2, int(min_dim * 0.01))
+            rmax = max(rmin + 1, int(min_dim * 0.03))
+        else:
+            rmin = max(4, int(min_dim * 0.05))
+            rmax = max(rmin + 1, int(min_dim * 0.12))
+        arr = make_random_circles_labels(shape, rmin, rmax, seed=seed, coverage=0.35)
+        return arr.astype(dtype, copy=False)
+    raise ValueError(f'Unknown template: {template}')
 
 
 def _time_and_run(
@@ -117,6 +206,10 @@ def run_benchmark(
     dtype: str,
     seeds: Sequence[int],
     output: Path,
+    profile: bool,
+    template: str,
+    grid_base: Tuple[int, int],
+    grid_tile: int | None,
 ) -> None:
     legacy = _require_legacy()
     dtype_np = np.dtype(dtype)
@@ -124,7 +217,11 @@ def run_benchmark(
     legacy_baselines: dict[Tuple[Tuple[int, ...], int], float] = {}
     nd_baselines: dict[Tuple[Tuple[int, ...], int], float] = {}
 
-    os.environ['EDT_ND_PROFILE'] = '1'
+    # Only enable ND profiling if the caller explicitly requested it.
+    if profile:
+        os.environ['EDT_ND_PROFILE'] = '1'
+    else:
+        os.environ.pop('EDT_ND_PROFILE', None)
 
     for shape in shapes:
         dims = len(shape)
@@ -133,7 +230,7 @@ def run_benchmark(
         legacy_fn, anis = _resolve_legacy_fn(legacy, dims)
 
         for seed in seeds:
-            arr = _make_array(seed, shape, dtype_np)
+            arr = _make_template_array(template, shape, seed, dtype_np, grid_base, grid_tile)
             baseline_key = (shape, seed)
 
             for parallel in parallels:
@@ -344,6 +441,26 @@ def main() -> None:
     parser.add_argument('--dtype', default='uint8', help='Array dtype.')
     parser.add_argument('--seeds', default='0', help='Comma-separated RNG seeds for inputs (e.g. "0,1,2,3,4").')
     parser.add_argument('--output', default=str(ROOT / 'benchmarks' / 'legacy_vs_nd_explicit.csv'))
+    parser.add_argument('--profile', action='store_true', help='Enable EDT_ND_PROFILE during benchmarking.')
+    parser.add_argument('--structured-grid', action='store_true',
+                        help='Use a structured tiled label grid for 2D shapes (deprecated; use --template).')
+    parser.add_argument('--template', default='structured',
+                        choices=[
+                            'structured',
+                            'structured_mod2',
+                            'structured_mod4',
+                            'structured_mod8',
+                            'fib_spiral',
+                            'circles_small',
+                            'circles_large',
+                        ],
+                        help='Input template to benchmark.')
+    parser.add_argument('--grid-base', default='10x10',
+                        help="Base grid size for structured labels, e.g. 10x10 or 10x10x10.")
+    parser.add_argument('--grid-tile', default='',
+                        help='Tile size for structured grid. If omitted, inferred from shape.')
+    parser.add_argument('--nd-batch', default='',
+                        help='ND multi-seg batch size (1-32).')
     args = parser.parse_args()
 
     parallels = [int(x) for x in args.parallels.split(',') if x.strip()]
@@ -353,7 +470,27 @@ def main() -> None:
     seeds = [int(x) for x in args.seeds.split(',') if x.strip()]
     if not seeds:
         raise ValueError('At least one seed required.')
-    run_benchmark(shapes, parallels, args.reps, args.dtype, seeds, Path(args.output))
+    if 'x' not in args.grid_base:
+        raise ValueError("grid-base must be like '10x10' or '10x10x10'")
+    grid_base = tuple(int(x) for x in args.grid_base.split('x') if x)
+    grid_tile = int(args.grid_tile) if args.grid_tile else None
+    template = args.template
+    if args.structured_grid:
+        template = 'structured'
+    if args.nd_batch:
+        edt.nd_multi_batch(int(args.nd_batch))
+    run_benchmark(
+        shapes,
+        parallels,
+        args.reps,
+        args.dtype,
+        seeds,
+        Path(args.output),
+        args.profile,
+        template,
+        grid_base,
+        grid_tile,
+    )
 
 
 if __name__ == '__main__':

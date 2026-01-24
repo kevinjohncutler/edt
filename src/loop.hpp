@@ -248,6 +248,82 @@ inline void for_each_line(const size_t* extents, const size_t* strides,
 }
 
 template <size_t Dim, typename Fn>
+inline void for_each_line_blocked(const size_t* extents, const size_t* strides,
+                                  size_t offset, size_t block, Fn&& fn) {
+  if constexpr (Dim == 0) {
+    fn(offset);
+  } else if constexpr (Dim == 1) {
+    const size_t stride0 = strides[0];
+    const size_t extent0 = extents[0];
+    for (size_t b = 0; b < extent0; b += block) {
+      const size_t end = std::min(extent0, b + block);
+      size_t off = offset + b * stride0;
+      for (size_t i = b; i < end; ++i) {
+        fn(off);
+        off += stride0;
+      }
+    }
+  } else {
+    const size_t stride0 = strides[0];
+    const size_t extent0 = extents[0];
+    for (size_t b = 0; b < extent0; b += block) {
+      const size_t end = std::min(extent0, b + block);
+      size_t off = offset + b * stride0;
+      for (size_t i = b; i < end; ++i) {
+        for_each_line_blocked<Dim - 1>(extents + 1, strides + 1, off, block,
+                                       std::forward<Fn>(fn));
+        off += stride0;
+      }
+    }
+  }
+}
+
+template <size_t Dim, typename Fn>
+inline void for_each_block2(const size_t* extents, const size_t* strides,
+                            size_t offset, size_t block0, size_t block1,
+                            Fn&& fn) {
+  if constexpr (Dim == 0) {
+    fn(offset);
+  } else if constexpr (Dim == 1) {
+    const size_t extent0 = extents[0];
+    const size_t stride0 = strides[0];
+    for (size_t b0 = 0; b0 < extent0; b0 += block0) {
+      const size_t end0 = std::min(extent0, b0 + block0);
+      size_t off0 = offset + b0 * stride0;
+      for (size_t i0 = b0; i0 < end0; ++i0) {
+        fn(off0);
+        off0 += stride0;
+      }
+    }
+  } else {
+    const size_t extent0 = extents[0];
+    const size_t extent1 = extents[1];
+    const size_t stride0 = strides[0];
+    const size_t stride1 = strides[1];
+    for (size_t b0 = 0; b0 < extent0; b0 += block0) {
+      const size_t end0 = std::min(extent0, b0 + block0);
+      for (size_t b1 = 0; b1 < extent1; b1 += block1) {
+        const size_t end1 = std::min(extent1, b1 + block1);
+        size_t off0 = offset + b0 * stride0;
+        for (size_t i0 = b0; i0 < end0; ++i0) {
+          size_t off1 = off0 + b1 * stride1;
+          for (size_t i1 = b1; i1 < end1; ++i1) {
+            if constexpr (Dim == 2) {
+              fn(off1);
+            } else {
+              for_each_line<Dim - 2>(extents + 2, strides + 2, off1,
+                                     std::forward<Fn>(fn));
+            }
+            off1 += stride1;
+          }
+          off0 += stride0;
+        }
+      }
+    }
+  }
+}
+
+template <size_t Dim, typename Fn>
 inline void for_each_range(const size_t* extents, const size_t* strides,
                            size_t offset, size_t begin, size_t end, Fn&& fn) {
   if constexpr (Dim == 0) {
