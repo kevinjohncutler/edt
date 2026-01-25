@@ -63,26 +63,15 @@ def _parse_shape2d(text: str) -> Tuple[int, int]:
 
 
 def _make_structured_grid_base(
-    base_shape: Tuple[int, ...],
+    grid_shape: Tuple[int, ...],
 ) -> np.ndarray:
-    return np.arange(int(np.prod(base_shape)), dtype=int).reshape(base_shape)
+    return np.arange(int(np.prod(grid_shape)), dtype=int).reshape(grid_shape)
 
 
-def _tile_grid(base: np.ndarray, shape: Tuple[int, ...], tile: int | None) -> np.ndarray:
-    if tile is None:
-        tiles = []
-        for s, b in zip(shape, base.shape):
-            if s % b != 0:
-                raise ValueError(f"Shape {shape} not divisible by base {base.shape}")
-            tiles.append(s // b)
-        if len(set(tiles)) != 1:
-            raise ValueError(f"Non-uniform tile sizes for shape {shape} and base {base.shape}")
-        tile = tiles[0]
+def _tile_grid(base: np.ndarray, tile_shape: Tuple[int, ...]) -> np.ndarray:
     out = base
-    for axis in range(out.ndim):
+    for axis, tile in enumerate(tile_shape):
         out = np.repeat(out, tile, axis=axis)
-    if out.shape != shape:
-        raise ValueError(f"Structured grid shape {out.shape} does not match requested {shape}")
     return out
 
 
@@ -94,8 +83,19 @@ def _make_structured_grid(
 ) -> np.ndarray:
     if len(shape) != len(base_shape):
         raise ValueError(f"Shape {shape} dims do not match base {base_shape}")
-    base = _make_structured_grid_base(base_shape)
-    grid = _tile_grid(base, shape, tile)
+    if tile is not None:
+        tile_shape = (tile,) * len(shape)
+    else:
+        tile_shape = base_shape
+    grid_shape = []
+    for s, t in zip(shape, tile_shape):
+        if s % t != 0:
+            raise ValueError(f"Shape {shape} not divisible by tile {tile_shape}")
+        grid_shape.append(s // t)
+    base = _make_structured_grid_base(tuple(grid_shape))
+    grid = _tile_grid(base, tile_shape)
+    if grid.shape != shape:
+        raise ValueError(f"Structured grid shape {grid.shape} does not match requested {shape}")
     return grid.astype(dtype, copy=False)
 
 
@@ -129,9 +129,20 @@ def _make_template_array(
         return _make_structured_grid(shape, grid_base, grid_tile, dtype)
     if template.startswith('structured_mod'):
         mod = int(template.replace('structured_mod', ''))
-        base = _make_structured_grid_base(grid_base)
+        if grid_tile is not None:
+            tile_shape = (grid_tile,) * len(shape)
+        else:
+            tile_shape = grid_base
+        grid_shape = []
+        for s, t in zip(shape, tile_shape):
+            if s % t != 0:
+                raise ValueError(f"Shape {shape} not divisible by tile {tile_shape}")
+            grid_shape.append(s // t)
+        base = _make_structured_grid_base(tuple(grid_shape))
         base_masked = _apply_label_mod_mask(base, mod)
-        arr = _tile_grid(base_masked, shape, grid_tile)
+        arr = _tile_grid(base_masked, tile_shape)
+        if arr.shape != shape:
+            raise ValueError(f"Structured grid shape {arr.shape} does not match requested {shape}")
         return arr.astype(dtype, copy=False)
     if template == 'fib_spiral':
         if len(shape) != 2:

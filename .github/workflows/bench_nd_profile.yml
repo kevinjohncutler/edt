@@ -28,7 +28,7 @@ jobs:
           # Dense (structured) templates
           python scripts/bench_explicit_threads.py \
             --parallels 1,2,4,8 --reps 20 --dtype uint16 --profile \
-            --shapes 128x128,512x512 --template structured --grid-base 8x8 \
+            --shapes 128x128,512x512,1024x1024,2048x2048 --template structured --grid-base 8x8 \
             --output benchmarks/legacy_vs_nd_explicit_ci.template_structured_2d.csv
           python scripts/bench_explicit_threads.py \
             --parallels 1,2,4,8 --reps 20 --dtype uint16 --profile \
@@ -38,7 +38,7 @@ jobs:
           # Sparse (mod8) templates
           python scripts/bench_explicit_threads.py \
             --parallels 1,2,4,8 --reps 20 --dtype uint16 --profile \
-            --shapes 128x128,512x512 --template structured_mod8 --grid-base 8x8 \
+            --shapes 128x128,512x512,1024x1024,2048x2048 --template structured_mod8 --grid-base 8x8 \
             --output benchmarks/legacy_vs_nd_explicit_ci.template_structured_mod8_2d.csv
           python scripts/bench_explicit_threads.py \
             --parallels 1,2,4,8 --reps 20 --dtype uint16 --profile \
@@ -48,11 +48,11 @@ jobs:
           # Circle templates (2D only)
           python scripts/bench_explicit_threads.py \
             --parallels 1,2,4,8 --reps 20 --dtype uint16 --profile \
-            --shapes 128x128,512x512 --template circles_small \
+            --shapes 128x128,512x512,1024x1024,2048x2048 --template circles_small \
             --output benchmarks/legacy_vs_nd_explicit_ci.template_circles_small_2d.csv
           python scripts/bench_explicit_threads.py \
             --parallels 1,2,4,8 --reps 20 --dtype uint16 --profile \
-            --shapes 128x128,512x512 --template circles_large \
+            --shapes 128x128,512x512,1024x1024,2048x2048 --template circles_large \
             --output benchmarks/legacy_vs_nd_explicit_ci.template_circles_large_2d.csv
 
       - name: Summarize results
