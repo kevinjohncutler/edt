@@ -97,7 +97,9 @@ jobs:
           sections.append(render_table("Circles large 2D", Path("benchmarks/legacy_vs_nd_explicit_ci.template_circles_large_2d.csv")))
 
           summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
-          summary_path.write_text("## ND Benchmark Profile\n\n" + "\n".join(sections))
+          summary = "## ND Benchmark Profile\n\n" + "\n".join(sections)
+          summary = summary.replace("\\n", "")
+          summary_path.write_text(summary)
           PY
 
       - name: Upload benchmark CSV
