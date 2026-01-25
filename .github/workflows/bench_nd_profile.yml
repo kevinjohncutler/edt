@@ -74,7 +74,7 @@ jobs:
           ]
 
           def render_table(title, csv_path):
-              title = title.replace("\\n", " ")
+              title = title.replace("\\n", " ").replace("\n", " ").strip()
               if not csv_path.exists():
                   return f"### {title}\\n\\nMissing CSV: `{csv_path}`\\n"
               with csv_path.open() as fp:
