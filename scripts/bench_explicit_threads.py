@@ -159,27 +159,27 @@ def _time_and_run(
     *,
     profile_fetcher=None,
 ) -> tuple[float, np.ndarray | None, Exception | None, dict | None]:
-    best = float('inf')
-    best_out: np.ndarray | None = None
-    best_profile: dict | None = None
+    times: list[float] = []
+    last_out: np.ndarray | None = None
+    last_profile: dict | None = None
     try:
         fn(arr)  # warmup once
         for _ in range(max(1, reps)):
             start = time.perf_counter()
             out = fn(arr)
             elapsed = time.perf_counter() - start
-            if elapsed < best:
-                best = elapsed
-                best_out = out
-                if profile_fetcher is not None:
-                    try:
-                        profile = profile_fetcher()
-                    except Exception:
-                        profile = None
-                    best_profile = profile
+            times.append(elapsed)
+            last_out = out
+            if profile_fetcher is not None:
+                try:
+                    last_profile = profile_fetcher()
+                except Exception:
+                    last_profile = None
     except Exception as exc:  # capture runtime errors (e.g. thread creation failure)
         return float('nan'), None, exc, None
-    return best, best_out, None, best_profile
+    if not times:
+        return float('nan'), last_out, None, last_profile
+    return float(np.median(times)), last_out, None, last_profile
 
 
 def _format_numeric(value: float | int) -> str:
@@ -350,14 +350,14 @@ def run_benchmark(
                 'dims': dims,
                 'parallel': parallel,
                 'samples': len(entries),
-                'legacy_ms': float(np.mean(legacy_ms_vals)) if legacy_ms_vals else float('nan'),
-                'nd_ms': float(np.mean(nd_ms_vals)) if nd_ms_vals else float('nan'),
-                'ratio': float(np.mean(ratio_vals)) if ratio_vals else float('nan'),
-                'legacy_p1_ratio': float(np.mean(legacy_p1_vals)) if legacy_p1_vals else float('nan'),
-                'nd_p1_ratio': float(np.mean(nd_p1_vals)) if nd_p1_vals else float('nan'),
+                'legacy_ms': float(np.median(legacy_ms_vals)) if legacy_ms_vals else float('nan'),
+                'nd_ms': float(np.median(nd_ms_vals)) if nd_ms_vals else float('nan'),
+                'ratio': float(np.median(ratio_vals)) if ratio_vals else float('nan'),
+                'legacy_p1_ratio': float(np.median(legacy_p1_vals)) if legacy_p1_vals else float('nan'),
+                'nd_p1_ratio': float(np.median(nd_p1_vals)) if nd_p1_vals else float('nan'),
                 'max_abs_diff': max_abs_diff,
                 'legacy_threads_used': legacy_threads_used,
-                'nd_parallel_used': float(np.mean(nd_used_vals)) if nd_used_vals else None,
+                'nd_parallel_used': float(np.median(nd_used_vals)) if nd_used_vals else None,
                 'legacy_error': '; '.join(legacy_errors),
                 'nd_error': '; '.join(nd_errors),
             }
