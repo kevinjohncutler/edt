@@ -74,15 +74,15 @@ jobs:
           ]
 
           def render_table(title, csv_path):
-              title = title.replace("\\n", " ").replace("\n", " ").strip()
+              title = title.replace("\n", " ").strip()
               if not csv_path.exists():
-                  return f"### {title}\\n\\nMissing CSV: `{csv_path}`\\n"
+                  return f"### {title}\n\nMissing CSV: `{csv_path}`\n"
               with csv_path.open() as fp:
                   reader = csv.DictReader(fp)
                   rows = list(reader)
               if not rows:
-                  return f"### {title}\\n\\nNo benchmark rows captured.\\n"
-              table = [f"### {title}\\n", "| " + " | ".join(header) + " |"]
+                  return f"### {title}\n\nNo benchmark rows captured.\n"
+              table = [f"### {title}\n", "| " + " | ".join(header) + " |"]
               table.append("| " + " | ".join(["---"] * len(header)) + " |")
               for row in rows:
                   table.append("| " + " | ".join(row[h] for h in header) + " |")
@@ -97,9 +97,7 @@ jobs:
           sections.append(render_table("Circles large 2D", Path("benchmarks/legacy_vs_nd_explicit_ci.template_circles_large_2d.csv")))
 
           summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
-          summary = "## ND Benchmark Profile\n\n" + "\n".join(sections)
-          summary = summary.replace("\\n", "")
-          summary_path.write_text(summary)
+          summary_path.write_text("## ND Benchmark Profile\n\n" + "\n".join(sections))
           PY
 
       - name: Upload benchmark CSV
