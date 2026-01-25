@@ -59,6 +59,7 @@ jobs:
         run: |
           python - <<'PY'
           import csv
+          import os
           from pathlib import Path
 
           header = [
