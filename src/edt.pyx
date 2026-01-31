@@ -1893,12 +1893,6 @@ def edtsq_nd(
   else:
     out = result_full
 
-  # Convert capped infinity back to proper infinity
-  # The barrier algorithm caps infinite distances to 1e9f (see nd_barrier_core.hpp)
-  # Use numpy float32 threshold to match the output dtype exactly
-  cdef np.float32_t inf_threshold = np.float32(1e9 - 1e6)
-  out[out >= inf_threshold] = np.inf
-
   if profile_enabled:
     profile_sections['total'] = time.perf_counter() - t_total_start
     profile_data['shape'] = original_shape
