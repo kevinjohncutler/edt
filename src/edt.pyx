@@ -1,4 +1,4 @@
-# cython: language_level=3
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """
 Cython binding for the C++ multi-label Euclidean Distance
 Transform library by William Silversmith based on the 
@@ -30,6 +30,7 @@ from libc.stdint cimport (
   uint8_t, uint16_t, uint32_t, uint64_t,
    int8_t,  int16_t,  int32_t,  int64_t
 )
+from libc.string cimport memcpy
 from libcpp cimport bool as native_bool
 from libcpp.map cimport map as mapcpp
 from libcpp.utility cimport pair as cpp_pair
@@ -69,6 +70,383 @@ _ND_3D_MAX_THREADS = 16
 
 _nd_profile_last = None
 
+# --- voxel_graph gating helpers (C-order contiguous) ---
+cdef inline void _gate_voxel_graph_uint8(
+    const np.uint8_t* graph,
+    const np.uint8_t* fg,
+    np.uint8_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = fg[i]
+
+cdef inline void _gate_voxel_graph_uint16(
+    const np.uint16_t* graph,
+    const np.uint8_t* fg,
+    np.uint8_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = fg[i]
+
+cdef inline void _gate_voxel_graph_uint32(
+    const np.uint32_t* graph,
+    const np.uint8_t* fg,
+    np.uint8_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = fg[i]
+
+cdef inline void _gate_voxel_graph_uint64(
+    const np.uint64_t* graph,
+    const np.uint8_t* fg,
+    np.uint8_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = fg[i]
+
+cdef inline void _gate_voxel_graph_labels_u8(
+    const np.uint8_t* graph,
+    const np.uint32_t* labels,
+    np.uint32_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = labels[i]
+
+cdef inline void _gate_voxel_graph_labels_u16(
+    const np.uint16_t* graph,
+    const np.uint32_t* labels,
+    np.uint32_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = labels[i]
+
+cdef inline void _gate_voxel_graph_labels_u32(
+    const np.uint32_t* graph,
+    const np.uint32_t* labels,
+    np.uint32_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = labels[i]
+
+cdef inline void _gate_voxel_graph_labels_u64(
+    const np.uint64_t* graph,
+    const np.uint32_t* labels,
+    np.uint32_t* dbl,
+    size_t nd,
+    const size_t* shape,
+    const size_t* dbl_strides
+) noexcept nogil:
+  cdef size_t total = 1
+  cdef size_t d, i, tmp, coord, base_even
+  cdef size_t bit
+  for d in range(nd):
+    total *= shape[d]
+  for i in range(total):
+    tmp = i
+    base_even = 0
+    for d in range(nd-1, -1, -1):
+      coord = tmp % shape[d]
+      tmp //= shape[d]
+      base_even += coord * (dbl_strides[d] * 2)
+    for d in range(nd):
+      bit = 2 * (nd - 1 - d)
+      if (graph[i] >> bit) & 1:
+        dbl[base_even + dbl_strides[d]] = labels[i]
+
+
+# --- Barrier graph building/conversion helpers ---
+
+def _build_barrier_graph_from_labels(labels, int parallel=1):
+  """
+  Build a barrier graph from labels for standard EDT (no voxel_graph).
+
+  All foreground voxels get the foreground marker (0x80 for <=4D, 0x8000 for 5D+).
+  Adjacent foreground voxels with the same label get forward edge bits.
+
+  This allows using the barrier EDT algorithm for standard (non-voxel_graph) EDT.
+  Uses fast C++ implementation with optional parallelization.
+  """
+  cdef int ndim = labels.ndim
+  cdef int bits_needed = 2 * ndim
+
+  if bits_needed <= 8:
+    graph_dtype = np.uint8
+  else:
+    graph_dtype = np.uint16
+
+  # Ensure labels is contiguous and get supported dtype
+  if not labels.flags.c_contiguous:
+    labels = np.ascontiguousarray(labels)
+
+  cdef np.ndarray[int64_t, ndim=1] shape_arr = np.array(labels.shape, dtype=np.int64)
+  cdef int64_t* shape_ptr = <int64_t*> np.PyArray_DATA(shape_arr)
+
+  graph = np.empty(labels.shape, dtype=graph_dtype)
+
+  cdef void* labels_ptr = np.PyArray_DATA(labels)
+  cdef void* graph_ptr = np.PyArray_DATA(graph)
+  cdef int ndim_c = ndim
+  cdef int parallel_c = parallel
+
+  # Call C++ implementation based on label dtype
+  if labels.dtype == np.uint8:
+    if graph_dtype == np.uint8:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint8_t, uint8_t](
+          <const uint8_t*>labels_ptr, <uint8_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+    else:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint8_t, uint16_t](
+          <const uint8_t*>labels_ptr, <uint16_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+  elif labels.dtype == np.uint16:
+    if graph_dtype == np.uint8:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint16_t, uint8_t](
+          <const uint16_t*>labels_ptr, <uint8_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+    else:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint16_t, uint16_t](
+          <const uint16_t*>labels_ptr, <uint16_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+  elif labels.dtype == np.uint32:
+    if graph_dtype == np.uint8:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint32_t, uint8_t](
+          <const uint32_t*>labels_ptr, <uint8_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+    else:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint32_t, uint16_t](
+          <const uint32_t*>labels_ptr, <uint16_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+  elif labels.dtype == np.uint64:
+    if graph_dtype == np.uint8:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint64_t, uint8_t](
+          <const uint64_t*>labels_ptr, <uint8_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+    else:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint64_t, uint16_t](
+          <const uint64_t*>labels_ptr, <uint16_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+  else:
+    # Fallback for other dtypes - convert to uint32
+    labels_u32 = labels.astype(np.uint32, copy=False)
+    labels_ptr = np.PyArray_DATA(labels_u32)
+    if graph_dtype == np.uint8:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint32_t, uint8_t](
+          <const uint32_t*>labels_ptr, <uint8_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+    else:
+      with nogil:
+        build_barrier_graph_from_labels_cpp[uint32_t, uint16_t](
+          <const uint32_t*>labels_ptr, <uint16_t*>graph_ptr, shape_ptr, ndim_c, parallel_c)
+
+  return graph
+
+
+def _edtsq_barrier_direct(graph, anisotropy=None, int parallel=1):
+  """
+  Direct barrier EDT call with pre-built graph (minimal wrapper).
+
+  This bypasses graph building and most Python overhead.
+  Used for benchmarking the raw EDT performance.
+  """
+  cdef int ndim_c = graph.ndim
+  if anisotropy is None:
+    anisotropy = (1.0,) * ndim_c
+  if len(anisotropy) != ndim_c:
+    raise ValueError("anisotropy length must match ndim")
+
+  if not graph.flags.c_contiguous:
+    graph = np.ascontiguousarray(graph)
+
+  cdef np.ndarray[int64_t, ndim=1] shape_arr = np.array(graph.shape, dtype=np.int64)
+  cdef np.ndarray[np.float32_t, ndim=1] aniso_arr = np.array(anisotropy, dtype=np.float32)
+  cdef int64_t voxels = graph.size
+  cdef np.ndarray[np.float32_t, ndim=1] out_flat = np.empty(voxels, dtype=np.float32)
+
+  cdef float* result_ptr = NULL
+  cdef int64_t* shape_ptr = <int64_t*> np.PyArray_DATA(shape_arr)
+  cdef float* aniso_ptr = <float*> np.PyArray_DATA(aniso_arr)
+  cdef void* graph_ptr = np.PyArray_DATA(graph)
+
+  cdef bint is_u8 = graph.dtype == np.uint8
+  cdef bint is_u16 = graph.dtype == np.uint16
+
+  if is_u8:
+    with nogil:
+      result_ptr = edtsq_barrier[uint8_t](
+        <const uint8_t*>graph_ptr, shape_ptr, aniso_ptr, ndim_c, parallel)
+  elif is_u16:
+    with nogil:
+      result_ptr = edtsq_barrier[uint16_t](
+        <const uint16_t*>graph_ptr, shape_ptr, aniso_ptr, ndim_c, parallel)
+  else:
+    raise TypeError("graph must be uint8 or uint16")
+
+  cdef int64_t i
+  for i in range(voxels):
+    out_flat[i] = result_ptr[i]
+
+  delete_array_barrier[float](result_ptr)
+  return out_flat.reshape(graph.shape)
+
+
+def _voxel_graph_to_barrier_graph(labels, voxel_graph):
+  """
+  Convert bidirectional voxel_graph to barrier_graph format.
+
+  The standard voxel_graph format uses 2*ndim bits per voxel:
+  - For each axis a: positive direction at bit (2*(ndim-1-a)+0)
+  - For each axis a: negative direction at bit (2*(ndim-1-a)+1)
+
+  The barrier_graph format uses forward edges only + foreground marker:
+  - Forward edge for axis a at bit (2*(ndim-1-a))
+  - High bit (0x80 for uint8, 0x8000 for uint16) marks foreground
+  """
+  if voxel_graph.shape != labels.shape:
+    raise ValueError("voxel_graph shape must match labels")
+
+  cdef int ndim = voxel_graph.ndim
+  cdef int bits_needed = 2 * ndim
+
+  if bits_needed <= 8:
+    dtype = np.uint8
+    fg_marker = 0x80
+  else:
+    dtype = np.uint16
+    fg_marker = 0x8000
+
+  # Build mask for positive direction bits only
+  # Positive direction for axis a is at bit (2*(ndim-1-a)+0)
+  # which equals the barrier forward edge position
+  cdef int pos_mask = 0
+  cdef int ax
+  for ax in range(ndim):
+    pos_mask |= 1 << (2 * (ndim - 1 - ax))
+
+  # Extract only positive direction bits
+  barrier_graph = (voxel_graph.astype(np.uint32) & pos_mask).astype(dtype)
+
+  # Add foreground marker to foreground voxels
+  barrier_graph[labels != 0] |= fg_marker
+
+  return barrier_graph
 
 
 def _env_int(name: str, default: int) -> int:
@@ -214,6 +592,111 @@ class _LegacyModuleProxy(types.ModuleType):
 
 legacy = _LegacyModuleProxy()
 
+
+class _NdV1ModuleProxy(types.ModuleType):
+  """Lazy loader for the ND V1 EDT extension (pre-barrier implementation)."""
+
+  def __init__(self):
+    super().__init__('edt.nd_v1')
+    self._module = None
+    self._load_error = None
+
+  def _candidate_roots(self):
+    env_path = os.environ.get('EDT_ND_V1_PATH')
+    if env_path:
+      path = pathlib.Path(env_path).expanduser()
+      if path.exists():
+        yield path
+    base = pathlib.Path(__file__).resolve()
+    seen = set()
+    for parent in (base.parent,) + tuple(base.parents):
+      candidate = (parent / 'nd_v1').resolve()
+      if candidate.exists() and candidate not in seen:
+        seen.add(candidate)
+        yield candidate
+
+  def _iter_extension_candidates(self, roots):
+    patterns = ('**/edt_nd_v1*.so', '**/edt_nd_v1*.pyd', '**/edt_nd_v1*.dll')
+    for root in roots:
+      for pattern in patterns:
+        for path in sorted(root.glob(pattern), reverse=True):
+          if path.is_file():
+            yield path
+
+  def _register(self, module):
+    module.__name__ = 'edt.nd_v1'
+    module.available = lambda: True
+    sys.modules['edt.nd_v1'] = module
+    self._module = module
+    self._load_error = None
+    return module
+
+  def _load(self):
+    if self._module is not None:
+      return self._module
+    if self._load_error is not None:
+      raise self._load_error
+
+    errors = []
+    for module_name in ('edt_nd_v1',):
+      try:
+        module = importlib.import_module(module_name)
+        return self._register(module)
+      except Exception as exc:
+        errors.append((f'import:{module_name}', exc))
+
+    # fall back to disk lookup
+    roots = list(self._candidate_roots())
+    candidates = list(self._iter_extension_candidates(roots))
+
+    for candidate in candidates:
+      try:
+        spec = importlib.util.spec_from_file_location('edt_nd_v1_native', candidate)
+        if spec is None or spec.loader is None:
+          raise ImportError(f'Unable to create loader for {candidate}')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return self._register(module)
+      except Exception as exc:
+        errors.append((str(candidate), exc))
+
+    if errors:
+      messages = ', '.join(f"{source}: {exc}" for source, exc in errors)
+      err = ImportError(f'Failed to load ND V1 EDT extension ({messages})')
+      self._load_error = err
+      raise err
+
+    err = ImportError(
+      "ND V1 EDT implementation not available. Build it from the nd_v1/ directory."
+    )
+    self._load_error = err
+    raise err
+
+  def __getattr__(self, name):
+    module = self._load()
+    return getattr(module, name)
+
+  def __dir__(self):
+    try:
+      module = self._load()
+    except Exception:
+      return sorted(set(super().__dir__()) | {'available'})
+    return sorted(set(super().__dir__()) | set(dir(module)) | {'available'})
+
+  def available(self):
+    """Return True if the ND V1 module could be loaded."""
+    if self._module is not None:
+      return True
+    try:
+      self._load()
+    except Exception:
+      return False
+    return True
+
+
+nd_v1 = _NdV1ModuleProxy()
+
+
 @cython.binding(True)
 def nd_tuning(tile=None, prefetch_step=None, chunks_per_thread=None):
   """Tune ND internals: lines tile size, prefetch lookahead, and chunking.
@@ -269,6 +752,33 @@ ctypedef fused NUMBER:
 from libc.stddef cimport size_t
 from libc.stdlib cimport malloc, free
 from libc.math cimport isinf, INFINITY
+from libc.stdint cimport int64_t
+
+# Barrier EDT (primary voxel_graph path)
+cdef extern from "nd_barrier_core.hpp" namespace "nd_barrier":
+  cdef float* edtsq_barrier[GRAPH_T](
+    const GRAPH_T* graph,
+    const int64_t* shape,
+    const float* anisotropy,
+    int ndim,
+    int parallel
+  ) nogil
+
+  cdef void build_barrier_graph_from_labels_cpp "nd_barrier::build_barrier_graph_from_labels"[LABEL_T, GRAPH_T](
+    const LABEL_T* labels,
+    GRAPH_T* graph,
+    const int64_t* shape,
+    int ndim,
+    int parallel
+  ) nogil
+
+cdef extern from *:
+  """
+  template<typename T>
+  void delete_array_barrier(T* ptr) { delete[] ptr; }
+  """
+  void delete_array_barrier[T](T* ptr)
+
 cdef extern from "edt.hpp" namespace "pyedt":
     cdef void nd_set_base_block(size_t block) nogil
     cdef void nd_set_multi_batch(size_t batch) nogil
@@ -379,7 +889,7 @@ ctypedef fused nd_t:
 cdef void _run_multi_pass(nd_t* datap, float* outp,
                           size_t nd, size_t* cshape, size_t* cstrides,
                           size_t axis, float anisotropy,
-                          native_bool black_border, int parallel) nogil:
+                          native_bool black_border, int parallel) noexcept nogil:
   cdef bint used = _nd_pass_multi_compiled(
       datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel
   )
@@ -391,7 +901,7 @@ cdef void _run_multi_pass(nd_t* datap, float* outp,
 cdef void _run_parabolic_pass(nd_t* datap, float* outp,
                               size_t nd, size_t* cshape, size_t* cstrides,
                               size_t axis, float anisotropy,
-                              native_bool black_border, int parallel) nogil:
+                              native_bool black_border, int parallel) noexcept nogil:
   cdef bint used = _nd_pass_parabolic_compiled(
       datap, outp, nd, cshape, cstrides, axis, anisotropy, black_border, parallel
   )
@@ -626,11 +1136,8 @@ def expand_labels(
   parallel : int, optional
       Number of threads; if <= 0, uses cpu_count().
   voxel_graph : ndarray, optional
-      Per-voxel bitfield describing allowed +axis connections. Bit layout
-      matches legacy (x/y/z ordering): bit = 1 << (2*(ndim-1-axis)).
-      For 2D: axis0 uses bit 4, axis1 uses bit 1. For 3D: axis0 uses bit 16,
-      axis1 uses bit 4, axis2 uses bit 1. If provided, labels are expanded
-      with voxel-graph barriers using the legacy doubling scheme generalized to ND.
+      Not supported for expand_labels; only distance transforms accept
+      voxel_graph. Passing a non-None value raises ValueError.
   return_features : bool, optional
       If True, also return the feature (nearest-seed linear index) array.
 
@@ -642,6 +1149,8 @@ def expand_labels(
       If return_features=True, the nearest-seed linear indices (uint32 or uintp)
       as a second return value.
   """
+  if voxel_graph is not None:
+    raise ValueError("voxel_graph is only supported for distance transforms (edtsq/edt)")
   cdef np.ndarray[np.uint32_t, ndim=1] out1
   cdef np.ndarray pos
   cdef np.ndarray mids
@@ -663,9 +1172,17 @@ def expand_labels(
   cdef Py_ssize_t max_dim
   cdef Py_ssize_t total_elems
   cdef int target
+  cdef size_t* vg_shape
+  cdef size_t* dbl_strides
+  cdef void* graph_data
+  cdef void* labels_data
+  cdef void* dbl_data
+  cdef Py_ssize_t a
+  cdef Py_ssize_t nd
 
   arr = np.require(data, dtype=np.uint32, requirements='C')
   dims = arr.ndim
+  nd = dims
   cdef tuple anis
   if anisotropy is None:
     anis = (1.0,) * dims
@@ -685,51 +1202,6 @@ def expand_labels(
   else:
     parallel = max(1, min(parallel, cpu_cap))
 
-  if voxel_graph is not None:
-    graph = np.asarray(voxel_graph)
-    if graph.shape != arr.shape:
-      raise ValueError('voxel_graph must have the same shape as data')
-    if not graph.flags.c_contiguous:
-      graph = np.ascontiguousarray(graph)
-    graph_u64 = graph.astype(np.uint64, copy=False)
-    max_bits = graph_u64.dtype.itemsize * 8
-    if (dims - 1) * 2 >= max_bits:
-      raise ValueError('voxel_graph dtype does not have enough bits for data.ndim')
-
-    labels = arr
-    dbl = labels
-    for ax_vg in range(dims):
-      dbl = np.repeat(dbl, 2, axis=ax_vg)
-
-    for ax_vg in range(dims):
-      bit = 2 * (dims - 1 - ax_vg)
-      mask = ((graph_u64 >> bit) & 1).astype(np.uint32, copy=False)
-      slc = [slice(0, None, 2)] * dims
-      slc[ax_vg] = slice(1, None, 2)
-      dbl[tuple(slc)] = labels & mask
-
-    anis2 = tuple(val / 2.0 for val in anis)
-    if return_features:
-      lbl2, feat2 = expand_labels(dbl, anis2, 1, None, True)
-    else:
-      lbl2 = expand_labels(dbl, anis2, 1, None, False)
-
-    slc = tuple(slice(0, None, 2) for _ in range(dims))
-    labels_out = lbl2[slc]
-
-    if not return_features:
-      return labels_out
-
-    if return_features:
-      feat2 = np.asarray(feat2)[slc]
-      shape2 = dbl.shape
-      coords = np.unravel_index(feat2.ravel().astype(np.int64, copy=False), shape2)
-      coords = tuple(c // 2 for c in coords)
-      feat = np.ravel_multi_index(coords, arr.shape).astype(
-        np.uint32 if arr.size < 2**32 else np.uintp,
-        copy=False
-      )
-      return labels_out, feat.reshape(arr.shape)
   if dims == 1:
     # reuse 1D midpoint selection from expand_labels 1D branch
     n1 = arr.shape[0]
@@ -773,7 +1245,6 @@ def expand_labels(
     arr = np.ascontiguousarray(arr)
   cdef np.ndarray[np.uint8_t, ndim=1] seeds_flat = (arr.ravel(order='K') != 0).astype(np.uint8, order='C')
   cdef np.ndarray[np.uint32_t, ndim=1] labels_flat = arr.ravel(order='K').astype(np.uint32, order='C')
-  cdef Py_ssize_t nd = arr.ndim
   cdef tuple shape = arr.shape
   # element strides for C-order
   cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
@@ -894,7 +1365,6 @@ def expand_labels(
       _nd_expand_init_labels_bases(seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, labp, lprev, parallel)
 
   # Remaining axes
-  cdef Py_ssize_t a
   for a in range(1, nd):
     lines = total // cshape[paxes[a]]
     # rebuild ord for this axis
@@ -980,12 +1450,8 @@ def feature_transform(
   parallel : int, optional
       Number of threads; if <= 0, uses cpu_count().
   voxel_graph : ndarray, optional
-      Per-voxel bitfield describing allowed +axis connections. Bit layout
-      matches legacy (x/y/z ordering): bit = 1 << (2*(ndim-1-axis)).
-      For 2D: axis0 uses bit 4, axis1 uses bit 1. For 3D: axis0 uses bit 16,
-      axis1 uses bit 4, axis2 uses bit 1. If provided, feature indices and
-      distances respect the voxel-graph barriers using the legacy doubling
-      scheme generalized to ND.
+      Not supported for feature_transform; only distance transforms accept
+      voxel_graph. Passing a non-None value raises ValueError.
   return_distances : bool, optional
       If True, also return squared EDT of the seed mask.
   features_dtype : {'auto','uint32','u32','uintp'}, optional
@@ -998,6 +1464,8 @@ def feature_transform(
   dist : ndarray of float32, optional
       Squared Euclidean distance, if return_distances=True.
   """
+  if voxel_graph is not None:
+    raise ValueError("voxel_graph is only supported for distance transforms (edtsq/edt)")
   arr = np.asarray(data)
   if arr.size == 0:
     if return_distances:
@@ -1024,7 +1492,7 @@ def feature_transform(
       parallel = max(1, parallel)
 
   # Use ND expand path with feature return on original array (nonzero=seeds)
-  labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, parallel, voxel_graph, True)
+  labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, parallel, None, True)
 
   voxels = arr.size
   if isinstance(features_dtype, str):
@@ -1037,7 +1505,7 @@ def feature_transform(
       feats = feats.astype(np.uint32 if voxels < 2**32 else np.uintp, copy=False)
 
   if return_distances:
-    dist = edtsq_nd((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel, voxel_graph)
+    dist = edtsq_nd((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel, None)
     return feats, dist
   return feats
 
@@ -1157,6 +1625,9 @@ def __getattr__(name):
     warnings.warn("`edt.original` is deprecated; use `edt.legacy` instead.", DeprecationWarning, stacklevel=2)
     setattr(sys.modules[__name__], 'original', legacy)
     return legacy
+  if name == 'nd_v1':
+    setattr(sys.modules[__name__], 'nd_v1', nd_v1)
+    return nd_v1
   try:
     attr = getattr(legacy, name)
   except AttributeError as exc:
@@ -1180,14 +1651,19 @@ def edtsq_nd(
   int parallel=1, voxel_graph=None, order=None,
 ):
   """
-  General ND squared EDT using a dimension-agnostic pass schedule.
+  General ND squared EDT using barrier-aware algorithm.
 
   This is the core ND implementation used by `edtsq` and `edt`.
   The input is made C-contiguous if needed; anisotropy is always specified
   in axis order (length == data.ndim).
 
-  Voxel-graph constraints are handled by constructing a doubled grid using
-  the legacy barrier scheme generalized to ND.
+  Uses the barrier EDT algorithm which processes edge connectivity directly
+  without grid doubling. For standard EDT (no voxel_graph), a barrier graph
+  is built from labels where same-label adjacent voxels are connected.
+  For voxel_graph inputs, the bidirectional graph is converted to barrier
+  format (forward edges only + foreground marker).
+
+  The previous ND implementation is available via edt.nd_v1 if built.
   """
   global _nd_profile_last
   _nd_profile_last = None
@@ -1202,6 +1678,12 @@ def edtsq_nd(
   cdef Py_ssize_t thresh12
   cdef Py_ssize_t thresh16
   cdef int target
+  cdef Py_ssize_t nd
+  cdef size_t* vg_shape
+  cdef size_t* dbl_strides
+  cdef void* graph_data
+  cdef void* fg_data
+  cdef void* dbl_data
 
   if isinstance(data, list):
     arr = np.array(data)
@@ -1242,6 +1724,7 @@ def edtsq_nd(
     arr = np.ascontiguousarray(arr)
 
   dims = arr.ndim
+  nd = dims
   cdef tuple anis
   if anisotropy is None:
     anis = (1.0,) * dims
@@ -1267,31 +1750,66 @@ def edtsq_nd(
     profile_data['parallel_requested'] = requested_parallel
     profile_data['parallel_used'] = parallel
 
+  # --- Barrier EDT path (primary implementation) ---
+  # Both voxel_graph and standard EDT now use barrier algorithm
+  cdef np.ndarray barrier_graph
+  cdef np.ndarray[int64_t, ndim=1] shape_arr
+  cdef np.ndarray[np.float32_t, ndim=1] anis_arr
+  cdef int64_t* shape_ptr
+  cdef float* anis_ptr
+  cdef void* barrier_ptr
+  cdef float* result_ptr
+  cdef int64_t voxels
+  cdef int ndim_c = <int>dims
+  cdef int parallel_c = <int>parallel
+  cdef int64_t ii
+
   if voxel_graph is not None:
+    # Use grid doubling approach for voxel_graph to match legacy behavior
     graph = np.asarray(voxel_graph)
     if graph.shape != arr.shape:
       raise ValueError('voxel_graph must have the same shape as data')
     if not graph.flags.c_contiguous:
       graph = np.ascontiguousarray(graph)
-    graph_u64 = graph.astype(np.uint64, copy=False)
-    max_bits = graph_u64.dtype.itemsize * 8
-    if (dims - 1) * 2 >= max_bits:
+    graph_u = graph.astype(np.uint64, copy=False)
+    req_bits = 2 * dims
+    if req_bits > 64:
       raise ValueError('voxel_graph dtype does not have enough bits for data.ndim')
 
     fg = (arr != 0).astype(np.uint8, copy=False)
 
-    # Repeat fg on a doubled grid for all axes (equivalent to all 2^D corners set).
-    dbl = fg
-    for a in range(dims):
-      dbl = np.repeat(dbl, 2, axis=a)
+    # Build doubled grid and populate all even + multi-odd positions.
+    dbl_shape = tuple(int(s * 2) for s in fg.shape)
+    dbl = np.zeros(dbl_shape, dtype=fg.dtype)
+    for combo in range(1 << dims):
+      # Skip single-axis odd positions; they are gated by voxel_graph below.
+      if combo != 0 and (combo & (combo - 1)) == 0:
+        continue
+      slc = []
+      for ax in range(dims):
+        slc.append(slice(1, None, 2) if (combo & (1 << ax)) else slice(0, None, 2))
+      dbl[tuple(slc)] = fg
 
-    # Gate the single-axis half-step positions by the voxel_graph bits.
+    vg_shape = <size_t*> malloc(dims * sizeof(size_t))
+    dbl_strides = <size_t*> malloc(dims * sizeof(size_t))
+    if vg_shape == NULL or dbl_strides == NULL:
+      if vg_shape != NULL: free(vg_shape)
+      if dbl_strides != NULL: free(dbl_strides)
+      raise MemoryError('Allocation failure for voxel_graph strides')
     for a in range(dims):
-      bit = 2 * (dims - 1 - a)
-      mask = ((graph_u64 >> bit) & 1).astype(np.uint8, copy=False)
-      slc = [slice(0, None, 2)] * dims
-      slc[a] = slice(1, None, 2)
-      dbl[tuple(slc)] = fg & mask
+      vg_shape[a] = <size_t>arr.shape[a]
+    dbl_strides[dims-1] = 1
+    for a in range(dims-2, -1, -1):
+      dbl_strides[a] = dbl_strides[a+1] * (vg_shape[a+1] * 2)
+    graph_data = np.PyArray_DATA(graph_u)
+    fg_data = np.PyArray_DATA(fg)
+    dbl_data = np.PyArray_DATA(dbl)
+    with nogil:
+      _gate_voxel_graph_uint64(<np.uint64_t*> graph_data,
+                               <np.uint8_t*> fg_data,
+                               <np.uint8_t*> dbl_data,
+                               <size_t>nd, vg_shape, dbl_strides)
+    free(vg_shape); free(dbl_strides)
 
     if black_border:
       for a in range(dims):
@@ -1299,37 +1817,91 @@ def edtsq_nd(
         slc[a] = -1
         dbl[tuple(slc)] = 0
 
+    # Recursive call on doubled grid (without voxel_graph) - uses barrier EDT
     anis2 = tuple(val / 2.0 for val in anis)
     transform2 = edtsq_nd(dbl, anis2, black_border, 1, None, order)
     slc = tuple(slice(0, None, 2) for _ in range(dims))
     return transform2[slc]
 
-  if arr.dtype == np.int8:
-    arr = arr.view(np.uint8)
-  elif arr.dtype == np.int16:
-    arr = arr.view(np.uint16)
-  elif arr.dtype == np.int32:
-    arr = arr.view(np.uint32)
-  elif arr.dtype == np.int64:
-    arr = arr.view(np.uint64)
-  elif arr.dtype not in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64, bool):
-    raise TypeError(f"Unsupported dtype: {arr.dtype}")
+  # Standard EDT (no voxel_graph) - use barrier algorithm
+  barrier_graph = _build_barrier_graph_from_labels(arr, parallel)
 
-  cdef Py_ssize_t nd = dims
+  # Handle black_border by padding with background (zeros)
+  # This ensures array edges are treated as borders
+  cdef bint was_padded = False
+  if black_border:
+    # Pad barrier_graph with zeros on all sides
+    pad_width = [(1, 1)] * dims
+    barrier_graph = np.pad(barrier_graph, pad_width, mode='constant', constant_values=0)
+    was_padded = True
 
-  cdef object debug_stage = os.environ.get('EDT_ND_DEBUG_STAGE')
-  cdef np.ndarray out = (<object>_edtsq_nd_typed)(
-      arr.reshape(-1), arr.shape, anis, arr.flags.c_contiguous,
-      black_border, parallel, profile_enabled,
-      profile_sections, profile_axes, debug_stage
-  )
+  if not barrier_graph.flags.c_contiguous:
+    barrier_graph = np.ascontiguousarray(barrier_graph)
 
-  if debug_stage in ('multi', 'parabolic'):
-    return out
+  # Prepare arrays for C++ call - use padded shape if applicable
+  original_shape = tuple(arr.shape)
+  # Compute working shape: if padded, add 2 to each dimension
+  if was_padded:
+    working_shape = tuple(s + 2 for s in original_shape)
+  else:
+    working_shape = original_shape
+  shape_arr = np.array(working_shape, dtype=np.int64)
+  anis_arr = np.array(anis, dtype=np.float32)
+  cdef int64_t working_voxels = 1
+  for s in working_shape:
+    working_voxels *= s
+
+  shape_ptr = <int64_t*> np.PyArray_DATA(shape_arr)
+  anis_ptr = <float*> np.PyArray_DATA(anis_arr)
+  barrier_ptr = np.PyArray_DATA(barrier_graph)
+
+  # Call barrier EDT
+  cdef bint is_u8 = barrier_graph.dtype == np.uint8
+  cdef bint is_u16 = barrier_graph.dtype == np.uint16
+
+  if is_u8:
+    with nogil:
+      result_ptr = edtsq_barrier[uint8_t](
+        <const uint8_t*> barrier_ptr,
+        shape_ptr,
+        anis_ptr,
+        ndim_c,
+        parallel_c
+      )
+  elif is_u16:
+    with nogil:
+      result_ptr = edtsq_barrier[uint16_t](
+        <const uint16_t*> barrier_ptr,
+        shape_ptr,
+        anis_ptr,
+        ndim_c,
+        parallel_c
+      )
+  else:
+    raise TypeError("barrier_graph must be uint8 or uint16")
+
+  # Copy result to numpy array and free C++ allocated memory
+  result_full = np.empty(working_shape, dtype=np.float32)
+  cdef float* result_flat = <float*> np.PyArray_DATA(result_full)
+  memcpy(result_flat, result_ptr, working_voxels * sizeof(float))
+  delete_array_barrier[float](result_ptr)
+
+  # Extract center portion if we padded
+  if was_padded:
+    slc = tuple(slice(1, -1) for _ in range(dims))
+    out = np.ascontiguousarray(result_full[slc])
+  else:
+    out = result_full
+
+  # Convert capped infinity back to proper infinity
+  # The barrier algorithm caps infinite distances to 1e9f (see nd_barrier_core.hpp)
+  # Use numpy float32 threshold to match the output dtype exactly
+  cdef np.float32_t inf_threshold = np.float32(1e9 - 1e6)
+  out[out >= inf_threshold] = np.inf
 
   if profile_enabled:
     profile_sections['total'] = time.perf_counter() - t_total_start
-    profile_data['shape'] = tuple(arr.shape)
+    profile_data['shape'] = original_shape
     profile_data['dims'] = dims
     profile_data['dtype'] = str(arr.dtype)
     profile_data['sections'] = profile_sections
@@ -1337,6 +1909,7 @@ def edtsq_nd(
     _nd_profile_last = profile_data
 
   return out
+
 
 @cython.binding(True)
 def edtsq_nd_last_profile():

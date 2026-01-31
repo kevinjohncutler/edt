@@ -30,8 +30,6 @@ if sys.platform == 'win32':
 else:
   extra_compile_args_nd += [
     '-std=c++17',
-    # '-Ofast', #'-ffast-math',
-    # '-Ofast', '-fno-finite-math-only',
     '-O3', '-ffast-math', '-fno-finite-math-only', '-fno-unsafe-math-optimizations',
     '-fno-math-errno', '-fno-trapping-math',
     '-flto', '-DNDEBUG', '-pthread'
@@ -72,6 +70,15 @@ extensions = [
     include_dirs=['legacy', str(NumpyImport())],
     extra_compile_args=extra_compile_args_legacy,
     extra_link_args=extra_link_args_legacy,
+    define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
+  ),
+  setuptools.Extension(
+    'edt_nd_v1',
+    sources=['nd_v1/edt.pyx'],
+    language='c++',
+    include_dirs=['nd_v1', str(NumpyImport())],
+    extra_compile_args=extra_compile_args_nd,
+    extra_link_args=extra_link_args_nd,
     define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
   ),
 ]

@@ -47,32 +47,36 @@ class ThreadPool {
 public:
     ThreadPool(size_t);
     template<class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) 
+    auto enqueue(F&& f, Args&&... args)
         -> std::future<std::invoke_result_t<F, Args...>>;
     void start(size_t);
     void join();
+    void wait();  // Wait for all tasks to complete without destroying threads
     ~ThreadPool();
 private:
     // need to keep track of threads so we can join them
     std::vector< std::thread > workers;
     // the task queue
     std::queue< std::function<void()> > tasks;
-    
+
     // synchronization
     std::mutex queue_mutex;
     std::condition_variable condition;
+    std::condition_variable done_condition;  // Signals when queue is empty and all workers idle
     bool stop;
+    size_t active_tasks;  // Number of tasks currently being executed
 };
  
 // the constructor just launches some amount of workers
 inline ThreadPool::ThreadPool(size_t threads)
-    :   stop(false)
+    :   stop(false), active_tasks(0)
 {
     start(threads);
 }
 
 void ThreadPool::start(size_t threads) {
     stop = false;
+    active_tasks = 0;
     for(size_t i = 0;i<threads;++i)
         workers.emplace_back(
             [this]
@@ -89,9 +93,18 @@ void ThreadPool::start(size_t threads) {
                             return;
                         task = std::move(this->tasks.front());
                         this->tasks.pop();
+                        this->active_tasks++;
                     }
 
                     task();
+
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->active_tasks--;
+                        if (this->tasks.empty() && this->active_tasks == 0) {
+                            this->done_condition.notify_all();
+                        }
+                    }
                 }
             }
         );
@@ -140,6 +153,14 @@ inline void ThreadPool::join () {
         std::unique_lock<std::mutex> lock(queue_mutex);
         while(!tasks.empty()) tasks.pop();
     }
+}
+
+// Wait for all current tasks to complete without destroying threads
+inline void ThreadPool::wait() {
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    done_condition.wait(lock, [this]{
+        return tasks.empty() && active_tasks == 0;
+    });
 }
 
 // the destructor joins all threads

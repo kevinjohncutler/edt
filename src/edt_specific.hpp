@@ -478,7 +478,6 @@ float* _edt2dsq_with_features(
     ThreadPool pool(std::max(1, parallel));
     const size_t bx = std::max<size_t>(1, sx / (size_t(4) * std::max(1, parallel)));
     for (size_t x0 = 0; x0 < sx; x0 += bx) {
-      const size_t x1 = std::min(sx, x0 + bx);
       pool.enqueue([=]() {
         std::vector<float> row(sx);
         std::vector<float> drow(sx);

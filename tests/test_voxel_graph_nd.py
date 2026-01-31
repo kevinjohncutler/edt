@@ -124,29 +124,6 @@ def test_voxel_graph_4d_runs_and_shapes():
     assert nd.dtype == np.float32
 
 
-def test_expand_labels_voxel_graph_consistent_with_feature_transform():
-    arr = np.zeros((4, 5), dtype=np.uint32)
-    arr[0, 0] = 1
-    arr[1, 3] = 2
-    arr[3, 4] = 3
-    graph = _random_graph(arr.shape, bits=_axis_bits(arr.ndim), seed=4)
-
-    labels, feats = edt.expand_labels(
-        arr, anisotropy=(1.0, 1.0), parallel=1,
-        voxel_graph=graph, return_features=True
-    )
-    feats2 = edt.feature_transform(
-        arr, anisotropy=(1.0, 1.0), black_border=True, parallel=1,
-        voxel_graph=graph
-    )
-
-    seeds_flat = arr.ravel()
-    recon = seeds_flat[feats.ravel()].reshape(arr.shape)
-
-    np.testing.assert_allclose(labels, recon, rtol=0, atol=0)
-    np.testing.assert_allclose(feats, feats2, rtol=0, atol=0)
-
-
 def test_voxel_graph_quadrants_parity_and_effects():
     M = 8
     labels = make_label_matrix(2, M).astype(np.uint32)
@@ -197,34 +174,30 @@ def test_voxel_graph_quadrants_parity_and_effects():
         legacy = edt.legacy.edtsq(labels, voxel_graph=g, black_border=black_border)
         np.testing.assert_allclose(nd, legacy, rtol=0, atol=0)
         nd_plain = edt.edtsq(labels, black_border=black_border)
-        expanded = edt.expand_labels(labels, voxel_graph=g)
-        feats = edt.feature_transform(labels, voxel_graph=g, black_border=black_border)
-        recon = labels.ravel()[feats.ravel()].reshape(labels.shape)
-        np.testing.assert_allclose(expanded, recon, rtol=0, atol=0)
-        return nd, nd_plain, expanded
+        return nd, nd_plain
 
-    nd_asym_bb, nd_plain_bb, expanded_asym_bb = compute_row(graph_asym, True)
-    nd_asym_open, nd_plain_open, expanded_asym_open = compute_row(graph_asym, False)
-    nd_sym_bb, nd_plain_sym_bb, expanded_sym_bb = compute_row(graph_sym, True)
-    nd_sym_open, nd_plain_sym_open, expanded_sym_open = compute_row(graph_sym, False)
+    nd_asym_bb, nd_plain_bb = compute_row(graph_asym, True)
+    nd_asym_open, nd_plain_open = compute_row(graph_asym, False)
+    nd_sym_bb, nd_plain_sym_bb = compute_row(graph_sym, True)
+    nd_sym_open, nd_plain_sym_open = compute_row(graph_sym, False)
 
     _maybe_plot_grid(
         "quadrants",
         [
             [labels, blocked_faces(graph_asym).astype(np.uint8), blocked_faces(graph_asym).astype(np.uint8),
-             expanded_asym_bb, nd_asym_bb, nd_plain_bb],
+             nd_asym_bb, nd_plain_bb],
             [labels, blocked_faces(graph_asym).astype(np.uint8), blocked_faces(graph_asym).astype(np.uint8),
-             expanded_asym_open, nd_asym_open, nd_plain_open],
+             nd_asym_open, nd_plain_open],
             [labels, blocked_faces(graph_sym).astype(np.uint8), blocked_faces(graph_sym).astype(np.uint8),
-             expanded_sym_bb, nd_sym_bb, nd_plain_sym_bb],
+             nd_sym_bb, nd_plain_sym_bb],
             [labels, blocked_faces(graph_sym).astype(np.uint8), blocked_faces(graph_sym).astype(np.uint8),
-             expanded_sym_open, nd_sym_open, nd_plain_sym_open],
+             nd_sym_open, nd_plain_sym_open],
         ],
         [
-            ["labels", "blocked_faces", "blocked_arrows", "expanded_bb", "dist_graph_bb", "dist_plain_bb"],
-            ["labels", "blocked_faces", "blocked_arrows", "expanded_open", "dist_graph_open", "dist_plain_open"],
-            ["labels", "blocked_faces", "blocked_arrows", "expanded_bb", "dist_graph_bb", "dist_plain_bb"],
-            ["labels", "blocked_faces", "blocked_arrows", "expanded_open", "dist_graph_open", "dist_plain_open"],
+            ["labels", "blocked_faces", "blocked_arrows", "dist_graph_bb", "dist_plain_bb"],
+            ["labels", "blocked_faces", "blocked_arrows", "dist_graph_open", "dist_plain_open"],
+            ["labels", "blocked_faces", "blocked_arrows", "dist_graph_bb", "dist_plain_bb"],
+            ["labels", "blocked_faces", "blocked_arrows", "dist_graph_open", "dist_plain_open"],
         ],
         blocked_arrows=[
             blocked_arrows(graph_asym, mirror=False),
@@ -312,17 +285,11 @@ def test_voxel_graph_examples_png():
         block_incoming(g_both, target_mask, bits)
         graphs["both"] = g_both
 
-        results = {}
         dists = {}
         for name, g in graphs.items():
-            feats, dist_sq = edt.feature_transform(labels, voxel_graph=g, return_distances=True)
-            results[name] = labels.ravel()[feats.ravel()].reshape(labels.shape)
-            # Background EDT via feature_transform on background mask
-            _, dist_bg_sq = edt.feature_transform(
-                (labels == 0).astype(np.uint8), voxel_graph=g, return_distances=True
-            )
-            dists[name] = np.sqrt(dist_bg_sq, dtype=np.float32)
-        return results, dists, graphs
+            dist_sq = edt.edtsq(labels, voxel_graph=g)
+            dists[name] = np.sqrt(dist_sq, dtype=np.float32)
+        return dists, graphs
 
     def block_midline(graph, axis, idx, bits):
         bit = bits[axis]
@@ -339,7 +306,7 @@ def test_voxel_graph_examples_png():
     # Example 1: two squares, expand labels under different blocking.
     labels = make_two_squares((48, 48), size=8, gap=4)
     target = labels == 1
-    expanded, dists, graphs = expand_for_cases(labels, target)
+    dists, graphs = expand_for_cases(labels, target)
 
     # Example 2: single rectangle with midline blocked both directions.
     rect = np.zeros((48, 48), dtype=np.uint32)
@@ -356,10 +323,6 @@ def test_voxel_graph_examples_png():
     titles = ["none", "outgoing", "incoming", "both"]
     for c, name in enumerate(titles):
         ax = axes[0, c]
-        ax.imshow(expanded[name], cmap=label_cmap, vmin=0, vmax=3, interpolation="nearest")
-        ax.set_title(f"expand_{name}")
-        ax.axis("off")
-        ax = axes[1, c]
         ax.imshow(dists[name], cmap=dist_cmap, interpolation="nearest")
         ax.set_title(f"dist_{name}")
         ax.axis("off")

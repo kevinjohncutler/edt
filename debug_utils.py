@@ -161,6 +161,89 @@ def make_random_circles_labels(
         labels[mask] = label_id
     return labels
 
+
+def make_voxel_graph_split_labels(
+    labels: np.ndarray,
+    axis: int = 1,
+    split_at: float = 0.5,
+    block_boundaries: bool = True,
+) -> np.ndarray:
+    """
+    Build a voxel_graph that encodes all label boundaries (optional) and
+    additionally splits every label along a chosen axis at a fractional
+    position within each labeled region.
+
+    For 2D: axis=1 splits left/right (x); axis=0 splits top/bottom (y).
+    """
+    if labels.ndim < 2:
+        raise ValueError("labels must be at least 2D")
+    if axis < 0 or axis >= labels.ndim:
+        raise ValueError("axis out of range")
+    if not (0.0 < split_at < 1.0):
+        raise ValueError("split_at must be in (0, 1)")
+
+    bits = 2 * labels.ndim
+    dtype = np.uint8 if bits <= 8 else np.uint16
+    bitmask = (1 << bits) - 1
+    graph = np.full(labels.shape, bitmask, dtype=dtype)
+
+    # Bit layout: bit = 1 << (2*(ndim-1-axis) + sign), sign 0 => +, 1 => -
+    def bit_pos(ax: int) -> int:
+        return 1 << (2 * (labels.ndim - 1 - ax) + 0)
+
+    def bit_neg(ax: int) -> int:
+        return 1 << (2 * (labels.ndim - 1 - ax) + 1)
+
+    if block_boundaries:
+        # Block edges between different labels in both directions.
+        for ax in range(labels.ndim):
+            slicer_hi = [slice(None)] * labels.ndim
+            slicer_lo = [slice(None)] * labels.ndim
+            slicer_hi[ax] = slice(1, None)
+            slicer_lo[ax] = slice(0, -1)
+            diff = labels[tuple(slicer_hi)] != labels[tuple(slicer_lo)]
+            # block +ax on lower voxel, -ax on upper voxel
+            graph[tuple(slicer_lo)][diff] &= (~bit_pos(ax)) & (bitmask)
+            graph[tuple(slicer_hi)][diff] &= (~bit_neg(ax)) & (bitmask)
+
+            # Also handle edges: block connections from foreground to outside
+            # Left edge: block -ax direction where label != 0
+            slicer_edge = [slice(None)] * labels.ndim
+            slicer_edge[ax] = 0
+            edge_fg = labels[tuple(slicer_edge)] != 0
+            graph[tuple(slicer_edge)][edge_fg] &= (~bit_neg(ax)) & (bitmask)
+
+            # Right edge: block +ax direction where label != 0
+            slicer_edge[ax] = labels.shape[ax] - 1
+            edge_fg = labels[tuple(slicer_edge)] != 0
+            graph[tuple(slicer_edge)][edge_fg] &= (~bit_pos(ax)) & (bitmask)
+
+    # Split each label along the chosen axis at split_at of its extent.
+    for lab in np.unique(labels):
+        if lab == 0:
+            continue
+        coords = np.argwhere(labels == lab)
+        if coords.size == 0:
+            continue
+        lo = coords[:, axis].min()
+        hi = coords[:, axis].max() + 1
+        split = lo + int(round((hi - lo) * split_at))
+        if split <= lo or split >= hi:
+            continue
+
+        # Block edges crossing the split plane in both directions.
+        slicer_left = [slice(None)] * labels.ndim
+        slicer_right = [slice(None)] * labels.ndim
+        slicer_left[axis] = split - 1
+        slicer_right[axis] = split
+        mask_left = labels[tuple(slicer_left)] == lab
+        mask_right = labels[tuple(slicer_right)] == lab
+        mask = mask_left & mask_right
+        graph[tuple(slicer_left)][mask] &= (~bit_pos(axis)) & bitmask
+        graph[tuple(slicer_right)][mask] &= (~bit_neg(axis)) & bitmask
+
+    return graph
+
 def test_edt_consistency():
     """Test that edt functions give consistent results across dimensions"""
     
