@@ -1,5 +1,8 @@
 include src/edt.pyx
 include src/edt.hpp
+include src/edt_specific.hpp
+include src/loop.hpp
+include src/nd_barrier_core.hpp
 include src/edt_voxel_graph.hpp
 include src/threadpool.h
 include src_old/edt.pyx

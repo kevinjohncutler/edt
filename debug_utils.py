@@ -152,13 +152,22 @@ def make_random_circles_labels(
     circle_area = np.pi * r_mean * r_mean
     count = max(1, int(coverage * area / circle_area))
     labels = np.zeros((h, w), dtype=int)
-    yy, xx = np.ogrid[:h, :w]
+
     for label_id in range(1, count + 1):
         r = rng.integers(rmin, rmax + 1)
         cy = rng.integers(r, h - r) if h > 2 * r else rng.integers(0, h)
         cx = rng.integers(r, w - r) if w > 2 * r else rng.integers(0, w)
+
+        # Local bounding box only - O(r²) instead of O(h*w)
+        y0 = max(0, cy - r)
+        y1 = min(h, cy + r + 1)
+        x0 = max(0, cx - r)
+        x1 = min(w, cx + r + 1)
+
+        yy, xx = np.ogrid[y0:y1, x0:x1]
         mask = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
-        labels[mask] = label_id
+        labels[y0:y1, x0:x1][mask] = label_id
+
     return labels
 
 
