@@ -731,6 +731,28 @@ def nd_multi_batch(batch):
   with nogil:
     nd_set_multi_batch(b)
 
+@cython.binding(True)
+def barrier_tuning(col_batch_size=8, chunks_per_thread=1, use_batched=True):
+  """
+  Set barrier EDT tuning parameters.
+
+  Parameters:
+    col_batch_size: Number of columns to batch together (default 8)
+    chunks_per_thread: Number of work chunks per thread (default 1)
+    use_batched: Whether to use batched strided processing (default True)
+  """
+  cdef size_t cbs = <size_t>int(col_batch_size)
+  cdef size_t cpt = <size_t>int(chunks_per_thread)
+  cdef bint ub = <bint>bool(use_batched)
+  with nogil:
+    barrier_set_tuning(cbs, cpt, ub)
+
+@cython.binding(True)
+def barrier_reset():
+  """Reset barrier EDT tuning to defaults."""
+  with nogil:
+    barrier_reset_tuning()
+
 ctypedef fused UINT:
   uint8_t
   uint16_t
@@ -771,6 +793,9 @@ cdef extern from "nd_barrier_core.hpp" namespace "nd_barrier":
     int ndim,
     int parallel
   ) nogil
+
+  cdef void barrier_set_tuning(size_t col_batch_size, size_t chunks_per_thread, bint use_batched) nogil
+  cdef void barrier_reset_tuning() nogil
 
 cdef extern from *:
   """
