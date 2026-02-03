@@ -129,6 +129,83 @@ def make_fibonacci_spiral_labels(shape: tuple[int, int]) -> np.ndarray:
     return labels
 
 
+def make_random_hyperspheres_labels(
+    shape: tuple[int, ...],
+    rmin: int,
+    rmax: int,
+    seed: int = 0,
+    coverage: float = 0.3,
+) -> np.ndarray:
+    """
+    Create an ND label array with random filled hyperspheres, each with a unique label.
+
+    Works for any dimensionality:
+    - 2D: circles
+    - 3D: spheres
+    - ND: hyperspheres
+
+    Hyperspheres may overlap (later ones overwrite earlier ones).
+    Uses local bounding box for O(r^ndim) per sphere instead of O(volume).
+    """
+    ndim = len(shape)
+    if ndim < 1:
+        raise ValueError("shape must be at least 1D.")
+    if rmin < 1 or rmax < rmin:
+        raise ValueError("invalid radius range")
+
+    rng = np.random.default_rng(seed)
+    total_volume = int(np.prod(shape))
+    r_mean = (rmin + rmax) / 2.0
+
+    # Hypersphere volume formula: V = pi^(n/2) / Gamma(n/2 + 1) * r^n
+    # Simplified approximation for counting
+    if ndim == 1:
+        sphere_volume = 2 * r_mean
+    elif ndim == 2:
+        sphere_volume = np.pi * r_mean ** 2
+    elif ndim == 3:
+        sphere_volume = (4.0 / 3.0) * np.pi * r_mean ** 3
+    else:
+        # General formula using gamma function
+        from math import gamma
+        sphere_volume = (np.pi ** (ndim / 2)) / gamma(ndim / 2 + 1) * r_mean ** ndim
+
+    count = max(1, int(coverage * total_volume / sphere_volume))
+    labels = np.zeros(shape, dtype=np.int32)
+
+    for label_id in range(1, count + 1):
+        r = rng.integers(rmin, rmax + 1)
+
+        # Random center, staying r away from edges when possible
+        center = []
+        for dim_size in shape:
+            if dim_size > 2 * r:
+                c = rng.integers(r, dim_size - r)
+            else:
+                c = rng.integers(0, dim_size)
+            center.append(c)
+
+        # Build local bounding box slices
+        slices = []
+        for ax, (c, dim_size) in enumerate(zip(center, shape)):
+            lo = max(0, c - r)
+            hi = min(dim_size, c + r + 1)
+            slices.append(slice(lo, hi))
+
+        # Build distance mask using ogrid for efficiency
+        ogrid_slices = [np.arange(s.start, s.stop) for s in slices]
+        grids = np.ogrid[tuple(slice(0, len(og)) for og in ogrid_slices)]
+
+        # Compute squared distance from center
+        dist_sq = sum((g + slices[ax].start - center[ax]) ** 2 for ax, g in enumerate(grids))
+        mask = dist_sq <= r * r
+
+        # Apply label
+        labels[tuple(slices)][mask] = label_id
+
+    return labels
+
+
 def make_random_circles_labels(
     shape: tuple[int, int],
     rmin: int,
@@ -136,39 +213,74 @@ def make_random_circles_labels(
     seed: int = 0,
     coverage: float = 0.3,
 ) -> np.ndarray:
-    """
-    Create a 2D label image with random filled circles, each with a unique label.
-
-    Circles may overlap (later circles overwrite earlier ones).
-    """
+    """Backwards-compatible alias for 2D hyperspheres (circles)."""
     if len(shape) != 2:
         raise ValueError("shape must be 2D for random circles.")
-    if rmin < 1 or rmax < rmin:
-        raise ValueError("invalid radius range")
-    h, w = shape
+    return make_random_hyperspheres_labels(shape, rmin, rmax, seed, coverage)
+
+
+def make_random_spheres_labels(
+    shape: tuple[int, int, int],
+    rmin: int,
+    rmax: int,
+    seed: int = 0,
+    coverage: float = 0.3,
+) -> np.ndarray:
+    """Backwards-compatible alias for 3D hyperspheres (spheres)."""
+    if len(shape) != 3:
+        raise ValueError("shape must be 3D for random spheres.")
+    return make_random_hyperspheres_labels(shape, rmin, rmax, seed, coverage)
+
+
+def make_random_boxes_labels(
+    shape: tuple[int, ...],
+    size_min: int = None,
+    size_max: int = None,
+    seed: int = 0,
+    num_boxes: int = 50,
+) -> np.ndarray:
+    """
+    Create an ND label array with random axis-aligned boxes stacked/overlapping.
+
+    Works for any dimensionality:
+    - 2D: rectangles (squares)
+    - 3D: cubes
+    - ND: hypercubes
+    """
+    ndim = len(shape)
+    if ndim < 1:
+        raise ValueError("shape must be at least 1D.")
+
+    min_dim = min(shape)
+    if size_min is None:
+        size_min = max(1, min_dim // 20)
+    if size_max is None:
+        size_max = max(size_min + 1, min_dim // 4)
+
     rng = np.random.default_rng(seed)
-    area = h * w
-    r_mean = (rmin + rmax) / 2.0
-    circle_area = np.pi * r_mean * r_mean
-    count = max(1, int(coverage * area / circle_area))
-    labels = np.zeros((h, w), dtype=int)
+    labels = np.zeros(shape, dtype=np.int32)
 
-    for label_id in range(1, count + 1):
-        r = rng.integers(rmin, rmax + 1)
-        cy = rng.integers(r, h - r) if h > 2 * r else rng.integers(0, h)
-        cx = rng.integers(r, w - r) if w > 2 * r else rng.integers(0, w)
-
-        # Local bounding box only - O(r²) instead of O(h*w)
-        y0 = max(0, cy - r)
-        y1 = min(h, cy + r + 1)
-        x0 = max(0, cx - r)
-        x1 = min(w, cx + r + 1)
-
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        mask = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
-        labels[y0:y1, x0:x1][mask] = label_id
+    for label_id in range(1, num_boxes + 1):
+        size = rng.integers(size_min, size_max + 1)
+        slices = []
+        for dim_size in shape:
+            lo = rng.integers(0, max(1, dim_size - size))
+            hi = min(dim_size, lo + size)
+            slices.append(slice(lo, hi))
+        labels[tuple(slices)] = label_id
 
     return labels
+
+
+def make_cube_stack_labels(
+    shape: tuple[int, int, int],
+    seed: int = 0,
+    num_cubes: int = 50,
+) -> np.ndarray:
+    """Backwards-compatible alias for 3D random boxes."""
+    if len(shape) != 3:
+        raise ValueError("shape must be 3D for cube stack.")
+    return make_random_boxes_labels(shape, seed=seed, num_boxes=num_cubes)
 
 
 def make_voxel_graph_split_labels(
