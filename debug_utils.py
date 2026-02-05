@@ -41,9 +41,17 @@ def make_tiled_label_grid(base_shape: tuple[int, int], tile: int) -> np.ndarray:
     return make_tiled_label_grid_nd(base_shape, tile)
 
 
-def make_tiled_label_grid_nd(base_shape: tuple[int, ...], tile: int) -> np.ndarray:
+def make_tiled_label_grid_nd(base_shape: tuple[int, ...], tile: int, gap: int = 0) -> np.ndarray:
     """
     Create an ND grid where each voxel is a unique label, then upscale by tiling.
+
+    Parameters:
+        base_shape: Number of tiles in each dimension
+        tile: Size of each tile in pixels
+        gap: Gap between tiles (background pixels). Default 0.
+
+    When gap=0: Labels start from 0, so first tile is background.
+    When gap>0: Labels start from 1, gaps are background (label 0).
 
     Example:
       base_shape=(10, 10, 10), tile=20 -> output shape (200, 200, 200)
@@ -53,10 +61,26 @@ def make_tiled_label_grid_nd(base_shape: tuple[int, ...], tile: int) -> np.ndarr
         raise ValueError("base_shape must be at least 1D.")
     if tile < 1:
         raise ValueError("tile must be >= 1.")
-    base = np.arange(int(np.prod(base_shape)), dtype=int).reshape(base_shape)
-    for axis in range(len(base_shape)):
-        base = np.repeat(base, tile, axis=axis)
-    return base
+
+    if gap == 0:
+        # Original fast path: labels 0..N-1, first tile is background
+        base = np.arange(int(np.prod(base_shape)), dtype=int).reshape(base_shape)
+        for axis in range(len(base_shape)):
+            base = np.repeat(base, tile, axis=axis)
+        return base
+    else:
+        # With gaps: labels 1..N, gaps are background (0)
+        if gap >= tile:
+            raise ValueError("gap must be < tile.")
+        output_shape = tuple(s * tile for s in base_shape)
+        output = np.zeros(output_shape, dtype=int)
+        fill_size = tile - gap
+        label = 1
+        for tile_idx in np.ndindex(*base_shape):
+            slices = tuple(slice(idx * tile, idx * tile + fill_size) for idx in tile_idx)
+            output[slices] = label
+            label += 1
+        return output
 
 
 def make_fibonacci_spiral_labels(shape: tuple[int, int]) -> np.ndarray:
