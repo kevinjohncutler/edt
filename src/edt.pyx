@@ -1,11 +1,23 @@
-# cython: language_level=3
+# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """
-EDT - Euclidean Distance Transform
+Multi-label Euclidean Distance Transform based on the algorithms of
+Saito et al (1994), Meijster et al (2002), and Felzenszwalb & Huttenlocher (2012).
 
-Multi-label EDT using graph-first architecture. Builds a connectivity graph
-from labels, then computes EDT using a unified ND algorithm.
+Uses uint8 connectivity graphs for 25% memory reduction vs segment labels.
+Supports custom voxel_graph input for user-defined boundaries.
 
-33% less memory than segment-label approach (uint8 graph vs uint32 labels).
+Key methods:
+  edt, edtsq - main EDT functions
+  edt_graph, edtsq_graph - EDT from pre-built connectivity graph
+  build_graph - build connectivity graph from labels
+
+Additional utilities (from edt_barrier):
+  feature_transform, expand_labels, each, sdf
+
+License: GNU 3.0
+
+Original EDT: William Silversmith (Seung Lab, Princeton), 2018-2023
+ND connectivity graph EDT: Kevin Cutler, 2026
 """
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport malloc, free
@@ -17,10 +29,10 @@ import numpy as np
 import multiprocessing
 
 
-cdef extern from "nd_v2_core.hpp" namespace "nd_v2":
+cdef extern from "edt.hpp" namespace "nd":
     # Tuning
-    cdef void v2_set_tuning(size_t chunks_per_thread, size_t tile) nogil
-    cdef void v2_set_force_generic(native_bool force) nogil
+    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
+    cdef void _nd_set_force_generic "nd::set_force_generic"(native_bool force) nogil
 
     # EDT from labels (original, unused)
     cdef void edtsq_from_labels[T](
@@ -66,32 +78,35 @@ cdef extern from "nd_v2_core.hpp" namespace "nd_v2":
 
 
 def set_tuning(chunks_per_thread=1, tile=8):
-    """Set tuning parameters for nd_v2 EDT."""
-    v2_set_tuning(chunks_per_thread, tile)
+    """Set tuning parameters for ND EDT."""
+    _nd_set_tuning(chunks_per_thread, tile)
 
 
 def set_force_generic(force):
-    """Force use of generic ND path (for testing/benchmarking)."""
-    v2_set_force_generic(force)
+    """Force use of generic ND path (for testing/benchmarking). Deprecated - no-op."""
+    _nd_set_force_generic(force)
 
 
-def _voxel_graph_to_nd_v2(labels, voxel_graph):
+def _voxel_graph_to_nd(voxel_graph, labels=None):
     """
-    Convert bidirectional voxel_graph to nd_v2 graph format.
+    Convert bidirectional voxel_graph to ND graph format.
 
     The voxel_graph format uses 2*ndim bits per voxel:
     - positive direction at bit (2*(ndim-1-axis))
     - negative direction at bit (2*(ndim-1-axis)+1)
 
-    The nd_v2 format uses forward edges only + foreground marker:
+    The ND format uses forward edges only + foreground marker:
     - Forward edge for axis a at bit (2*(ndim-1-a))
     - Bit 7 (0x80) marks foreground
 
-    Since positive direction bits match nd_v2 edge bits exactly,
+    Since positive direction bits match ND edge bits exactly,
     we just mask out negative bits and add foreground marker.
+
+    If labels is None, foreground is inferred from voxel_graph != 0
+    (any voxel with connectivity is foreground).
     """
     ndim = voxel_graph.ndim
-    if voxel_graph.shape != labels.shape:
+    if labels is not None and voxel_graph.shape != labels.shape:
         raise ValueError("voxel_graph shape must match labels")
 
     # Build mask for positive direction bits only
@@ -99,16 +114,19 @@ def _voxel_graph_to_nd_v2(labels, voxel_graph):
     for axis in range(ndim):
         pos_mask |= (1 << (2 * (ndim - 1 - axis)))
 
-    # Extract positive direction bits (these match nd_v2 edge bits)
+    # Extract positive direction bits (these match ND edge bits)
     graph = (voxel_graph.astype(np.uint32) & pos_mask).astype(np.uint8)
 
-    # Add foreground marker for foreground voxels
-    graph[labels != 0] |= 0x80
+    # Add foreground marker - infer from voxel_graph if no labels provided
+    if labels is not None:
+        graph[labels != 0] |= 0x80
+    else:
+        graph[voxel_graph != 0] |= 0x80
 
     return graph
 
 
-def edtsq(labels, anisotropy=None, black_border=False, parallel=0, voxel_graph=None, order=None):
+def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_graph=None, order=None):
     """
     Compute squared Euclidean distance transform via graph-first architecture.
 
@@ -117,8 +135,9 @@ def edtsq(labels, anisotropy=None, black_border=False, parallel=0, voxel_graph=N
 
     Parameters
     ----------
-    labels : ndarray
+    labels : ndarray or None
         Input label array. Non-zero values are foreground.
+        Can be None if voxel_graph is provided (foreground inferred from connectivity).
     anisotropy : tuple or None
         Physical voxel size for each dimension. Default is isotropic (1, 1, ...).
     black_border : bool
@@ -127,7 +146,8 @@ def edtsq(labels, anisotropy=None, black_border=False, parallel=0, voxel_graph=N
         Number of threads. 0 means auto-detect.
     voxel_graph : ndarray, optional
         Per-voxel bitfield describing allowed connections. Positive direction
-        bits are extracted and used for EDT computation.
+        bits are extracted and used for EDT computation. If labels is None,
+        foreground is inferred from voxel_graph != 0.
     order : ignored
         For backwards compatibility.
 
@@ -136,11 +156,16 @@ def edtsq(labels, anisotropy=None, black_border=False, parallel=0, voxel_graph=N
     ndarray
         Squared Euclidean distance transform (float32).
     """
-    # Handle voxel_graph input by converting to nd_v2 format
+    # Handle voxel_graph input by converting to ND graph format
     if voxel_graph is not None:
-        labels = np.asarray(labels)
-        graph = _voxel_graph_to_nd_v2(labels, np.ascontiguousarray(voxel_graph))
+        voxel_graph = np.ascontiguousarray(voxel_graph)
+        if labels is not None:
+            labels = np.asarray(labels)
+        graph = _voxel_graph_to_nd(voxel_graph, labels)
         return edtsq_graph(graph, anisotropy, black_border, parallel)
+
+    if labels is None:
+        raise ValueError("labels is required when voxel_graph is not provided")
 
     labels = np.ascontiguousarray(labels, dtype=np.uint32)
     cdef size_t nd = labels.ndim
@@ -190,7 +215,7 @@ def edtsq(labels, anisotropy=None, black_border=False, parallel=0, voxel_graph=N
     return output
 
 
-def edt(labels, anisotropy=None, black_border=False, parallel=0, voxel_graph=None, order=None):
+def edt(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_graph=None, order=None):
     """
     Compute Euclidean distance transform.
 

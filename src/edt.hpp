@@ -1,5 +1,5 @@
 /*
- * ND v2 EDT - Segment Label Based Euclidean Distance Transform
+ * ND EDT - Graph-First Euclidean Distance Transform
  *
  * Key insight: ND's speed comes from cached label comparison in segment finding:
  *   while (j < n && segids[j] == label) { ++j; }
@@ -13,8 +13,8 @@
  * No graph edge bit checking, no [i-1] access patterns, just equality comparison.
  */
 
-#ifndef ND_V2_CORE_HPP
-#define ND_V2_CORE_HPP
+#ifndef EDT_HPP
+#define EDT_HPP
 
 #include <algorithm>
 #include <atomic>
@@ -29,31 +29,31 @@
 #include <unordered_map>
 #include "threadpool.h"
 
-// Prefetch support (matching ND v1)
+// Prefetch support
 #if defined(__GNUC__) || defined(__clang__)
-#  define V2_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
+#  define ND_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
 #elif defined(_MSC_VER)
 #  include <xmmintrin.h>
-#  define V2_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#  define ND_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
 #else
-#  define V2_PREFETCH(addr) do {} while(0)
+#  define ND_PREFETCH(addr) do {} while(0)
 #endif
 
-namespace nd_v2 {
+namespace nd {
 
-// Tuning parameters (matching ND v1 defaults)
-static size_t V2_CHUNKS_PER_THREAD = 1;
-static size_t V2_TILE = 8;
-static bool V2_FORCE_GENERIC_GRAPH = false;  // Deprecated: no-op (unified ND path is now default)
+// Tuning parameters
+static size_t ND_CHUNKS_PER_THREAD = 1;
+static size_t ND_TILE = 8;
+static bool ND_FORCE_GENERIC_GRAPH = false;  // Deprecated: no-op (unified ND path is now default)
 
-inline void v2_set_tuning(size_t chunks_per_thread, size_t tile) {
-    if (chunks_per_thread > 0) V2_CHUNKS_PER_THREAD = chunks_per_thread;
-    if (tile > 0) V2_TILE = tile;
+inline void set_tuning(size_t chunks_per_thread, size_t tile) {
+    if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
+    if (tile > 0) ND_TILE = tile;
 }
 
 // Deprecated: no-op since unified ND path is now the only path
-inline void v2_set_force_generic(bool force) {
-    V2_FORCE_GENERIC_GRAPH = force;  // Kept for API compatibility
+inline void set_force_generic(bool force) {
+    ND_FORCE_GENERIC_GRAPH = force;  // Kept for API compatibility
 }
 
 // Shared thread pool (like ND v1)
@@ -2488,6 +2488,6 @@ inline void edtsq_from_labels_fused(
     }
 }
 
-} // namespace nd_v2
+} // namespace nd
 
-#endif // ND_V2_CORE_HPP
+#endif // EDT_HPP
