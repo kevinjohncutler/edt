@@ -115,13 +115,33 @@ Graph size: 1N bytes (uint8) for 2D-4D, 2N bytes (uint16) for 5D+.
 
 **Peak memory during `edtsq()` (2D-4D)**: ~5N bytes (4N output + 1N graph)
 
-| Input dtype | Graph-first | Label-segment | Savings |
+| Input label dtype | Graph-first | Label-segment | Savings |
 |-------------|-------------|---------------|---------|
 | uint8  | 5N | 5N | 0.0% |
 | uint16 | 5N | 6N | 16.7% |
 | uint32 | 5N | 8N | 37.5% |
 
-Graph-first peak is constant. Label-segment peak grows with input dtype.
+### Voxel Graph Input
+
+When using `voxel_graph` input, the bidirectional cc3d format is translated to the internal ND graph format:
+
+1. **Mask out negative direction bits** - voxel_graph uses 2 bits per axis (positive + negative); ND graph uses only forward edges
+2. **Add foreground marker** - bit 7 (0x80) is set for non-zero voxels
+
+This creates a temporary uint8 array (1N bytes), but avoids the grid doubling required by the legacy label-segment approach. Assuming 16-bit labels (2N memory allocation):
+
+**Peak memory for voxel_graph input**:
+
+| Component | Graph-first | Legacy 2D | Legacy 3D |
+|-----------|-------------|-----------|-----------|
+| Input voxel_graph | 1N | 1N | 1N |
+| Translated ND graph | 1N | - | - |
+| Labels (legacy requires) | - | 2N | 2N |
+| double_labels (uint8) | - | 4N | 8N |
+| Transform on doubled grid | - | 16N | 32N |
+| Output (float32) | 4N | 4N | 4N | 
+| **Peak** | **6N** | **23N** | **43N** |
+| **Theoretical savings** | 1× | 3.8× | 7.2× |
 
 ## Implementation Details
 
