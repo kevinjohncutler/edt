@@ -171,7 +171,12 @@ def _voxel_graph_to_nd(voxel_graph, labels=None):
         pos_mask |= (1 << (2 * (ndim - 1 - axis)))
 
     # Extract positive direction bits (these match ND edge bits)
-    graph = (voxel_graph.astype(np.uint32) & pos_mask).astype(np.uint8)
+    # Use minimal dtype based on ndim (not input dtype) to avoid large intermediates
+    # Bit encoding: 2*(ndim-1) bits for edges + bit 7 for foreground
+    # Dtype doubles every 4 dims: 2-4D → uint8, 5-8D → uint16, 9-12D → uint32, 13-16D → uint64
+    mask_dtype = (np.uint8, np.uint16, np.uint32, np.uint64)[min((ndim - 1) // 4, 3)]
+    graph = voxel_graph.astype(mask_dtype, copy=False) & mask_dtype(pos_mask)
+    # Keep mask_dtype - don't truncate to uint8 (5D+ needs higher bits)
 
     # Add foreground marker - infer from voxel_graph if no labels provided
     if labels is not None:
@@ -320,8 +325,8 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     Parameters
     ----------
-    graph : ndarray (uint8)
-        Voxel connectivity graph. Each byte encodes edge bits for each axis.
+    graph : ndarray (uint8 for 2D-4D, uint16 for 5D-8D)
+        Voxel connectivity graph. Each element encodes edge bits for each axis.
         For 2D: axis 0 -> bit 2, axis 1 -> bit 0
         For 3D: axis 0 -> bit 4, axis 1 -> bit 2, axis 2 -> bit 0
     anisotropy : tuple or None
@@ -336,9 +341,12 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     ndarray
         Squared Euclidean distance transform (float32).
     """
-    graph = np.ascontiguousarray(graph, dtype=np.uint8)
     cdef size_t nd = graph.ndim
     cdef tuple shape = graph.shape
+
+    # Select dtype based on ndim: 2-4D -> uint8, 5-8D -> uint16, 9-12D -> uint32, 13-16D -> uint64
+    graph_dtype = (np.uint8, np.uint16, np.uint32, np.uint64)[min((nd - 1) // 4, 3)]
+    graph = np.ascontiguousarray(graph, dtype=graph_dtype)
 
     if anisotropy is None:
         anisotropy = tuple([1.0] * nd)
@@ -371,14 +379,26 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     cdef np.ndarray output = np.zeros(shape, dtype=np.float32)
     cdef float* outp = <float*> np.PyArray_DATA(output)
-    cdef uint8_t* graphp = <uint8_t*> np.PyArray_DATA(graph)
 
     cdef native_bool bb = black_border
     cdef int par = parallel
 
+    # Get graph pointer before nogil (dispatch based on dtype)
+    cdef void* graphp = np.PyArray_DATA(graph)
+
     try:
-        with nogil:
-            edtsq_from_graph[uint8_t](graphp, outp, cshape, canis, nd, bb, par)
+        if nd <= 4:
+            with nogil:
+                edtsq_from_graph[uint8_t](<uint8_t*>graphp, outp, cshape, canis, nd, bb, par)
+        elif nd <= 8:
+            with nogil:
+                edtsq_from_graph[uint16_t](<uint16_t*>graphp, outp, cshape, canis, nd, bb, par)
+        elif nd <= 12:
+            with nogil:
+                edtsq_from_graph[uint32_t](<uint32_t*>graphp, outp, cshape, canis, nd, bb, par)
+        else:
+            with nogil:
+                edtsq_from_graph[uint64_t](<uint64_t*>graphp, outp, cshape, canis, nd, bb, par)
     finally:
         free(cshape)
         free(canis)

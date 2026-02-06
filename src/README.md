@@ -98,7 +98,9 @@ Formula: `bit_position = 2 * (ndim - 1 - axis)`
 | 2D | bit 2 (4) | bit 0 (1) | - | - | uint8 |
 | 3D | bit 4 (16) | bit 2 (4) | bit 0 (1) | - | uint8 |
 | 4D | bit 6 (64) | bit 4 (16) | bit 2 (4) | bit 0 (1) | uint8 |
-| 5D+ | bit 8+ | ... | ... | ... | uint16 |
+| 5D-8D | bit 8+ | ... | ... | ... | uint16 |
+| 9D-12D | bit 16+ | ... | ... | ... | uint32 |
+| 13D-16D | bit 24+ | ... | ... | ... | uint64 |
 
 Note: Bit 7 is reserved for the foreground marker, so 4D is the maximum for uint8.
 
