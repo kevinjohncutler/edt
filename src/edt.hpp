@@ -2488,6 +2488,281 @@ inline void edtsq_from_labels_fused(
     }
 }
 
+//-----------------------------------------------------------------------------
+// Parabolic EDT with argmin tracking (for expand_labels/feature_transform)
+//-----------------------------------------------------------------------------
+
+inline float sq_f(float x) { return x * x; }
+
+inline void squared_edt_1d_parabolic_with_arg_stride(
+    float* f,
+    const long int n,
+    const long int stride,
+    const float anisotropy,
+    const bool black_border_left,
+    const bool black_border_right,
+    int* arg_out,
+    const long int arg_stride
+) {
+    if (n == 0) return;
+    const float w2 = anisotropy * anisotropy;
+
+    int k = 0;
+    std::unique_ptr<int[]> v(new int[n]());
+    std::unique_ptr<float[]> ff(new float[n]());
+    for (long int i = 0; i < n; i++) ff[i] = f[i * stride];
+    std::unique_ptr<float[]> ranges(new float[n + 1]());
+    ranges[0] = -std::numeric_limits<float>::infinity();
+    ranges[1] = std::numeric_limits<float>::infinity();
+
+    float s, factor1, factor2;
+    for (long int i = 1; i < n; i++) {
+        factor1 = (i - v[k]) * w2;
+        factor2 = i + v[k];
+        s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+        while (k > 0 && s <= ranges[k]) {
+            k--;
+            factor1 = (i - v[k]) * w2;
+            factor2 = i + v[k];
+            s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+        }
+        k++;
+        v[k] = i;
+        ranges[k] = s;
+        ranges[k + 1] = std::numeric_limits<float>::infinity();
+    }
+
+    k = 0;
+    float envelope;
+    for (long int i = 0; i < n; i++) {
+        while (ranges[k + 1] < i) k++;
+        f[i * stride] = w2 * sq_f(i - v[k]) + ff[v[k]];
+        arg_out[i * arg_stride] = v[k];
+        if (black_border_left && black_border_right) {
+            envelope = std::fmin(w2 * sq_f(i + 1), w2 * sq_f(n - i));
+            f[i * stride] = std::fmin(envelope, f[i * stride]);
+        } else if (black_border_left) {
+            f[i * stride] = std::fmin(w2 * sq_f(i + 1), f[i * stride]);
+        } else if (black_border_right) {
+            f[i * stride] = std::fmin(w2 * sq_f(n - i), f[i * stride]);
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Expand labels helpers (for ND expand_labels/feature_transform)
+//-----------------------------------------------------------------------------
+
+template <typename INDEX=size_t>
+inline void _nd_expand_init_bases(
+    const uint8_t* seeds,
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    INDEX* feat_out,
+    const int parallel
+) {
+    if (n == 0 || num_lines == 0) return;
+    const int threads = std::max(1, parallel);
+    ThreadPool pool(threads);
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+    const size_t chunk = (num_lines + chunks - 1) / chunks;
+    for (size_t start = 0; start < num_lines; start += chunk) {
+        const size_t end = std::min(num_lines, start + chunk);
+        pool.enqueue([=]() {
+            std::vector<int> arg(n);
+            for (size_t i = start; i < end; ++i) {
+                const size_t base = bases[i];
+                bool any_zero = false;
+                for (size_t j = 0; j < n; ++j) {
+                    const bool seeded = (seeds[base + j * s] != 0);
+                    dist[base + j * s] = seeded ? 0.0f : (std::numeric_limits<float>::max() / 4.0f);
+                    any_zero |= (!seeded);
+                }
+                if (any_zero) {
+                    squared_edt_1d_parabolic_with_arg_stride(
+                        dist + base, (int)n, (long)s, anis,
+                        black_border, black_border,
+                        arg.data(), 1);
+                } else {
+                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                }
+                for (size_t j = 0; j < n; ++j) {
+                    feat_out[base + j * s] = (INDEX)(base + (size_t)arg[j] * s);
+                }
+            }
+        });
+    }
+    pool.join();
+}
+
+template <typename INDEX=size_t>
+inline void _nd_expand_parabolic_bases(
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    INDEX* feat,
+    const int parallel
+) {
+    if (n == 0 || num_lines == 0) return;
+    const int threads = std::max(1, parallel);
+
+    if (threads <= 1 || num_lines == 1) {
+        std::vector<int> arg(n);
+        std::vector<INDEX> feat_line(n);
+        for (size_t i = 0; i < num_lines; ++i) {
+            const size_t base = bases[i];
+            bool any_nonzero = false;
+            for (size_t j = 0; j < n; ++j) {
+                const float val = dist[base + j * s];
+                any_nonzero |= (val != 0.0f);
+                feat_line[j] = feat[base + j * s];
+            }
+            if (any_nonzero) {
+                squared_edt_1d_parabolic_with_arg_stride(
+                    dist + base, (int)n, (long)s, anis,
+                    black_border, black_border,
+                    arg.data(), 1);
+            } else {
+                for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+            }
+            for (size_t j = 0; j < n; ++j) {
+                feat[base + j * s] = feat_line[(size_t)arg[j]];
+            }
+        }
+        return;
+    }
+
+    ThreadPool pool(threads);
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
+    const size_t chunk = (num_lines + chunks - 1) / chunks;
+    for (size_t start = 0; start < num_lines; start += chunk) {
+        const size_t end = std::min(num_lines, start + chunk);
+        pool.enqueue([=]() {
+            std::vector<int> arg(n);
+            std::vector<INDEX> feat_line(n);
+            for (size_t i = start; i < end; ++i) {
+                const size_t base = bases[i];
+                bool any_nonzero = false;
+                for (size_t j = 0; j < n; ++j) {
+                    const float val = dist[base + j * s];
+                    any_nonzero |= (val != 0.0f);
+                    feat_line[j] = feat[base + j * s];
+                }
+                if (any_nonzero) {
+                    squared_edt_1d_parabolic_with_arg_stride(
+                        dist + base, (int)n, (long)s, anis,
+                        black_border, black_border,
+                        arg.data(), 1);
+                } else {
+                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                }
+                for (size_t j = 0; j < n; ++j) {
+                    feat[base + j * s] = feat_line[(size_t)arg[j]];
+                }
+            }
+        });
+    }
+    pool.join();
+}
+
+inline void _nd_expand_init_labels_bases(
+    const uint8_t* seeds,
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    const uint32_t* labelsp,
+    uint32_t* label_out,
+    const int parallel
+) {
+    if (n == 0 || num_lines == 0) return;
+    const int threads = std::max(1, parallel);
+    ThreadPool pool(threads);
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+    const size_t chunk = (num_lines + chunks - 1) / chunks;
+    for (size_t start = 0; start < num_lines; start += chunk) {
+        const size_t end = std::min(num_lines, start + chunk);
+        pool.enqueue([=]() {
+            std::vector<int> arg(n);
+            for (size_t i = start; i < end; ++i) {
+                const size_t base = bases[i];
+                bool any_nonseed = false;
+                for (size_t j = 0; j < n; ++j) {
+                    const bool seeded = (seeds[base + j * s] != 0);
+                    dist[base + j * s] = seeded ? 0.0f : (std::numeric_limits<float>::max() / 4.0f);
+                    any_nonseed |= (!seeded);
+                }
+                if (any_nonseed) {
+                    squared_edt_1d_parabolic_with_arg_stride(
+                        dist + base, (int)n, (long)s, anis,
+                        black_border, black_border,
+                        arg.data(), 1);
+                } else {
+                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                }
+                for (size_t j = 0; j < n; ++j) {
+                    label_out[base + j * s] = labelsp[base + (size_t)arg[j] * s];
+                }
+            }
+        });
+    }
+    pool.join();
+}
+
+inline void _nd_expand_parabolic_labels_bases(
+    float* dist,
+    const size_t* bases,
+    const size_t num_lines,
+    const size_t n,
+    const size_t s,
+    const float anis,
+    const bool black_border,
+    const uint32_t* label_in,
+    uint32_t* label_out,
+    const int parallel
+) {
+    if (n == 0 || num_lines == 0) return;
+    const int threads = std::max(1, parallel);
+    ThreadPool pool(threads);
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+    const size_t chunk = (num_lines + chunks - 1) / chunks;
+    for (size_t start = 0; start < num_lines; start += chunk) {
+        const size_t end = std::min(num_lines, start + chunk);
+        pool.enqueue([=]() {
+            std::vector<int> arg(n);
+            for (size_t i = start; i < end; ++i) {
+                const size_t base = bases[i];
+                bool any_nonzero = false;
+                for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
+                if (any_nonzero) {
+                    squared_edt_1d_parabolic_with_arg_stride(
+                        dist + base, (int)n, (long)s, anis,
+                        black_border, black_border,
+                        arg.data(), 1);
+                } else {
+                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                }
+                for (size_t j = 0; j < n; ++j) {
+                    label_out[base + j * s] = label_in[base + (size_t)arg[j] * s];
+                }
+            }
+        });
+    }
+    pool.join();
+}
+
 } // namespace nd
 
 #endif // EDT_HPP

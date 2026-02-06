@@ -15,9 +15,10 @@ SMOKE_CSV = ROOT / "benchmarks" / "nd_smoke.csv"
 
 
 def _require_legacy():
+  import pytest
   legacy = getattr(edt, 'legacy', None)
-  if legacy is None or not getattr(legacy, 'available', lambda: False)():
-    raise RuntimeError(
+  if legacy is None:
+    pytest.skip(
         "edt.legacy must be built for benchmark tests. "
         "Run `pip install -e .` to compile the legacy extension."
     )

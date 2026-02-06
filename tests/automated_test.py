@@ -877,9 +877,8 @@ def test_sdf(dtype):
     [0, 0, 0, 0, 0, 0, 0],
   ], dtype=dtype)
 
-  # sdf uses legacy edt internally, so compare against legacy formula
-  import edt_legacy
-  ans = edt_legacy.edt(labels) - edt_legacy.edt(labels == 0)
+  # sdf = edt(foreground) - edt(background)
+  ans = edt.edt(labels) - edt.edt(labels == 0)
   res = edt.sdf(labels)
   assert np.all(res == ans)
 

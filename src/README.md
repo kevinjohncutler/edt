@@ -24,17 +24,7 @@ Within a segment, distance grows quadratically from each end: 1, 4, 9, 16...
 
 For each subsequent axis, we need to combine the previous distances with distances along the new axis. This is done efficiently using the "lower envelope of parabolas" algorithm.
 
-**Intuition**: Each voxel's squared distance from Pass 0 defines a parabola. When we add distance along a new axis, we're finding where each parabola is the minimum:
-
-```
-Previous squared distances:  [1][4][1]
-                              ╱ │ ╲
-Parabolas:                   ╱  │  ╲    (y = prev_d² + x²)
-                            ╱   │   ╲
-                           ╱    │    ╲
-
-Lower envelope = minimum at each x position
-```
+**Intuition**: Each voxel's squared distance from Pass 0 defines a parabola centered at that voxel. The new distance at any position is the minimum across all parabolas - the "lower envelope".
 
 The algorithm:
 1. Build a stack of "winning" parabolas from left to right
@@ -142,53 +132,49 @@ Notice: No edge between columns 1→2 (label 1 to background) or 2→3 (backgrou
 
 ## Memory Usage
 
-For N voxels:
+Let N = number of voxels. The graph-first architecture minimizes memory by:
 
-| Component | Segment labels | Connectivity graph |
-|-----------|----------------|-------------------|
-| Input | 4N bytes (uint32) | 4N bytes (uint32) |
-| Internal | 4N bytes (uint32) | 1N bytes (uint8) |
-| Output | 4N bytes (float32) | 4N bytes (float32) |
-| **Total** | **12N bytes** | **9N bytes** |
+1. Preserving input dtype (no forced uint32 conversion)
+2. When building from labels: graph is allocated in C++ and freed before return
+3. Output is float32 (4N bytes)
 
-**Theoretical savings**: 3N bytes (25% reduction)
+Graph size: 1N bytes (uint8) for 2D-4D, 2N bytes (uint16) for 5D+.
 
-**Example** (4001x4001 = 16M voxels):
+**Peak memory during `edtsq()` (2D-4D)**: ~5N bytes (4N output + 1N graph)
 
-| Component | Segment labels | Connectivity graph |
-|-----------|----------------|-------------------|
-| Input | 64 MB | 64 MB |
-| Internal | 64 MB | 16 MB |
-| Output | 64 MB | 64 MB |
-| **Total** | **192 MB** | **144 MB** |
+| Input dtype | Graph-first | Label-segment | Savings |
+|-------------|-------------|---------------|---------|
+| uint8  | 5N | 5N | 0.0% |
+| uint16 | 5N | 6N | 16.7% |
+| uint32 | 5N | 8N | 37.5% |
 
-**Savings**: 48 MB (25%)
+Graph-first peak is constant. Label-segment peak grows with input dtype.
 
 ## Implementation Details
 
-### Fused Passes
+### Segment Detection
 
-Segment detection is fused into each EDT pass (no separate labeling step):
+Both graph-first and label-segment approaches use fused segment detection - boundaries are detected during the EDT passes rather than in a separate labeling step.
 
-1. **Pass 0**: For each scanline, iterate through voxels. When edge bit is clear, we've hit a boundary - process the completed segment, start a new one.
+The difference is how boundaries are detected:
 
-2. **Passes 1+**: Same boundary detection via edge bits, but applies parabolic envelope algorithm to combine distances.
+- **Graph-first**: Check edge bits (`if !(graph[i] & bit)`)
+- **Label-segment**: Compare adjacent labels (`if labels[i] != labels[i+1]`)
 
-This avoids:
-- Separate segment label allocation
-- Separate segment-building passes
-- Extra memory bandwidth from reading labels
+The graph approach uses less memory bandwidth (1-2 bytes vs 4 bytes per voxel for uint32 labels).
 
 ### Threading
 
-Each pass is parallelized across independent scanlines. Uses shared thread pool with work-based capping:
+Each pass is parallelized across independent scanlines using a shared thread pool.
+
+This implementation adds work-based capping to avoid thread overhead on small arrays:
 - < 60K voxels: max 4 threads
 - < 120K voxels: max 8 threads
 - < 400K voxels: max 12 threads
 
 ### Axis Processing Order
 
-Critical for cache efficiency: process innermost axis (stride=1) first, then work outward to larger strides. This ensures sequential memory access patterns in the cache-critical passes.
+Both implementations process the innermost axis (stride=1) first, then work outward to larger strides. This ensures sequential memory access patterns in the cache-critical first pass.
 
 ## References
 
