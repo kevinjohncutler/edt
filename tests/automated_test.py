@@ -719,62 +719,6 @@ def test_numpy_anisotropy():
   resolution = np.array([4,4,40])
   res = edt.edtsq(labels, anisotropy=resolution)
 
-@pytest.mark.skip(reason="voxel_graph support pending reintegration with legacy path")
-def test_voxel_connectivity_graph_2d():
-  labels = np.array([
-    [1, 1, 1, 1, 1, 1],
-    [1, 1, 1, 1, 1, 1],
-    [1, 1, 1, 1, 1, 1],
-    [1, 1, 1, 1, 1, 1],
-    [1, 1, 1, 1, 1, 1],
-  ])
-
-  omni = 0b111111
-  noxf = 0b111110
-  noxb = 0b111101
-
-  graph = np.array([
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-  ], dtype=np.uint8)
-
-  dt = edt.edt(labels, voxel_graph=graph)
-  assert np.all(dt == np.inf)
-
-  dt = edt.edt(labels, voxel_graph=graph, black_border=True)
-  assert np.all(dt == np.array([
-    [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
-    [0.5, 1.5, 1.5, 1.5, 1.5, 0.5],
-    [0.5, 1.5, 2.5, 2.5, 1.5, 0.5],
-    [0.5, 1.5, 1.5, 1.5, 1.5, 0.5],
-    [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-  ]))
-
-  graph = np.array([
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, noxf, noxb, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-    [omni, omni, omni, omni, omni, omni],
-  ], dtype=np.uint8, order="C")
-  dt = edt.edt(labels, voxel_graph=graph, black_border=True)
-
-  ans = np.array([
-    [1,        1,        1,        1,        1,        1],
-    [1,        1.8027756,1.118034, 1.118034, 1.8027756,1],
-    [1,        1.5,      0.5,      0.5,      1.5,      1],
-    [1,        1.8027756,1.118034, 1.118034, 1.8027756,1],
-    [1,        1,        1,        1,        1,        1]
-  ])
-  assert np.all(np.abs(dt - ans)) < 0.000002
-
-  graph = np.asfortranarray(graph)
-  dt = edt.edt(labels, voxel_graph=graph, black_border=True)
-  assert np.all(np.abs(dt - ans)) < 0.000002
-
 def test_small_anisotropy():
   d = np.array([
     [True, True ], 

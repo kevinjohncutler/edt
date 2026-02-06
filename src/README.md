@@ -102,33 +102,6 @@ Formula: `bit_position = 2 * (ndim - 1 - axis)`
 
 Note: Bit 7 is reserved for the foreground marker, so 4D is the maximum for uint8.
 
-**Example values for 2D**:
-```
-0   = background
-128 = foreground, no edges (isolated/corner)
-129 = foreground + right edge (axis 1)
-132 = foreground + down edge (axis 0)
-133 = foreground + down + right edges
-```
-
-**Visual example**:
-```
-Labels:                    Graph values:
-[[1, 1, 0, 2, 2],         [[133, 132,   0, 133, 132],
- [1, 1, 0, 2, 2],          [129, 128,   0, 129, 128],
- [0, 0, 0, 0, 0],          [  0,   0,   0,   0,   0],
- [3, 3, 3, 0, 0],          [133, 133, 132,   0,   0],
- [3, 3, 3, 0, 0]]          [129, 129, 128,   0,   0]]
-
-Decoded (↓=down edge, →=right edge):
-↓→ ↓    .  ↓→ ↓
- →      .   →
-  .   .   .   .   .
-↓→ ↓→ ↓    .   .
- →  →      .   .
-```
-
-Notice: No edge between columns 1→2 (label 1 to background) or 2→3 (background to label 2).
 
 ## Memory Usage
 
