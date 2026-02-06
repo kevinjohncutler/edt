@@ -1,13 +1,8 @@
 include src/edt.pyx
 include src/edt.hpp
-include src/edt_specific.hpp
-include src/loop.hpp
-include src/nd_barrier_core.hpp
-include src/edt_voxel_graph.hpp
 include src/threadpool.h
-include src_old/edt.pyx
-include src_old/edt.hpp
-include src_old/edt_voxel_graph.hpp
-include src_old/threadpool.h
+include legacy/edt.pyx
+include legacy/edt.hpp
+include legacy/threadpool.h
 include COPYING
 include COPYING.LESSER

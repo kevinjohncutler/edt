@@ -74,26 +74,6 @@ extensions = [
     extra_link_args=extra_link_args_legacy,
     define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
   ),
-  # ND v1 (segment-label based, for comparison)
-  setuptools.Extension(
-    'edt_nd_v1',
-    sources=['nd_v1/edt.pyx'],
-    language='c++',
-    include_dirs=['nd_v1', str(NumpyImport())],
-    extra_compile_args=extra_compile_args_nd,
-    extra_link_args=extra_link_args_nd,
-    define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-  ),
-  # Barrier-based implementation (for comparison)
-  setuptools.Extension(
-    'edt_barrier',
-    sources=['src_barrier/edt_barrier.pyx'],
-    language='c++',
-    include_dirs=['src_barrier', str(NumpyImport())],
-    extra_compile_args=extra_compile_args_nd,
-    extra_link_args=extra_link_args_nd,
-    define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-  ),
 ]
 
 setuptools.setup(
