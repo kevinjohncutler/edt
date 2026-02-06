@@ -865,7 +865,6 @@ def test_zero_trailing_2d():
 
 @pytest.mark.parametrize("dtype", INTEGER_TYPES)
 def test_sdf(dtype):
-  """Test signed distance function runs and returns correct shape."""
   labels = np.array([
     [0, 0, 0, 0, 0, 0, 0],
     [0, 0, 0, 0, 0, 0, 0],
@@ -878,13 +877,11 @@ def test_sdf(dtype):
     [0, 0, 0, 0, 0, 0, 0],
   ], dtype=dtype)
 
+  # sdf uses legacy edt internally, so compare against legacy formula
+  import edt_legacy
+  ans = edt_legacy.edt(labels) - edt_legacy.edt(labels == 0)
   res = edt.sdf(labels)
-
-  # Basic sanity checks
-  assert res.shape == labels.shape
-  assert res.dtype == np.float32
-  # Background should be negative (legacy sdf convention)
-  assert np.all(res[labels == 0] < 0)
+  assert np.all(res == ans)
 
 
 
