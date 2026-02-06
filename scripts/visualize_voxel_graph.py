@@ -81,13 +81,16 @@ main_graph_edt = main_edt.edt(voxel_graph=voxel_graph)
 # Legacy EDT with voxel_graph (requires labels)
 legacy_graph_edt = edt_legacy.edt(single_rect, voxel_graph=voxel_graph)
 
-# Dark mode styling
+# Common scale for all images (connectivity max is 4, EDT max is ~3)
+vmax = 4
+
+# Dark mode styling (no outlines)
 plt.style.use('dark_background')
 TEXT_COLOR = '#AAAAAA'
 plt.rcParams.update({
     'text.color': TEXT_COLOR,
     'axes.labelcolor': TEXT_COLOR,
-    'axes.edgecolor': TEXT_COLOR,
+    'axes.edgecolor': 'none',
     'xtick.color': TEXT_COLOR,
     'ytick.color': TEXT_COLOR,
     'figure.facecolor': 'none',
@@ -95,75 +98,71 @@ plt.rcParams.update({
     'savefig.facecolor': 'none',
 })
 
-# Create visualization
+# Create visualization with space for colorbar on right
 fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-fig.suptitle('voxel_graph Comparison: Proper Boundary Graph', fontsize=14, color=TEXT_COLOR)
+fig.subplots_adjust(right=0.92)
 
 # Row 1: Labels and connectivity
 ax = axes[0, 0]
-im = ax.imshow(ground_truth, cmap='tab20', interpolation='nearest')
+ax.imshow(ground_truth, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.set_title(f'Ground Truth Labels\n(two {N}x{N} squares with bg border)')
 ax.set_xticks([])
 ax.set_yticks([])
 
 ax = axes[0, 1]
-im = ax.imshow(single_rect, cmap='tab20', interpolation='nearest')
+ax.imshow(single_rect, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.set_title(f'Single Rectangle\n({N}x{2*N} with bg border)')
 ax.set_xticks([])
 ax.set_yticks([])
 
 ax = axes[0, 2]
-im = ax.imshow(connectivity, cmap='Blues', interpolation='nearest', vmin=0, vmax=4)
+ax.imshow(connectivity, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.axvline(x=PAD+N-0.5, color='red', linestyle='--', linewidth=2)
 ax.set_title('Voxel Graph Connectivity\n(edges per voxel)')
 ax.set_xticks([])
 ax.set_yticks([])
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-# Add text box explaining connectivity
+# Add text box explaining connectivity (semi-transparent background)
 ax = axes[0, 3]
-ax.axis('off')
-ax.text(0.1, 0.7, 'Connectivity = sum of edge bits\n\n'
-        '4 = internal (all 4 neighbors)\n'
-        '3 = edge (3 neighbors)\n'
-        '2 = corner (2 neighbors)\n'
-        '0 = background\n\n'
-        'Red line = barrier (no edges cross)',
-        fontsize=11, verticalalignment='top', fontfamily='monospace', color=TEXT_COLOR,
-        bbox=dict(boxstyle='round', facecolor='#2a2a2a', edgecolor=TEXT_COLOR, alpha=0.9))
+blank = np.zeros_like(ground_truth, dtype=np.float32)
+ax.imshow(blank, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax, alpha=0.5)
+ax.set_xticks([])
+ax.set_yticks([])
+ax.text(0.5, 0.5, 'Edge count per voxel\n\n4 = inside\n3 = edge\n2 = corner\n0 = background\n\nRed line = barrier',
+        fontsize=8, verticalalignment='center', horizontalalignment='center',
+        fontfamily='monospace', color=TEXT_COLOR, transform=ax.transAxes)
 
-# Row 2: EDT results
+# Row 2: EDT results (all same scale)
 ax = axes[1, 0]
-im = ax.imshow(gt_edt, cmap='plasma', interpolation='nearest')
+ax.imshow(gt_edt, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.set_title(f'Ground Truth EDT\nmax={gt_edt.max():.2f}')
 ax.set_xticks([])
 ax.set_yticks([])
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 ax = axes[1, 1]
-im = ax.imshow(single_rect_edt, cmap='plasma', interpolation='nearest')
+ax.imshow(single_rect_edt, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.set_title(f'Single Rect (no graph)\nmax={single_rect_edt.max():.2f}')
 ax.set_xticks([])
 ax.set_yticks([])
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 ax = axes[1, 2]
-im = ax.imshow(main_graph_edt, cmap='plasma', interpolation='nearest')
+ax.imshow(main_graph_edt, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.axvline(x=PAD+N-0.5, color='red', linestyle='--', linewidth=1, alpha=0.5)
 ax.set_title(f'Main EDT + voxel_graph\nmax={main_graph_edt.max():.2f}')
 ax.set_xticks([])
 ax.set_yticks([])
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 ax = axes[1, 3]
-im = ax.imshow(legacy_graph_edt, cmap='plasma', interpolation='nearest')
+im = ax.imshow(legacy_graph_edt, cmap='magma', interpolation='nearest', vmin=0, vmax=vmax)
 ax.axvline(x=PAD+N-0.5, color='red', linestyle='--', linewidth=1, alpha=0.5)
 ax.set_title(f'Legacy EDT + voxel_graph\nmax={legacy_graph_edt.max():.2f}')
 ax.set_xticks([])
 ax.set_yticks([])
-plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-plt.tight_layout()
+# Single colorbar on right side of figure
+cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
+fig.colorbar(im, cax=cbar_ax)
+
 plt.savefig(ROOT / 'voxel_graph_comparison.png', dpi=150, bbox_inches='tight', transparent=True)
 print(f"Saved to {ROOT / 'voxel_graph_comparison.png'}")
 
