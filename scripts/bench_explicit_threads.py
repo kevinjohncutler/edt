@@ -41,7 +41,7 @@ LEGACY_AUTO_CAP = int(os.environ.get('EDT_BENCH_LEGACY_AUTO_CAP', '64'))
 
 def _require_legacy():
     legacy = getattr(edt, 'legacy', None)
-    if legacy is None or not getattr(legacy, 'available', lambda: False)():
+    if legacy is None:
         raise RuntimeError('Legacy module not available; build edt.legacy first.')
     return legacy
 

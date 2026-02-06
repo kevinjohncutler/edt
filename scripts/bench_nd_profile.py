@@ -25,7 +25,7 @@ import edt  # noqa: E402
 
 def _require_legacy():
     legacy = getattr(edt, 'legacy', None)
-    if legacy is None or not getattr(legacy, 'available', lambda: False)():
+    if legacy is None:
         raise ImportError(
             "The legacy edt.legacy extension is required for benchmarking. "
             "Please build/install the legacy module (e.g. `pip install -e .`)."

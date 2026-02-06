@@ -18,9 +18,10 @@ Additional utilities (from edt_barrier):
 
 License: GNU 3.0
 
-Original EDT: William Silversmith (Seung Lab, Princeton), 2018-2023
-ND connectivity graph EDT: Kevin Cutler, 2026
+Original EDT: William Silversmith (Seung Lab, Princeton),  August 2018 - February 2026
+ND connectivity graph EDT: Kevin Cutler, February 2026
 """
+
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
 from libc.stdlib cimport malloc, free
 from libcpp cimport bool as native_bool
