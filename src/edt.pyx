@@ -253,6 +253,13 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
 
+    global _nd_profile_last
+    _nd_profile_last = {
+        'shape': shape,
+        'dims': nd,
+        'parallel_used': parallel,
+    }
+
     cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
     cdef float* canis = <float*> malloc(nd * sizeof(float))
     if cshape == NULL or canis == NULL:
@@ -360,6 +367,13 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
+
+    global _nd_profile_last
+    _nd_profile_last = {
+        'shape': shape,
+        'dims': nd,
+        'parallel_used': parallel,
+    }
 
     cdef size_t total = 1
     cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
@@ -810,10 +824,9 @@ def edtsq_nd(data, anisotropy=None, black_border=False, int parallel=1, voxel_gr
     """ND squared EDT - alias for edtsq() which uses unified ND implementation."""
     return edtsq(data, anisotropy=anisotropy, black_border=black_border, parallel=parallel, voxel_graph=voxel_graph, order=order)
 
-# Profiling stub (no-op since we don't have barrier's profiling)
 _nd_profile_last = None
 def edtsq_nd_last_profile():
-    """Return the last ND profile (stub - profiling not implemented in graph-first path)."""
+    """Return the last ND profile."""
     return _nd_profile_last
 
 # Thread limiting heuristics
