@@ -16,6 +16,18 @@ Key methods:
 Additional utilities (from edt_barrier):
   feature_transform, expand_labels, each, sdf
 
+Programmatic configuration:
+  edt.configure(...) - set threading parameters in-process (see configure docstring)
+
+Environment Variables (runtime):
+  EDT_ADAPTIVE_THREADS      - 0/1, enable adaptive thread limiting by array size (default: 1)
+  EDT_ND_MIN_VOXELS_PER_THREAD - min voxels per thread for ND>=4 arrays (default: 50000)
+  EDT_ND_MIN_LINES_PER_THREAD  - min lines per thread for ND>=4 arrays (default: 32)
+  EDT_ND_PROFILE            - set to 1 to enable per-call profiling output
+
+Environment Variables (build-time):
+  EDT_MARCH_NATIVE          - 0/1, compile with -march=native (default: 1)
+
 License: GNU 3.0
 
 Original EDT: William Silversmith (Seung Lab, Princeton),  August 2018 - February 2026
@@ -851,7 +863,40 @@ _ND_3D_MAX_THREADS = [1, 2, 4]
 _ND_MIN_VOXELS_PER_THREAD_DEFAULT = 50000
 _ND_MIN_LINES_PER_THREAD_DEFAULT = 32
 
+# In-process overrides set via configure(), take priority over env vars
+_ND_CONFIG = {}
+
+def configure(
+    adaptive_threads=None,
+    min_voxels_per_thread=None,
+    min_lines_per_thread=None,
+):
+    """
+    Set EDT threading parameters programmatically, overriding environment
+    variables for the current process.
+
+    Parameters
+    ----------
+    adaptive_threads : bool or None
+        Enable adaptive thread limiting based on array size.
+        Overrides EDT_ADAPTIVE_THREADS.
+    min_voxels_per_thread : int or None
+        Minimum voxels per thread for ND>=4 arrays.
+        Overrides EDT_ND_MIN_VOXELS_PER_THREAD.
+    min_lines_per_thread : int or None
+        Minimum lines per thread for ND>=4 arrays.
+        Overrides EDT_ND_MIN_LINES_PER_THREAD.
+    """
+    if adaptive_threads is not None:
+        _ND_CONFIG['EDT_ADAPTIVE_THREADS'] = int(bool(adaptive_threads))
+    if min_voxels_per_thread is not None:
+        _ND_CONFIG['EDT_ND_MIN_VOXELS_PER_THREAD'] = int(min_voxels_per_thread)
+    if min_lines_per_thread is not None:
+        _ND_CONFIG['EDT_ND_MIN_LINES_PER_THREAD'] = int(min_lines_per_thread)
+
 def _env_int(name, default):
+    if name in _ND_CONFIG:
+        return _ND_CONFIG[name]
     try:
         return int(os.environ.get(name, default))
     except Exception:
@@ -866,10 +911,7 @@ def _apply_thresholds(val, thresholds, max_threads, capped):
 def _adaptive_thread_limit_nd(parallel, shape, requested=None):
     """General ND thread limiter matching 2D/3D heuristics."""
     parallel = max(1, parallel)
-    try:
-        adapt_enabled = bool(int(os.environ.get('EDT_ADAPTIVE_THREADS', '1')))
-    except Exception:
-        adapt_enabled = True
+    adapt_enabled = bool(_env_int('EDT_ADAPTIVE_THREADS', 1))
     if not adapt_enabled:
         return parallel
     dims = len(shape)

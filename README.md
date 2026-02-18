@@ -353,6 +353,37 @@ def ndimage_test():
 
 ```
 
+### Environment Variables
+
+Threading behavior can be controlled via environment variables or programmatically using `edt.configure()`.
+
+**Runtime:**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EDT_ADAPTIVE_THREADS` | `1` | Enable adaptive thread limiting based on array size. Set to `0` to always use the requested thread count. |
+| `EDT_ND_MIN_VOXELS_PER_THREAD` | `50000` | Minimum voxels per thread for ND≥4 arrays. |
+| `EDT_ND_MIN_LINES_PER_THREAD` | `32` | Minimum lines per thread for ND≥4 arrays. |
+| `EDT_ND_PROFILE` | unset | Set to `1` to enable per-call profiling output. |
+
+**Build-time:**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EDT_MARCH_NATIVE` | `1` | Compile with `-march=native` for the current CPU. Set to `0` to disable. |
+
+**Programmatic override** (takes priority over environment variables):
+
+```python
+import edt
+
+# Disable adaptive thread limiting for this process
+edt.configure(adaptive_threads=False)
+
+# Lower thread thresholds for small arrays
+edt.configure(min_voxels_per_thread=1000, min_lines_per_thread=4)
+```
+
 ### References
 
 1. M. Sato, I. Bitter, M.A. Bender, A.E. Kaufman, and M. Nakajima. "TEASAR: Tree-structure Extraction Algorithm for Accurate and Robust Skeletons". Proc. 8th Pacific Conf. on Computer Graphics and Applications. Oct. 2000. doi: 10.1109/PCCGA.2000.883951 ([link](https://ieeexplore.ieee.org/abstract/document/883951/))
