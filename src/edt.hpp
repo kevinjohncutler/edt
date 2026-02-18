@@ -28,16 +28,7 @@
 #include <mutex>
 #include <unordered_map>
 #include "threadpool.h"
-
-// Prefetch support
-#if defined(__GNUC__) || defined(__clang__)
-#  define ND_PREFETCH(addr) __builtin_prefetch((addr), 0, 1)
-#elif defined(_MSC_VER)
-#  include <xmmintrin.h>
-#  define ND_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
-#else
-#  define ND_PREFETCH(addr) do {} while(0)
-#endif
+#include "hedley.h"
 
 namespace nd {
 
