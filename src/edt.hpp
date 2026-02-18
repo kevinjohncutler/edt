@@ -2505,46 +2505,46 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
     const long int arg_stride
 ) {
     if (n == 0) return;
-    const float w2 = anisotropy * anisotropy;
+    const double w2 = (double)anisotropy * anisotropy;
 
     int k = 0;
     std::unique_ptr<int[]> v(new int[n]());
-    std::unique_ptr<float[]> ff(new float[n]());
+    std::unique_ptr<double[]> ff(new double[n]());
     for (long int i = 0; i < n; i++) ff[i] = f[i * stride];
-    std::unique_ptr<float[]> ranges(new float[n + 1]());
-    ranges[0] = -std::numeric_limits<float>::infinity();
-    ranges[1] = std::numeric_limits<float>::infinity();
+    std::unique_ptr<double[]> ranges(new double[n + 1]());
+    ranges[0] = -std::numeric_limits<double>::infinity();
+    ranges[1] = std::numeric_limits<double>::infinity();
 
-    float s, factor1, factor2;
+    double s, factor1, factor2;
     for (long int i = 1; i < n; i++) {
         factor1 = (i - v[k]) * w2;
         factor2 = i + v[k];
-        s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+        s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0 * factor1);
         while (k > 0 && s <= ranges[k]) {
             k--;
             factor1 = (i - v[k]) * w2;
             factor2 = i + v[k];
-            s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
+            s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0 * factor1);
         }
         k++;
         v[k] = i;
         ranges[k] = s;
-        ranges[k + 1] = std::numeric_limits<float>::infinity();
+        ranges[k + 1] = std::numeric_limits<double>::infinity();
     }
 
     k = 0;
-    float envelope;
+    double envelope;
     for (long int i = 0; i < n; i++) {
         while (ranges[k + 1] < i) k++;
-        f[i * stride] = w2 * sq_f(i - v[k]) + ff[v[k]];
+        f[i * stride] = (float)(w2 * (i - v[k]) * (i - v[k]) + ff[v[k]]);
         arg_out[i * arg_stride] = v[k];
         if (black_border_left && black_border_right) {
-            envelope = std::fmin(w2 * sq_f(i + 1), w2 * sq_f(n - i));
-            f[i * stride] = std::fmin(envelope, f[i * stride]);
+            envelope = std::fmin(w2 * (i + 1) * (i + 1), w2 * (n - i) * (n - i));
+            f[i * stride] = (float)std::fmin(envelope, (double)f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = std::fmin(w2 * sq_f(i + 1), f[i * stride]);
+            f[i * stride] = (float)std::fmin(w2 * (i + 1) * (i + 1), (double)f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = std::fmin(w2 * sq_f(n - i), f[i * stride]);
+            f[i * stride] = (float)std::fmin(w2 * (n - i) * (n - i), (double)f[i * stride]);
         }
     }
 }
