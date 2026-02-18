@@ -1199,13 +1199,25 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
             ff[i] = f[(start + i) * stride];
         }
 
+        // Skip INF-valued sources when building the parabolic envelope.
+        // INF sources never win the minimum, and INF - INF = NaN corrupts
+        // the intersection formula, leaving all subsequent ranges as NaN
+        // and preventing the output pass from ever advancing k.
+        int first_src = 0;
+        while (first_src < len && std::isinf(ff[first_src])) first_src++;
+
         int k = 0;
-        v[0] = 0;
+        // If all sources are INF, fall back to v[0]=0 with ff[0]=INF so
+        // the output pass correctly produces INF (borders still applied).
+        v[0] = (first_src < len) ? first_src : 0;
         ranges[0] = -std::numeric_limits<float>::infinity();
         ranges[1] = std::numeric_limits<float>::infinity();
 
         float s, factor1, factor2;
-        for (int i = 1; i < len; i++) {
+        const int loop_start = (first_src < len) ? first_src + 1 : len;
+        for (int i = loop_start; i < len; i++) {
+            if (std::isinf(ff[i])) continue;  // INF never wins the minimum
+
             factor1 = (i - v[k]) * w2;
             factor2 = i + v[k];
             s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);

@@ -59,6 +59,21 @@ def _graph_dtype(ndim):
     return (np.uint8, np.uint16, np.uint32, np.uint64)[(ndim - 1) // 4]
 
 
+def _prepare_array(arr, dtype):
+    """Return (contiguous_array, is_fortran).
+
+    Preserves F-contiguous layout to avoid an unnecessary copy.
+    Checks C-contiguous first so arrays that satisfy both (e.g. 1D or
+    size-1 dimensions) take the cheaper C path.
+    """
+    if arr.flags.c_contiguous:
+        return np.ascontiguousarray(arr, dtype=dtype), False
+    if arr.flags.f_contiguous:
+        return np.asfortranarray(arr, dtype=dtype), True
+    # Non-contiguous: force C-order copy
+    return np.ascontiguousarray(arr, dtype=dtype), False
+
+
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
     cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
@@ -261,7 +276,7 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     elif dtype not in (np.uint8, np.uint16, np.uint32, np.uint64):
         dtype = np.uint32  # Fallback for signed/float types
 
-    labels = np.ascontiguousarray(labels, dtype=dtype)
+    labels, is_fortran = _prepare_array(labels, dtype)
     cdef size_t nd = labels.ndim
     cdef tuple shape = labels.shape
 
@@ -277,6 +292,11 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
 
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
+
+    # For F-contiguous arrays, reverse shape and anisotropy so C++ sees a
+    # C-order array of reversed shape — same memory, no copy.
+    cpp_shape = tuple(reversed(shape)) if is_fortran else shape
+    cpp_anis  = tuple(reversed(anisotropy)) if is_fortran else anisotropy
 
     global _nd_profile_last
     _nd_profile_last = {
@@ -296,10 +316,10 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
 
     cdef size_t i
     for i in range(nd):
-        cshape[i] = <size_t>shape[i]
-        canis[i] = <float>anisotropy[i]
+        cshape[i] = <size_t>cpp_shape[i]
+        canis[i] = <float>cpp_anis[i]
 
-    cdef np.ndarray output = np.zeros(shape, dtype=np.float32)
+    cdef np.ndarray output = np.zeros(cpp_shape, dtype=np.float32)
     cdef float* outp = <float*> np.PyArray_DATA(output)
     cdef native_bool bb = black_border
     cdef int par = parallel
@@ -339,6 +359,8 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
         free(cshape)
         free(canis)
 
+    if is_fortran:
+        return output.T
     return output
 
 
@@ -378,7 +400,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     cdef tuple shape = graph.shape
 
     graph_dtype = _graph_dtype(nd)
-    graph = np.ascontiguousarray(graph, dtype=graph_dtype)
+    graph, is_fortran = _prepare_array(graph, graph_dtype)
 
     if anisotropy is None:
         anisotropy = tuple([1.0] * nd)
@@ -392,6 +414,9 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
+
+    cpp_shape = tuple(reversed(shape)) if is_fortran else shape
+    cpp_anis  = tuple(reversed(anisotropy)) if is_fortran else anisotropy
 
     global _nd_profile_last
     _nd_profile_last = {
@@ -412,11 +437,11 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     cdef size_t i
     for i in range(nd):
-        cshape[i] = <size_t>shape[i]
-        canis[i] = <float>anisotropy[i]
+        cshape[i] = <size_t>cpp_shape[i]
+        canis[i] = <float>cpp_anis[i]
         total *= cshape[i]
 
-    cdef np.ndarray output = np.zeros(shape, dtype=np.float32)
+    cdef np.ndarray output = np.zeros(cpp_shape, dtype=np.float32)
     cdef float* outp = <float*> np.PyArray_DATA(output)
 
     cdef native_bool bb = black_border
@@ -442,6 +467,8 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
         free(cshape)
         free(canis)
 
+    if is_fortran:
+        return output.T
     return output
 
 
