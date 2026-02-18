@@ -335,7 +335,8 @@ def edt(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_grap
 
     Returns the square root of edtsq.
     """
-    return np.sqrt(edtsq(labels, anisotropy, black_border, parallel, voxel_graph, order))
+    dt = edtsq(labels, anisotropy, black_border, parallel, voxel_graph, order)
+    return np.sqrt(dt, out=dt)
 
 
 def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
@@ -437,7 +438,8 @@ def edt_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     Returns the square root of edtsq_graph.
     """
-    return np.sqrt(edtsq_graph(graph, anisotropy, black_border, parallel))
+    dt = edtsq_graph(graph, anisotropy, black_border, parallel)
+    return np.sqrt(dt, out=dt)
 
 
 def build_graph(labels, parallel=0):
