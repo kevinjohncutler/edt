@@ -32,6 +32,20 @@ import numpy as np
 import multiprocessing
 
 
+def _graph_dtype(ndim):
+    """Return the minimal uint dtype for a connectivity graph of ndim dimensions.
+
+    Each axis occupies 2 bits, so max bit = 2*(ndim-1):
+      dims 1-4  -> uint8  (max bit 6)
+      dims 5-8  -> uint16 (max bit 14)
+      dims 9-12 -> uint32 (max bit 22)
+      dims 13-16 -> uint64 (max bit 30)
+    """
+    if ndim > 16:
+        raise ValueError(f"EDT supports at most 16 dimensions, got {ndim}.")
+    return (np.uint8, np.uint16, np.uint32, np.uint64)[(ndim - 1) // 4]
+
+
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
     cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
@@ -172,9 +186,7 @@ def _voxel_graph_to_nd(voxel_graph, labels=None):
 
     # Extract positive direction bits (these match ND edge bits)
     # Use minimal dtype based on ndim (not input dtype) to avoid large intermediates
-    # Bit encoding: 2*(ndim-1) bits for edges + bit 7 for foreground
-    # Dtype doubles every 4 dims: 2-4D → uint8, 5-8D → uint16, 9-12D → uint32, 13-16D → uint64
-    mask_dtype = (np.uint8, np.uint16, np.uint32, np.uint64)[min((ndim - 1) // 4, 3)]
+    mask_dtype = _graph_dtype(ndim)
     graph = voxel_graph.astype(mask_dtype, copy=False) & mask_dtype(pos_mask)
     # Keep mask_dtype - don't truncate to uint8 (5D+ needs higher bits)
 
@@ -351,8 +363,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     cdef size_t nd = graph.ndim
     cdef tuple shape = graph.shape
 
-    # Select dtype based on ndim: 2-4D -> uint8, 5-8D -> uint16, 9-12D -> uint32, 13-16D -> uint64
-    graph_dtype = (np.uint8, np.uint16, np.uint32, np.uint64)[min((nd - 1) // 4, 3)]
+    graph_dtype = _graph_dtype(nd)
     graph = np.ascontiguousarray(graph, dtype=graph_dtype)
 
     if anisotropy is None:
