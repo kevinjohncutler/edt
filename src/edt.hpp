@@ -2150,7 +2150,7 @@ inline void build_connectivity_graph(
         const int64_t n = static_cast<int64_t>(shape[0]);
         constexpr GRAPH_T BIT = 0x01;  // axis 0 bit for 1D
 
-        auto process_1d = [&](int64_t start, int64_t end) {
+        auto process_1d = [=](int64_t start, int64_t end) {
             for (int64_t i = start; i < end; i++) {
                 const T label = labels[i];
                 GRAPH_T g = (label != 0) ? FG : 0;
@@ -2176,150 +2176,8 @@ inline void build_connectivity_graph(
     }
 
     //-------------------------------------------------------------------------
-    // 2D path: optimized with constexpr bits and background chunk skipping
-    //-------------------------------------------------------------------------
-    if (dims == 2) {
-        const int64_t nrows = static_cast<int64_t>(shape[0]);
-        const int64_t ncols = static_cast<int64_t>(shape[1]);
-        constexpr GRAPH_T DOWN = 0x04;   // axis 0 bit for 2D
-        constexpr GRAPH_T RIGHT = 0x01;  // axis 1 bit for 2D
-        constexpr int64_t CHUNK = 8;     // Process 8 pixels at a time for background skip
-
-        auto process_2d = [&](int64_t r0, int64_t r1) {
-            for (int64_t r = r0; r < r1; r++) {
-                const T* rl = labels + r * ncols;
-                GRAPH_T* rg = graph + r * ncols;
-                const bool can_down = (r + 1 < nrows);
-                const T* rl_next = can_down ? (rl + ncols) : nullptr;
-
-                // Chunk-based processing with background skip
-                int64_t c = 0;
-                const int64_t ncols_chunked = ncols - (ncols % CHUNK);
-                for (; c < ncols_chunked; c += CHUNK) {
-                    // Quick check: OR all labels - if zero, all background
-                    T any_fg = rl[c] | rl[c+1] | rl[c+2] | rl[c+3] |
-                               rl[c+4] | rl[c+5] | rl[c+6] | rl[c+7];
-                    if (any_fg == 0) {
-                        // All background - zero the graph chunk
-                        std::memset(rg + c, 0, CHUNK * sizeof(GRAPH_T));
-                    } else {
-                        // At least one foreground - process individually
-                        for (int64_t i = 0; i < CHUNK; i++) {
-                            const int64_t ci = c + i;
-                            const T label = rl[ci];
-                            GRAPH_T g = (label != 0) ? FG : 0;
-                            if (label != 0) {
-                                if (ci + 1 < ncols && rl[ci + 1] == label) g |= RIGHT;
-                                if (can_down && rl_next[ci] == label) g |= DOWN;
-                            }
-                            rg[ci] = g;
-                        }
-                    }
-                }
-                // Handle remaining columns
-                for (; c < ncols; c++) {
-                    const T label = rl[c];
-                    GRAPH_T g = (label != 0) ? FG : 0;
-                    if (label != 0) {
-                        if (c + 1 < ncols && rl[c + 1] == label) g |= RIGHT;
-                        if (can_down && rl_next[c] == label) g |= DOWN;
-                    }
-                    rg[c] = g;
-                }
-            }
-        };
-        if (threads > 1 && nrows > 100) {
-            ThreadPool& pool = shared_pool_for(threads);
-            std::vector<std::future<void>> pending;
-            int64_t per_t = (nrows + threads - 1) / threads;
-            for (int t = 0; t < threads; t++) {
-                int64_t s = t * per_t, e = std::min(s + per_t, nrows);
-                if (s < e) pending.push_back(pool.enqueue([=]() { process_2d(s, e); }));
-            }
-            for (auto& f : pending) f.get();
-        } else {
-            process_2d(0, nrows);
-        }
-        return;
-    }
-
-    //-------------------------------------------------------------------------
-    // 3D path: optimized with constexpr bits and background chunk skipping
-    //-------------------------------------------------------------------------
-    if (dims == 3) {
-        const int64_t nz = static_cast<int64_t>(shape[0]);
-        const int64_t ny = static_cast<int64_t>(shape[1]);
-        const int64_t nx = static_cast<int64_t>(shape[2]);
-        const int64_t stride_z = ny * nx;
-        const int64_t stride_y = nx;
-        constexpr GRAPH_T BACK = 0x10;   // axis 0 bit (z)
-        constexpr GRAPH_T DOWN = 0x04;   // axis 1 bit (y)
-        constexpr GRAPH_T RIGHT = 0x01;  // axis 2 bit (x)
-        constexpr int64_t CHUNK = 8;     // Process 8 voxels at a time for background skip
-
-        auto process_3d = [&](int64_t z0, int64_t z1) {
-            for (int64_t z = z0; z < z1; z++) {
-                const bool can_back = (z + 1 < nz);
-                for (int64_t y = 0; y < ny; y++) {
-                    const bool can_down = (y + 1 < ny);
-                    const int64_t base = z * stride_z + y * stride_y;
-                    const T* row = labels + base;
-                    GRAPH_T* rowg = graph + base;
-
-                    // Chunk-based processing with background skip
-                    int64_t x = 0;
-                    const int64_t nx_chunked = nx - (nx % CHUNK);
-                    for (; x < nx_chunked; x += CHUNK) {
-                        // Quick check: OR all labels - if zero, all background
-                        T any_fg = row[x] | row[x+1] | row[x+2] | row[x+3] |
-                                   row[x+4] | row[x+5] | row[x+6] | row[x+7];
-                        if (any_fg == 0) {
-                            std::memset(rowg + x, 0, CHUNK * sizeof(GRAPH_T));
-                        } else {
-                            for (int64_t i = 0; i < CHUNK; i++) {
-                                const int64_t xi = x + i;
-                                const T label = row[xi];
-                                GRAPH_T g = (label != 0) ? FG : 0;
-                                if (label != 0) {
-                                    if (xi + 1 < nx && row[xi + 1] == label) g |= RIGHT;
-                                    if (can_down && labels[base + stride_y + xi] == label) g |= DOWN;
-                                    if (can_back && labels[base + stride_z + xi] == label) g |= BACK;
-                                }
-                                rowg[xi] = g;
-                            }
-                        }
-                    }
-                    // Handle remaining voxels
-                    for (; x < nx; x++) {
-                        const T label = row[x];
-                        GRAPH_T g = (label != 0) ? FG : 0;
-                        if (label != 0) {
-                            if (x + 1 < nx && row[x + 1] == label) g |= RIGHT;
-                            if (can_down && labels[base + stride_y + x] == label) g |= DOWN;
-                            if (can_back && labels[base + stride_z + x] == label) g |= BACK;
-                        }
-                        rowg[x] = g;
-                    }
-                }
-            }
-        };
-        if (threads > 1 && nz > 4) {
-            ThreadPool& pool = shared_pool_for(threads);
-            std::vector<std::future<void>> pending;
-            int64_t per_t = (nz + threads - 1) / threads;
-            for (int t = 0; t < threads; t++) {
-                int64_t s = t * per_t, e = std::min(s + per_t, nz);
-                if (s < e) pending.push_back(pool.enqueue([=]() { process_3d(s, e); }));
-            }
-            for (auto& f : pending) f.get();
-        } else {
-            process_3d(0, nz);
-        }
-        return;
-    }
-
-    //-------------------------------------------------------------------------
-    // Unified ND path for 4D+ - parallelize over first dimension
+    // Unified ND path for 2D+ - parallelize over first dimension with
+    // chunk-based background skipping on the inner loop
     //-------------------------------------------------------------------------
     int64_t strides[8];
     int64_t shape64[8];
@@ -2382,25 +2240,39 @@ inline void build_connectivity_graph(
                     mid_bits[md] = axis_bits[d];
                 }
 
-                // Tight inner loop over last dimension (stride=1)
-                for (int64_t x = 0; x < last_extent; x++) {
+                // Inner loop over last dimension with chunk-based background skipping
+                constexpr int64_t CHUNK = 8;
+                int64_t x = 0;
+                const int64_t last_chunked = last_extent - (last_extent % CHUNK);
+                for (; x < last_chunked; x += CHUNK) {
+                    T any_fg = row[x]   | row[x+1] | row[x+2] | row[x+3] |
+                               row[x+4] | row[x+5] | row[x+6] | row[x+7];
+                    if (any_fg == 0) {
+                        std::memset(rowg + x, 0, CHUNK * sizeof(GRAPH_T));
+                    } else {
+                        for (int64_t i = 0; i < CHUNK; i++) {
+                            const int64_t xi = x + i;
+                            const T label = row[xi];
+                            GRAPH_T g = (label != 0) ? FG : 0;
+                            if (label != 0) {
+                                if (xi + 1 < last_extent && row[xi + 1] == label) g |= last_bit;
+                                if (can_d0 && row_d0_next[xi] == label) g |= first_bit;
+                                for (size_t md = 0; md < num_mid; md++) {
+                                    if (mid_can_check[md] && mid_neighbor_row[md][xi] == label) g |= mid_bits[md];
+                                }
+                            }
+                            rowg[xi] = g;
+                        }
+                    }
+                }
+                for (; x < last_extent; x++) {
                     const T label = row[x];
                     GRAPH_T g = (label != 0) ? FG : 0;
-
                     if (label != 0) {
-                        // Last dim neighbor (simple pointer access)
-                        if (x + 1 < last_extent && row[x + 1] == label) {
-                            g |= last_bit;
-                        }
-                        // First dim neighbor (precomputed pointer)
-                        if (can_d0 && row_d0_next[x] == label) {
-                            g |= first_bit;
-                        }
-                        // Middle dimensions - use precomputed pointers
+                        if (x + 1 < last_extent && row[x + 1] == label) g |= last_bit;
+                        if (can_d0 && row_d0_next[x] == label) g |= first_bit;
                         for (size_t md = 0; md < num_mid; md++) {
-                            if (mid_can_check[md] && mid_neighbor_row[md][x] == label) {
-                                g |= mid_bits[md];
-                            }
+                            if (mid_can_check[md] && mid_neighbor_row[md][x] == label) g |= mid_bits[md];
                         }
                     }
                     rowg[x] = g;

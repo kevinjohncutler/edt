@@ -42,6 +42,7 @@ np.import_array()
 
 import numpy as np
 import multiprocessing
+import os
 
 
 def _graph_dtype(ndim):
@@ -855,7 +856,6 @@ def edtsq_nd_last_profile():
     return _nd_profile_last
 
 # Thread limiting heuristics
-import os
 _ND_2D_THRESHOLDS = [100000, 500000, 1000000]
 _ND_2D_MAX_THREADS = [1, 2, 4]
 _ND_3D_THRESHOLDS = [64, 128, 256]
@@ -945,7 +945,7 @@ def _adaptive_thread_limit_nd(parallel, shape, requested=None):
 
 
 def feature_transform(data, anisotropy=None, black_border=False, int parallel=1, return_distances=False, features_dtype='auto'):
-    """ND feature transform (nearest seed) with optional squared distances.
+    """ND feature transform (nearest seed) with optional Euclidean distances.
 
     Parameters
     ----------
@@ -958,22 +958,24 @@ def feature_transform(data, anisotropy=None, black_border=False, int parallel=1,
     parallel : int, optional
         Number of threads; if <= 0, uses cpu_count().
     return_distances : bool, optional
-        If True, also return squared EDT of the seed mask.
-    features_dtype : str, optional
-        Output dtype for features: 'auto', 'uint32', 'u32', or 'uintp'.
+        If True, also return the EDT of the seed mask.
+    features_dtype : dtype-like, optional
+        Output dtype for the feature index array. Accepts any value accepted
+        by np.dtype() (e.g. np.uint32, 'uint64'). Defaults to np.uint32 for
+        arrays with fewer than 2**32 voxels, np.uint64 otherwise.
 
     Returns
     -------
     feat : ndarray
         Linear index of nearest seed for each voxel.
     dist : ndarray of float32, optional
-        Squared Euclidean distance, if return_distances=True.
+        Euclidean distance to nearest seed, if return_distances=True.
     """
     arr = np.asarray(data)
     if arr.size == 0:
         if return_distances:
-            return np.zeros_like(arr, dtype=np.uintp), np.zeros_like(arr, dtype=np.float32)
-        return np.zeros_like(arr, dtype=np.uintp)
+            return np.zeros_like(arr, dtype=np.uint64), np.zeros_like(arr, dtype=np.float32)
+        return np.zeros_like(arr, dtype=np.uint64)
 
     dims = arr.ndim
     if anisotropy is None:
@@ -997,19 +999,15 @@ def feature_transform(data, anisotropy=None, black_border=False, int parallel=1,
     labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, parallel, True)
 
     voxels = arr.size
-    # Apply features_dtype
-    if isinstance(features_dtype, str):
-        fd = features_dtype.lower()
-        if fd in ('uint32', 'u32'):
-            feats = feats.astype(np.uint32, copy=False)
-        elif fd == 'uintp':
-            feats = feats.astype(np.uintp, copy=False)
-        else:  # 'auto'
-            feats = feats.astype(np.uint32 if voxels < 2**32 else np.uintp, copy=False)
+    if features_dtype == 'auto' or features_dtype is None:
+        out_dtype = np.uint32 if voxels < 2**32 else np.uint64
     else:
-        feats = feats.astype(np.uint32 if voxels < 2**32 else np.uintp, copy=False)
+        out_dtype = np.dtype(features_dtype)
+        if not np.issubdtype(out_dtype, np.unsignedinteger):
+            raise ValueError(f"features_dtype must be an unsigned integer dtype, got {out_dtype}")
+    feats = feats.astype(out_dtype, copy=False)
 
     if return_distances:
-        dist = edtsq((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel)
+        dist = edt((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel)
         return feats, dist
     return feats
