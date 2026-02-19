@@ -268,15 +268,20 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     if labels is None:
         raise ValueError("labels is required when voxel_graph is not provided")
 
-    # Preserve input dtype where possible to avoid copies
+    # Preserve input dtype where possible to avoid copies.
+    # For signed/float types, use .view() to reinterpret as same-width
+    # unsigned — zero-copy, and equality semantics are identical.
     labels = np.asarray(labels)
     dtype = labels.dtype
     if dtype == np.bool_:
         dtype = np.uint8
     elif dtype not in (np.uint8, np.uint16, np.uint32, np.uint64):
-        dtype = np.uint32  # Fallback for signed/float types
+        unsigned_map = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}
+        dtype = unsigned_map.get(dtype.itemsize, np.uint32)
 
-    labels, is_fortran = _prepare_array(labels, dtype)
+    labels, is_fortran = _prepare_array(labels, labels.dtype)
+    if labels.dtype != dtype:
+        labels = labels.view(dtype)
     cdef size_t nd = labels.ndim
     cdef tuple shape = labels.shape
 
@@ -497,15 +502,20 @@ def build_graph(labels, parallel=0):
     ndarray (uint8)
         Connectivity graph where each byte encodes edge bits.
     """
-    # Preserve input dtype where possible to avoid copies
+    # Preserve input dtype where possible to avoid copies.
+    # For signed/float types, use .view() to reinterpret as same-width
+    # unsigned — zero-copy, and equality semantics are identical.
     labels = np.asarray(labels)
     dtype = labels.dtype
     if dtype == np.bool_:
         dtype = np.uint8
     elif dtype not in (np.uint8, np.uint16, np.uint32, np.uint64):
-        dtype = np.uint32
+        unsigned_map = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}
+        dtype = unsigned_map.get(dtype.itemsize, np.uint32)
 
-    labels = np.ascontiguousarray(labels, dtype=dtype)
+    labels = np.ascontiguousarray(labels, dtype=labels.dtype)
+    if labels.dtype != dtype:
+        labels = labels.view(dtype)
     cdef size_t nd = labels.ndim
     cdef tuple shape = labels.shape
 
