@@ -27,8 +27,16 @@
 #include <future>
 #include <mutex>
 #include <unordered_map>
-#include "threadpool.h"
 #include "hedley.h"
+#include "threadpool.h"
+
+// Portable prefetch hint. hedley detects the compiler; __builtin_prefetch is
+// available on GCC and Clang. Falls back to a no-op on other compilers.
+#if HEDLEY_GCC_VERSION_CHECK(1,0,0) || HEDLEY_HAS_BUILTIN(__builtin_prefetch)
+#  define ND_PREFETCH(addr, rw, locality) __builtin_prefetch((addr), (rw), (locality))
+#else
+#  define ND_PREFETCH(addr, rw, locality) ((void)(addr))
+#endif
 
 namespace nd {
 
@@ -37,9 +45,29 @@ static size_t ND_CHUNKS_PER_THREAD = 1;
 static size_t ND_TILE = 8;
 static bool ND_FORCE_GENERIC_GRAPH = false;  // Deprecated: no-op (unified ND path is now default)
 
-inline void set_tuning(size_t chunks_per_thread, size_t tile) {
+// Prefetch tuning. All three can be set at runtime via set_tuning() or the
+// EDT_PREFETCH_* environment variables (read by Python at import and forwarded here).
+//   ND_PREFETCH_BASES:   lookahead distance (in lines) for the bases[] inner loops.
+//                        The bases[] pattern is scattered/indirect, so the hardware
+//                        prefetcher cannot help — software prefetch is genuinely useful.
+//                        0 = disabled; default 4.
+//   ND_PREFETCH_STRIDED: enable prefetch in the strided workspace-copy loops inside
+//                        the 1D parabolic functions. Hardware prefetcher may already
+//                        handle these. TODO(prefetch-testing): remove if benchmarks show no benefit.
+//   ND_PREFETCH_SEQ:     enable prefetch in the sequential connectivity-graph chunk scan.
+//                        Hardware prefetcher almost certainly handles this.
+//                        TODO(prefetch-testing): remove if benchmarks show no benefit.
+static int ND_PREFETCH_BASES   = 4;
+static int ND_PREFETCH_STRIDED = 1;
+static int ND_PREFETCH_SEQ     = 1;
+
+inline void set_tuning(size_t chunks_per_thread, size_t tile,
+                       int prefetch_bases = -1, int prefetch_strided = -1, int prefetch_seq = -1) {
     if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
     if (tile > 0) ND_TILE = tile;
+    if (prefetch_bases   >= 0) ND_PREFETCH_BASES   = prefetch_bases;
+    if (prefetch_strided >= 0) ND_PREFETCH_STRIDED = prefetch_strided;
+    if (prefetch_seq     >= 0) ND_PREFETCH_SEQ     = prefetch_seq;
 }
 
 // Deprecated: no-op since unified ND path is now the only path
@@ -805,6 +833,8 @@ inline void edt_pass0_from_graph_fused_parallel(
     const size_t threads = compute_threads(parallel, total_lines, n);
     if (threads <= 1) {
         for (size_t i = 0; i < total_lines; i++) {
+            if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < total_lines)
+                ND_PREFETCH(graph + bases[i + ND_PREFETCH_BASES], 0, 0);
             squared_edt_1d_from_graph_fused<GRAPH_T>(
                 graph + bases[i], output + bases[i], seg_labels + bases[i],
                 n, stride_ax, axis_bit, anisotropy, black_border
@@ -824,6 +854,8 @@ inline void edt_pass0_from_graph_fused_parallel(
         const size_t end = std::min(total_lines, begin + per_thread);
         pending.push_back(pool.enqueue([=, &bases]() {
             for (size_t i = begin; i < end; i++) {
+                if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < end)
+                    ND_PREFETCH(graph + bases[i + ND_PREFETCH_BASES], 0, 0);
                 squared_edt_1d_from_graph_fused<GRAPH_T>(
                     graph + bases[i], output + bases[i], seg_labels + bases[i],
                     n, stride_ax, axis_bit, anisotropy, black_border
@@ -1196,6 +1228,8 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
     auto process_large_run = [&](int start, int len, bool left_border, bool right_border) {
         // Copy to workspace
         for (int i = 0; i < len; i++) {
+            // TODO(prefetch-testing): strided gather; hardware may already handle this — disable via EDT_PREFETCH_STRIDED=0
+            if (ND_PREFETCH_STRIDED) ND_PREFETCH(f + (start + i + 4) * stride, 0, 1);
             ff[i] = f[(start + i) * stride];
         }
 
@@ -1337,6 +1371,8 @@ inline void squared_edt_1d_parabolic_ws(
     int k = 0;
 
     for (int i = 0; i < n; i++) {
+        // TODO(prefetch-testing): strided gather; hardware may already handle this — disable via EDT_PREFETCH_STRIDED=0
+        if (ND_PREFETCH_STRIDED) ND_PREFETCH(f + (i + 4) * stride, 0, 1);
         ff[i] = f[i * stride];
     }
 
@@ -1577,6 +1613,8 @@ inline void edt_pass0_parallel_generic(
     const size_t threads = compute_threads(parallel, total_lines, n);
     if (threads <= 1) {
         for (size_t i = 0; i < total_lines; i++) {
+            if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < total_lines)
+                ND_PREFETCH(seg_labels + bases[i + ND_PREFETCH_BASES], 0, 0);
             squared_edt_1d_multi_seg_generic<T>(
                 seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border
             );
@@ -1595,6 +1633,8 @@ inline void edt_pass0_parallel_generic(
         const size_t end = std::min(total_lines, begin + per_thread);
         pending.push_back(pool.enqueue([=, &bases]() {
             for (size_t i = begin; i < end; i++) {
+                if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < end)
+                    ND_PREFETCH(seg_labels + bases[i + ND_PREFETCH_BASES], 0, 0);
                 squared_edt_1d_multi_seg_generic<T>(
                     seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border
                 );
@@ -1703,6 +1743,8 @@ inline void edt_pass_parabolic_parallel_generic(
         std::vector<float> ff(n);
         std::vector<float> ranges(n + 1);
         for (size_t i = 0; i < total_lines; i++) {
+            if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < total_lines)
+                ND_PREFETCH(seg_labels + bases[i + ND_PREFETCH_BASES], 0, 0);
             squared_edt_1d_parabolic_multi_seg_ws_generic<T>(
                 seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border,
                 v.data(), ff.data(), ranges.data()
@@ -1725,6 +1767,8 @@ inline void edt_pass_parabolic_parallel_generic(
             std::vector<float> ff(n);
             std::vector<float> ranges(n + 1);
             for (size_t i = begin; i < end; i++) {
+                if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < end)
+                    ND_PREFETCH(seg_labels + bases[i + ND_PREFETCH_BASES], 0, 0);
                 squared_edt_1d_parabolic_multi_seg_ws_generic<T>(
                     seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border,
                     v.data(), ff.data(), ranges.data()
@@ -1824,6 +1868,8 @@ inline void edt_pass0_build_seglabels_parallel(
     const size_t threads = compute_threads(parallel, total_lines, n);
     if (threads <= 1) {
         for (size_t i = 0; i < total_lines; i++) {
+            if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < total_lines)
+                ND_PREFETCH(labels + bases[i + ND_PREFETCH_BASES], 0, 0);
             squared_edt_1d_multi_seg_build_seglabels<T>(
                 labels + bases[i], output + bases[i], seg_labels + bases[i],
                 n, stride_ax, anisotropy, black_border
@@ -1843,6 +1889,8 @@ inline void edt_pass0_build_seglabels_parallel(
         const size_t end = std::min(total_lines, begin + per_thread);
         pending.push_back(pool.enqueue([=, &bases]() {
             for (size_t i = begin; i < end; i++) {
+                if (ND_PREFETCH_BASES > 0 && i + (size_t)ND_PREFETCH_BASES < end)
+                    ND_PREFETCH(labels + bases[i + ND_PREFETCH_BASES], 0, 0);
                 squared_edt_1d_multi_seg_build_seglabels<T>(
                     labels + bases[i], output + bases[i], seg_labels + bases[i],
                     n, stride_ax, anisotropy, black_border
@@ -2257,6 +2305,11 @@ inline void build_connectivity_graph(
                 int64_t x = 0;
                 const int64_t last_chunked = last_extent - (last_extent % CHUNK);
                 for (; x < last_chunked; x += CHUNK) {
+                    // TODO(prefetch-testing): sequential scan; hardware likely handles this — disable via EDT_PREFETCH_SEQ=0
+                    if (ND_PREFETCH_SEQ) {
+                        ND_PREFETCH(row + x + 2 * CHUNK, 0, 1);
+                        if (can_d0) ND_PREFETCH(row_d0_next + x + 2 * CHUNK, 0, 1);
+                    }
                     T any_fg = row[x]   | row[x+1] | row[x+2] | row[x+3] |
                                row[x+4] | row[x+5] | row[x+6] | row[x+7];
                     if (any_fg == 0) {

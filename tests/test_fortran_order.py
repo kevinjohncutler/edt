@@ -72,3 +72,38 @@ def test_non_contiguous_falls_back_to_c():
     arr, is_f = edt._prepare_array(sliced, np.uint8)
     assert not is_f
     assert arr.flags.c_contiguous
+
+
+# ---------------------------------------------------------------------------
+# voxel_graph + Fortran-order
+# ---------------------------------------------------------------------------
+
+def test_fortran_voxel_graph_matches_c_order_2d():
+    """F-contiguous voxel_graph gives same result as C-contiguous (forced to C inside edtsq)."""
+    labels = np.ones((24, 36), dtype=np.uint8)
+    labels[8:16, 8:16] = 0
+    vg = np.ones_like(labels) * 0x3F  # all connectivity open
+
+    result_c = edt.edt(labels, voxel_graph=vg)
+    result_f = edt.edt(labels, voxel_graph=np.asfortranarray(vg))
+    np.testing.assert_allclose(result_c, result_f, rtol=1e-5)
+
+
+def test_fortran_voxel_graph_matches_c_order_3d(labels_3d):
+    """F-contiguous voxel_graph with 3D labels."""
+    vg = np.ones(labels_3d.shape, dtype=np.uint8) * 0x3F
+
+    result_c = edt.edt(labels_3d, voxel_graph=vg)
+    result_f = edt.edt(labels_3d, voxel_graph=np.asfortranarray(vg))
+    np.testing.assert_allclose(result_c, result_f, rtol=1e-5)
+
+
+def test_fortran_labels_with_voxel_graph_2d():
+    """F-contiguous labels with C-order voxel_graph."""
+    labels = np.ones((24, 36), dtype=np.uint8)
+    labels[8:16, 8:16] = 0
+    vg = np.ones_like(labels) * 0x3F
+
+    result_c = edt.edt(labels, voxel_graph=vg)
+    result_f = edt.edt(np.asfortranarray(labels), voxel_graph=vg)
+    np.testing.assert_allclose(result_c, result_f, rtol=1e-5)

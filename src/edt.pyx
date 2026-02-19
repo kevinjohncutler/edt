@@ -20,10 +20,16 @@ Programmatic configuration:
   edt.configure(...) - set threading parameters in-process (see configure docstring)
 
 Environment Variables (runtime):
-  EDT_ADAPTIVE_THREADS      - 0/1, enable adaptive thread limiting by array size (default: 1)
+  EDT_ADAPTIVE_THREADS         - 0/1, enable adaptive thread limiting by array size (default: 1)
   EDT_ND_MIN_VOXELS_PER_THREAD - min voxels per thread for ND>=4 arrays (default: 50000)
   EDT_ND_MIN_LINES_PER_THREAD  - min lines per thread for ND>=4 arrays (default: 32)
-  EDT_ND_PROFILE            - set to 1 to enable per-call profiling output
+  EDT_ND_PROFILE               - set to 1 to enable per-call profiling output
+  EDT_PREFETCH_BASES           - lookahead distance for bases[] inner loops (default: 4, 0=off)
+                                 Scattered/indirect access; software prefetch is genuinely useful here.
+  EDT_PREFETCH_STRIDED         - 0/1, prefetch in strided workspace-copy loops (default: 1)
+                                 TODO(prefetch-testing): may be redundant with hardware; remove after benchmarking.
+  EDT_PREFETCH_SEQ             - 0/1, prefetch in sequential connectivity-graph scan (default: 1)
+                                 TODO(prefetch-testing): almost certainly redundant; remove after benchmarking.
 
 Environment Variables (build-time):
   EDT_MARCH_NATIVE          - 0/1, compile with -march=native (default: 1)
@@ -76,7 +82,9 @@ def _prepare_array(arr, dtype):
 
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
-    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
+    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile,
+                                              int prefetch_bases, int prefetch_strided,
+                                              int prefetch_seq) nogil
     cdef void _nd_set_force_generic "nd::set_force_generic"(native_bool force) nogil
 
     # EDT from labels (original, unused)
@@ -175,9 +183,14 @@ cdef extern from "edt.hpp" namespace "nd":
     ) nogil
 
 
-def set_tuning(chunks_per_thread=1, tile=8):
-    """Set tuning parameters for ND EDT."""
-    _nd_set_tuning(chunks_per_thread, tile)
+def set_tuning(chunks_per_thread=1, tile=8, prefetch_bases=-1, prefetch_strided=-1, prefetch_seq=-1):
+    """Set tuning parameters for ND EDT.
+
+    prefetch_bases:   lookahead for bases[] inner loops (0=off, default 4).
+    prefetch_strided: 0/1, workspace gather-loop prefetch (pass -1 to leave unchanged).
+    prefetch_seq:     0/1, sequential connectivity-graph scan prefetch (pass -1 to leave unchanged).
+    """
+    _nd_set_tuning(chunks_per_thread, tile, prefetch_bases, prefetch_strided, prefetch_seq)
 
 
 def set_force_generic(force):
@@ -400,7 +413,11 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     cdef tuple shape = graph.shape
 
     graph_dtype = _graph_dtype(nd)
-    graph, is_fortran = _prepare_array(graph, graph_dtype)
+    # Connectivity graphs encode edge bits per axis (axis 0 -> bits 2,3; axis 1 -> bits 0,1; ...).
+    # The axis-reversal trick used for label arrays cannot be applied here: reversing the shape
+    # would cause C++ to read axis-0 bits for the axis-1 sweep and vice versa, corrupting
+    # direction-specific connectivity. Always copy to C-order to ensure correct bit interpretation.
+    graph = np.ascontiguousarray(graph, dtype=graph_dtype)
 
     if anisotropy is None:
         anisotropy = tuple([1.0] * nd)
@@ -414,9 +431,6 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
-
-    cpp_shape = tuple(reversed(shape)) if is_fortran else shape
-    cpp_anis  = tuple(reversed(anisotropy)) if is_fortran else anisotropy
 
     global _nd_profile_last
     _nd_profile_last = {
@@ -437,11 +451,11 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     cdef size_t i
     for i in range(nd):
-        cshape[i] = <size_t>cpp_shape[i]
-        canis[i] = <float>cpp_anis[i]
+        cshape[i] = <size_t>shape[i]
+        canis[i] = <float>anisotropy[i]
         total *= cshape[i]
 
-    cdef np.ndarray output = np.zeros(cpp_shape, dtype=np.float32)
+    cdef np.ndarray output = np.zeros(shape, dtype=np.float32)
     cdef float* outp = <float*> np.PyArray_DATA(output)
 
     cdef native_bool bb = black_border
@@ -467,8 +481,6 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
         free(cshape)
         free(canis)
 
-    if is_fortran:
-        return output.T
     return output
 
 
@@ -897,10 +909,13 @@ def configure(
     adaptive_threads=None,
     min_voxels_per_thread=None,
     min_lines_per_thread=None,
+    prefetch_bases=None,
+    prefetch_strided=None,
+    prefetch_seq=None,
 ):
     """
-    Set EDT threading parameters programmatically, overriding environment
-    variables for the current process.
+    Set EDT parameters programmatically, overriding environment variables
+    for the current process.
 
     Parameters
     ----------
@@ -913,6 +928,12 @@ def configure(
     min_lines_per_thread : int or None
         Minimum lines per thread for ND>=4 arrays.
         Overrides EDT_ND_MIN_LINES_PER_THREAD.
+    prefetch_bases : int or None
+        Lookahead distance for bases[] inner loops (0=off). Overrides EDT_PREFETCH_BASES.
+    prefetch_strided : int or None
+        0/1, workspace gather-loop prefetch. Overrides EDT_PREFETCH_STRIDED.
+    prefetch_seq : int or None
+        0/1, sequential connectivity-graph scan prefetch. Overrides EDT_PREFETCH_SEQ.
     """
     if adaptive_threads is not None:
         _ND_CONFIG['EDT_ADAPTIVE_THREADS'] = int(bool(adaptive_threads))
@@ -920,6 +941,15 @@ def configure(
         _ND_CONFIG['EDT_ND_MIN_VOXELS_PER_THREAD'] = int(min_voxels_per_thread)
     if min_lines_per_thread is not None:
         _ND_CONFIG['EDT_ND_MIN_LINES_PER_THREAD'] = int(min_lines_per_thread)
+    if prefetch_bases is not None:
+        _ND_CONFIG['EDT_PREFETCH_BASES'] = int(prefetch_bases)
+        _nd_set_tuning(1, 8, int(prefetch_bases), -1, -1)
+    if prefetch_strided is not None:
+        _ND_CONFIG['EDT_PREFETCH_STRIDED'] = int(prefetch_strided)
+        _nd_set_tuning(1, 8, -1, int(prefetch_strided), -1)
+    if prefetch_seq is not None:
+        _ND_CONFIG['EDT_PREFETCH_SEQ'] = int(prefetch_seq)
+        _nd_set_tuning(1, 8, -1, -1, int(prefetch_seq))
 
 def _env_int(name, default):
     if name in _ND_CONFIG:
@@ -928,6 +958,15 @@ def _env_int(name, default):
         return int(os.environ.get(name, default))
     except Exception:
         return default
+
+# Apply prefetch tuning from environment variables at import time.
+# These values are forwarded to C++ static vars via set_tuning(); they can
+# also be overridden at runtime via configure() or set_tuning() directly.
+_nd_set_tuning(1, 8,
+    _env_int('EDT_PREFETCH_BASES',   4),
+    _env_int('EDT_PREFETCH_STRIDED', 1),
+    _env_int('EDT_PREFETCH_SEQ',     1),
+)
 
 def _apply_thresholds(val, thresholds, max_threads, capped):
     for thresh, maxT in zip(thresholds, max_threads):
