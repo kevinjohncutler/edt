@@ -24,12 +24,6 @@ Environment Variables (runtime):
   EDT_ND_MIN_VOXELS_PER_THREAD - min voxels per thread for ND>=4 arrays (default: 50000)
   EDT_ND_MIN_LINES_PER_THREAD  - min lines per thread for ND>=4 arrays (default: 32)
   EDT_ND_PROFILE               - set to 1 to enable per-call profiling output
-  EDT_PREFETCH_BASES           - lookahead distance for bases[] inner loops (default: 4, 0=off)
-                                 Scattered/indirect access; software prefetch is genuinely useful here.
-  EDT_PREFETCH_STRIDED         - 0/1, prefetch in strided workspace-copy loops (default: 1)
-                                 TODO(prefetch-testing): may be redundant with hardware; remove after benchmarking.
-  EDT_PREFETCH_SEQ             - 0/1, prefetch in sequential connectivity-graph scan (default: 1)
-                                 TODO(prefetch-testing): almost certainly redundant; remove after benchmarking.
 
 Environment Variables (build-time):
   EDT_MARCH_NATIVE          - 0/1, compile with -march=native (default: 1)
@@ -82,9 +76,7 @@ def _prepare_array(arr, dtype):
 
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
-    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile,
-                                              int prefetch_bases, int prefetch_strided,
-                                              int prefetch_seq) nogil
+    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
     cdef void _nd_set_force_generic "nd::set_force_generic"(native_bool force) nogil
 
     # EDT from labels (original, unused)
@@ -183,14 +175,9 @@ cdef extern from "edt.hpp" namespace "nd":
     ) nogil
 
 
-def set_tuning(chunks_per_thread=1, tile=8, prefetch_bases=-1, prefetch_strided=-1, prefetch_seq=-1):
-    """Set tuning parameters for ND EDT.
-
-    prefetch_bases:   lookahead for bases[] inner loops (0=off, default 4).
-    prefetch_strided: 0/1, workspace gather-loop prefetch (pass -1 to leave unchanged).
-    prefetch_seq:     0/1, sequential connectivity-graph scan prefetch (pass -1 to leave unchanged).
-    """
-    _nd_set_tuning(chunks_per_thread, tile, prefetch_bases, prefetch_strided, prefetch_seq)
+def set_tuning(chunks_per_thread=1, tile=8):
+    """Set tuning parameters for ND EDT."""
+    _nd_set_tuning(chunks_per_thread, tile)
 
 
 def set_force_generic(force):
@@ -909,9 +896,6 @@ def configure(
     adaptive_threads=None,
     min_voxels_per_thread=None,
     min_lines_per_thread=None,
-    prefetch_bases=None,
-    prefetch_strided=None,
-    prefetch_seq=None,
 ):
     """
     Set EDT parameters programmatically, overriding environment variables
@@ -928,12 +912,6 @@ def configure(
     min_lines_per_thread : int or None
         Minimum lines per thread for ND>=4 arrays.
         Overrides EDT_ND_MIN_LINES_PER_THREAD.
-    prefetch_bases : int or None
-        Lookahead distance for bases[] inner loops (0=off). Overrides EDT_PREFETCH_BASES.
-    prefetch_strided : int or None
-        0/1, workspace gather-loop prefetch. Overrides EDT_PREFETCH_STRIDED.
-    prefetch_seq : int or None
-        0/1, sequential connectivity-graph scan prefetch. Overrides EDT_PREFETCH_SEQ.
     """
     if adaptive_threads is not None:
         _ND_CONFIG['EDT_ADAPTIVE_THREADS'] = int(bool(adaptive_threads))
@@ -941,15 +919,6 @@ def configure(
         _ND_CONFIG['EDT_ND_MIN_VOXELS_PER_THREAD'] = int(min_voxels_per_thread)
     if min_lines_per_thread is not None:
         _ND_CONFIG['EDT_ND_MIN_LINES_PER_THREAD'] = int(min_lines_per_thread)
-    if prefetch_bases is not None:
-        _ND_CONFIG['EDT_PREFETCH_BASES'] = int(prefetch_bases)
-        _nd_set_tuning(1, 8, int(prefetch_bases), -1, -1)
-    if prefetch_strided is not None:
-        _ND_CONFIG['EDT_PREFETCH_STRIDED'] = int(prefetch_strided)
-        _nd_set_tuning(1, 8, -1, int(prefetch_strided), -1)
-    if prefetch_seq is not None:
-        _ND_CONFIG['EDT_PREFETCH_SEQ'] = int(prefetch_seq)
-        _nd_set_tuning(1, 8, -1, -1, int(prefetch_seq))
 
 def _env_int(name, default):
     if name in _ND_CONFIG:
@@ -958,15 +927,6 @@ def _env_int(name, default):
         return int(os.environ.get(name, default))
     except Exception:
         return default
-
-# Apply prefetch tuning from environment variables at import time.
-# These values are forwarded to C++ static vars via set_tuning(); they can
-# also be overridden at runtime via configure() or set_tuning() directly.
-_nd_set_tuning(1, 8,
-    _env_int('EDT_PREFETCH_BASES',   4),
-    _env_int('EDT_PREFETCH_STRIDED', 1),
-    _env_int('EDT_PREFETCH_SEQ',     1),
-)
 
 def _apply_thresholds(val, thresholds, max_threads, capped):
     for thresh, maxT in zip(thresholds, max_threads):

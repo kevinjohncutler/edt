@@ -40,7 +40,9 @@
 .pytest_cache
 cpp/test
 
+# Cython-generated C++ (rebuilt on every install)
 src/edt.cpp
+legacy/edt.cpp
 
 test.py
 test2.py
