@@ -499,8 +499,9 @@ def build_graph(labels, parallel=0):
 
     Returns
     -------
-    ndarray (uint8)
-        Connectivity graph where each byte encodes edge bits.
+    ndarray
+        Connectivity graph (uint8 for 1D-4D, uint16 for 5D-8D) where each
+        element encodes per-axis edge bits.
     """
     # Preserve input dtype where possible to avoid copies.
     # For signed/float types, use .view() to reinterpret as same-width
@@ -522,6 +523,8 @@ def build_graph(labels, parallel=0):
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
 
+    graph_dtype = _graph_dtype(nd)
+
     cdef size_t total = 1
     cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
     if cshape == NULL:
@@ -532,11 +535,10 @@ def build_graph(labels, parallel=0):
         cshape[i] = <size_t>shape[i]
         total *= cshape[i]
 
-    cdef np.ndarray graph = np.zeros(shape, dtype=np.uint8)
-    cdef uint8_t* graphp = <uint8_t*> np.PyArray_DATA(graph)
+    cdef np.ndarray graph = np.zeros(shape, dtype=graph_dtype)
     cdef int par = parallel
 
-    # Dispatch based on dtype
+    # Dispatch based on label dtype
     cdef int dtype_code = 0  # 0=uint8, 1=uint16, 2=uint32, 3=uint64
     if dtype == np.uint16:
         dtype_code = 1
@@ -549,24 +551,46 @@ def build_graph(labels, parallel=0):
     cdef uint16_t* labelsp16
     cdef uint32_t* labelsp32
     cdef uint64_t* labelsp64
+    cdef uint8_t* graphp8
+    cdef uint16_t* graphp16
 
     try:
-        if dtype_code == 0:
-            labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
-            with nogil:
-                build_connectivity_graph[uint8_t, uint8_t](labelsp8, graphp, cshape, nd, par)
-        elif dtype_code == 1:
-            labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
-            with nogil:
-                build_connectivity_graph[uint16_t, uint8_t](labelsp16, graphp, cshape, nd, par)
-        elif dtype_code == 2:
-            labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
-            with nogil:
-                build_connectivity_graph[uint32_t, uint8_t](labelsp32, graphp, cshape, nd, par)
-        else:  # uint64
-            labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
-            with nogil:
-                build_connectivity_graph[uint64_t, uint8_t](labelsp64, graphp, cshape, nd, par)
+        if nd <= 4:
+            graphp8 = <uint8_t*> np.PyArray_DATA(graph)
+            if dtype_code == 0:
+                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint8_t, uint8_t](labelsp8, graphp8, cshape, nd, par)
+            elif dtype_code == 1:
+                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint16_t, uint8_t](labelsp16, graphp8, cshape, nd, par)
+            elif dtype_code == 2:
+                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint32_t, uint8_t](labelsp32, graphp8, cshape, nd, par)
+            else:
+                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint64_t, uint8_t](labelsp64, graphp8, cshape, nd, par)
+        else:
+            graphp16 = <uint16_t*> np.PyArray_DATA(graph)
+            if dtype_code == 0:
+                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint8_t, uint16_t](labelsp8, graphp16, cshape, nd, par)
+            elif dtype_code == 1:
+                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint16_t, uint16_t](labelsp16, graphp16, cshape, nd, par)
+            elif dtype_code == 2:
+                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint32_t, uint16_t](labelsp32, graphp16, cshape, nd, par)
+            else:
+                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint64_t, uint16_t](labelsp64, graphp16, cshape, nd, par)
     finally:
         free(cshape)
 
@@ -581,14 +605,21 @@ def sdf(data, anisotropy=None, black_border=False, int parallel=1):
     Foreground pixels get positive distance (to nearest background).
     Background pixels get negative distance (to nearest foreground).
 
-    Args:
-        data: Input array (binary or labels, 0 = background)
-        anisotropy: Pixel spacing per dimension
-        black_border: Treat image edges as background
-        parallel: Number of threads
+    Parameters
+    ----------
+    data : ndarray
+        Input array (binary or labels, 0 = background).
+    anisotropy : float or sequence of float, optional
+        Per-axis voxel size (default 1.0 for all axes).
+    black_border : bool, optional
+        Treat image edges as background.
+    parallel : int, optional
+        Number of threads.
 
-    Returns:
-        SDF as float32 array
+    Returns
+    -------
+    ndarray
+        SDF as float32 array.
     """
     dt = edt(data, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
     dt -= edt(data == 0, anisotropy=anisotropy, black_border=black_border, parallel=parallel)

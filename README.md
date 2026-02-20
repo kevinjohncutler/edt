@@ -74,9 +74,8 @@ sdf = edt.sdf(...) # same arguments as edt
 for label, image in edt.each(labels, dt, in_place=True):
   process(image) # stand in for whatever you'd like to do
 
-# The legacy 2D/3D implementations exposed a voxel_graph argument for
-# constrained connectivity. That functionality now lives in edt.legacy.*
-# (clone/build the upstream repo into ./original_repo to enable it).
+# Constrained connectivity via voxel_graph: each voxel encodes which
+# of its 2*ndim directions are permissible as a bitmask (uint8).
 # Voxels with an impermissible direction are treated as eroded
 # by 0.5 in that direction instead of being 1 unit from black.
 # WARNING: This is an experimental feature and uses 8x+ memory.
