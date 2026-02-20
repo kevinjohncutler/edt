@@ -2443,7 +2443,7 @@ inline void _nd_expand_init_bases(
     if (n == 0 || num_lines == 0) return;
     const int threads = std::max(1, parallel);
     ThreadPool pool(threads);
-    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, threads));
     const size_t chunk = (num_lines + chunks - 1) / chunks;
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
@@ -2459,14 +2459,14 @@ inline void _nd_expand_init_bases(
                 }
                 if (any_zero) {
                     squared_edt_1d_parabolic_with_arg_stride(
-                        dist + base, (int)n, (long)s, anis,
+                        dist + base, n, s, anis,
                         black_border, black_border,
                         arg.data(), 1);
                 } else {
-                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                    for (size_t j = 0; j < n; ++j) arg[j] = j;
                 }
                 for (size_t j = 0; j < n; ++j) {
-                    feat_out[base + j * s] = (INDEX)(base + (size_t)arg[j] * s);
+                    feat_out[base + j * s] = (INDEX)(base + arg[j] * s);
                 }
             }
         });
@@ -2502,21 +2502,21 @@ inline void _nd_expand_parabolic_bases(
             }
             if (any_nonzero) {
                 squared_edt_1d_parabolic_with_arg_stride(
-                    dist + base, (int)n, (long)s, anis,
+                    dist + base, n, s, anis,
                     black_border, black_border,
                     arg.data(), 1);
             } else {
-                for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                for (size_t j = 0; j < n; ++j) arg[j] = j;
             }
             for (size_t j = 0; j < n; ++j) {
-                feat[base + j * s] = feat_line[(size_t)arg[j]];
+                feat[base + j * s] = feat_line[arg[j]];
             }
         }
         return;
     }
 
     ThreadPool pool(threads);
-    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD));
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, threads * ND_CHUNKS_PER_THREAD));
     const size_t chunk = (num_lines + chunks - 1) / chunks;
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
@@ -2533,14 +2533,14 @@ inline void _nd_expand_parabolic_bases(
                 }
                 if (any_nonzero) {
                     squared_edt_1d_parabolic_with_arg_stride(
-                        dist + base, (int)n, (long)s, anis,
+                        dist + base, n, s, anis,
                         black_border, black_border,
                         arg.data(), 1);
                 } else {
-                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                    for (size_t j = 0; j < n; ++j) arg[j] = j;
                 }
                 for (size_t j = 0; j < n; ++j) {
-                    feat[base + j * s] = feat_line[(size_t)arg[j]];
+                    feat[base + j * s] = feat_line[arg[j]];
                 }
             }
         });
@@ -2564,7 +2564,7 @@ inline void _nd_expand_init_labels_bases(
     if (n == 0 || num_lines == 0) return;
     const int threads = std::max(1, parallel);
     ThreadPool pool(threads);
-    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, threads));
     const size_t chunk = (num_lines + chunks - 1) / chunks;
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
@@ -2580,14 +2580,14 @@ inline void _nd_expand_init_labels_bases(
                 }
                 if (any_nonseed) {
                     squared_edt_1d_parabolic_with_arg_stride(
-                        dist + base, (int)n, (long)s, anis,
+                        dist + base, n, s, anis,
                         black_border, black_border,
                         arg.data(), 1);
                 } else {
-                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                    for (size_t j = 0; j < n; ++j) arg[j] = j;
                 }
                 for (size_t j = 0; j < n; ++j) {
-                    label_out[base + j * s] = labelsp[base + (size_t)arg[j] * s];
+                    label_out[base + j * s] = labelsp[base + arg[j] * s];
                 }
             }
         });
@@ -2610,7 +2610,7 @@ inline void _nd_expand_parabolic_labels_bases(
     if (n == 0 || num_lines == 0) return;
     const int threads = std::max(1, parallel);
     ThreadPool pool(threads);
-    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, (size_t)threads));
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(num_lines, threads));
     const size_t chunk = (num_lines + chunks - 1) / chunks;
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
@@ -2622,14 +2622,14 @@ inline void _nd_expand_parabolic_labels_bases(
                 for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
                 if (any_nonzero) {
                     squared_edt_1d_parabolic_with_arg_stride(
-                        dist + base, (int)n, (long)s, anis,
+                        dist + base, n, s, anis,
                         black_border, black_border,
                         arg.data(), 1);
                 } else {
-                    for (size_t j = 0; j < n; ++j) arg[j] = (int)j;
+                    for (size_t j = 0; j < n; ++j) arg[j] = j;
                 }
                 for (size_t j = 0; j < n; ++j) {
-                    label_out[base + j * s] = label_in[base + (size_t)arg[j] * s];
+                    label_out[base + j * s] = label_in[base + arg[j] * s];
                 }
             }
         });
