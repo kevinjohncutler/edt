@@ -2410,15 +2410,15 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
     double envelope;
     for (long int i = 0; i < n; i++) {
         while (ranges[k + 1] < i) k++;
-        f[i * stride] = (float)(w2 * (i - v[k]) * (i - v[k]) + ff[v[k]]);
+        f[i * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
         arg_out[i * arg_stride] = v[k];
         if (black_border_left && black_border_right) {
             envelope = std::fmin(w2 * (i + 1) * (i + 1), w2 * (n - i) * (n - i));
-            f[i * stride] = (float)std::fmin(envelope, (double)f[i * stride]);
+            f[i * stride] = std::fmin(envelope, f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = (float)std::fmin(w2 * (i + 1) * (i + 1), (double)f[i * stride]);
+            f[i * stride] = std::fmin(w2 * (i + 1) * (i + 1), f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = (float)std::fmin(w2 * (n - i) * (n - i), (double)f[i * stride]);
+            f[i * stride] = std::fmin(w2 * (n - i) * (n - i), f[i * stride]);
         }
     }
 }
