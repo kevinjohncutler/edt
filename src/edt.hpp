@@ -1342,7 +1342,8 @@ inline void squared_edt_1d_parabolic_ws(
     ranges[0] = -std::numeric_limits<float>::infinity();
     ranges[1] = std::numeric_limits<float>::infinity();
 
-    float s, factor1, factor2;
+    float s, factor1;
+    int factor2;
     for (int i = 1; i < n; i++) {
         factor1 = (i - v[k]) * w2;
         factor2 = i + v[k];
@@ -2370,55 +2371,56 @@ inline float sq_f(float x) { return x * x; }
 
 inline void squared_edt_1d_parabolic_with_arg_stride(
     float* f,
-    const long int n,
-    const long int stride,
+    const size_t n,
+    const size_t stride,
     const float anisotropy,
     const bool black_border_left,
     const bool black_border_right,
-    int* arg_out,
-    const long int arg_stride
+    size_t* arg_out,
+    const size_t arg_stride
 ) {
     if (n == 0) return;
-    const double w2 = (double)anisotropy * anisotropy;
+    const float w2 = anisotropy * anisotropy;
 
     int k = 0;
     std::unique_ptr<int[]> v(new int[n]());
-    std::unique_ptr<double[]> ff(new double[n]());
+    std::unique_ptr<float[]> ff(new float[n]());
     for (long int i = 0; i < n; i++) ff[i] = f[i * stride];
-    std::unique_ptr<double[]> ranges(new double[n + 1]());
-    ranges[0] = -std::numeric_limits<double>::infinity();
-    ranges[1] = std::numeric_limits<double>::infinity();
+    std::unique_ptr<float[]> ranges(new float[n + 1]());
+    ranges[0] = -std::numeric_limits<float>::infinity();
+    ranges[1] = std::numeric_limits<float>::infinity();
 
-    double s, factor1, factor2;
+    float s, factor1;
+    int factor2;
     for (long int i = 1; i < n; i++) {
         factor1 = (i - v[k]) * w2;
         factor2 = i + v[k];
-        s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0 * factor1);
+        s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
         while (k > 0 && s <= ranges[k]) {
             k--;
             factor1 = (i - v[k]) * w2;
             factor2 = i + v[k];
-            s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0 * factor1);
+            s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
         }
         k++;
         v[k] = i;
         ranges[k] = s;
-        ranges[k + 1] = std::numeric_limits<double>::infinity();
+        ranges[k + 1] = std::numeric_limits<float>::infinity();
     }
 
     k = 0;
-    double envelope;
+    float envelope;
     for (long int i = 0; i < n; i++) {
         while (ranges[k + 1] < i) k++;
-        f[i * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+        f[i * stride] = w2 * sq_f(i - v[k]) + ff[v[k]];
         arg_out[i * arg_stride] = v[k];
         if (black_border_left && black_border_right) {
-            envelope = std::fmin(w2 * (i + 1) * (i + 1), w2 * (n - i) * (n - i));
-            f[i * stride] = std::fmin(envelope, f[i * stride]);
+            envelope = std::fminf(w2 * sq_f(i + 1), w2 * sq_f(n - i));
+            f[i * stride] = std::fminf(envelope, f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = std::fmin(w2 * (i + 1) * (i + 1), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * sq_f(i + 1), f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = std::fmin(w2 * (n - i) * (n - i), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * sq_f(n - i), f[i * stride]);
         }
     }
 }
@@ -2448,7 +2450,7 @@ inline void _nd_expand_init_bases(
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
         pool.enqueue([=]() {
-            std::vector<int> arg(n);
+            std::vector<size_t> arg(n);
             for (size_t i = start; i < end; ++i) {
                 const size_t base = bases[i];
                 bool any_zero = false;
@@ -2490,7 +2492,7 @@ inline void _nd_expand_parabolic_bases(
     const int threads = std::max(1, parallel);
 
     if (threads <= 1 || num_lines == 1) {
-        std::vector<int> arg(n);
+        std::vector<size_t> arg(n);
         std::vector<INDEX> feat_line(n);
         for (size_t i = 0; i < num_lines; ++i) {
             const size_t base = bases[i];
@@ -2521,7 +2523,7 @@ inline void _nd_expand_parabolic_bases(
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
         pool.enqueue([=]() {
-            std::vector<int> arg(n);
+            std::vector<size_t> arg(n);
             std::vector<INDEX> feat_line(n);
             for (size_t i = start; i < end; ++i) {
                 const size_t base = bases[i];
@@ -2569,7 +2571,7 @@ inline void _nd_expand_init_labels_bases(
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
         pool.enqueue([=]() {
-            std::vector<int> arg(n);
+            std::vector<size_t> arg(n);
             for (size_t i = start; i < end; ++i) {
                 const size_t base = bases[i];
                 bool any_nonseed = false;
@@ -2615,7 +2617,7 @@ inline void _nd_expand_parabolic_labels_bases(
     for (size_t start = 0; start < num_lines; start += chunk) {
         const size_t end = std::min(num_lines, start + chunk);
         pool.enqueue([=]() {
-            std::vector<int> arg(n);
+            std::vector<size_t> arg(n);
             for (size_t i = start; i < end; ++i) {
                 const size_t base = bases[i];
                 bool any_nonzero = false;
