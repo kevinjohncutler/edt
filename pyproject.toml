@@ -10,3 +10,4 @@ local_scheme = "no-local-version"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["upstream"]
+pythonpath = ["src"]

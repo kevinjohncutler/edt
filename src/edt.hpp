@@ -110,7 +110,7 @@ inline void build_segment_labels_1d_local(
     uint32_t* seg_labels,
     const T* labels,
     const int n,
-    const long int stride
+    const int64_t stride
 ) {
     if (n <= 0) return;
 
@@ -118,7 +118,7 @@ inline void build_segment_labels_1d_local(
     int i = 0;
 
     while (i < n) {
-        const long int base_idx = i * stride;
+        const int64_t base_idx = i * stride;
         const T label = labels[base_idx];
 
         if (label == 0) {
@@ -197,7 +197,7 @@ inline void build_segment_labels_from_graph_1d_local(
     uint32_t* seg_labels,
     const GRAPH_T* graph,
     const int n,
-    const long int stride,
+    const int64_t stride,
     const GRAPH_T axis_bit
 ) {
     if (n <= 0) return;
@@ -206,7 +206,7 @@ inline void build_segment_labels_from_graph_1d_local(
     int i = 0;
 
     while (i < n) {
-        const long int base_idx = i * stride;
+        const int64_t base_idx = i * stride;
 
         if (graph[base_idx] == 0) {
             seg_labels[base_idx] = 0;
@@ -246,7 +246,7 @@ inline void squared_edt_1d_from_graph_direct(
     const GRAPH_T* graph,
     float* d,
     const int n,
-    const long int stride,
+    const int64_t stride,
     const GRAPH_T axis_bit,
     const float anisotropy,
     const bool black_border
@@ -257,7 +257,7 @@ inline void squared_edt_1d_from_graph_direct(
     int i = 0;
 
     while (i < n) {
-        const long int base_idx = i * stride;
+        const int64_t base_idx = i * stride;
 
         // Check if this voxel is background (graph == 0)
         if (graph[base_idx] == 0) {
@@ -286,7 +286,7 @@ inline void squared_edt_1d_from_graph_direct(
         // Forward pass: write distances
         if (left_boundary) {
             for (int k = 0; k < seg_len; k++) {
-                d[(seg_start + k) * stride] = static_cast<float>(k + 1) * anisotropy;
+                d[(seg_start + k) * stride] = (k + 1) * anisotropy;
             }
         } else {
             for (int k = 0; k < seg_len; k++) {
@@ -297,8 +297,8 @@ inline void squared_edt_1d_from_graph_direct(
         // Backward pass
         if (right_boundary) {
             for (int k = seg_len - 1; k >= 0; k--) {
-                const float v = static_cast<float>(seg_len - k) * anisotropy;
-                const long int idx = (seg_start + k) * stride;
+                const float v = (seg_len - k) * anisotropy;
+                const int64_t idx = (seg_start + k) * stride;
                 if (v < d[idx]) {
                     d[idx] = v;
                 }
@@ -307,7 +307,7 @@ inline void squared_edt_1d_from_graph_direct(
 
         // Square the distances
         for (int k = 0; k < seg_len; k++) {
-            const long int idx = (seg_start + k) * stride;
+            const int64_t idx = (seg_start + k) * stride;
             d[idx] *= d[idx];
         }
     }
@@ -322,7 +322,7 @@ inline void squared_edt_1d_from_graph_fused(
     float* d,
     uint32_t* seg_labels,
     const int n,
-    const long int stride,
+    const int64_t stride,
     const GRAPH_T axis_bit,
     const float anisotropy,
     const bool black_border
@@ -334,7 +334,7 @@ inline void squared_edt_1d_from_graph_fused(
     int i = 0;
 
     while (i < n) {
-        const long int base_idx = i * stride;
+        const int64_t base_idx = i * stride;
 
         // Check if this voxel is background (graph == 0)
         if (graph[base_idx] == 0) {
@@ -365,13 +365,13 @@ inline void squared_edt_1d_from_graph_fused(
         // Forward pass: write distances and segment labels
         if (left_boundary) {
             for (int k = 0; k < seg_len; k++) {
-                const long int idx = (seg_start + k) * stride;
-                d[idx] = static_cast<float>(k + 1) * anisotropy;
+                const int64_t idx = (seg_start + k) * stride;
+                d[idx] = (k + 1) * anisotropy;
                 seg_labels[idx] = seg_id;
             }
         } else {
             for (int k = 0; k < seg_len; k++) {
-                const long int idx = (seg_start + k) * stride;
+                const int64_t idx = (seg_start + k) * stride;
                 d[idx] = inf;
                 seg_labels[idx] = seg_id;
             }
@@ -380,8 +380,8 @@ inline void squared_edt_1d_from_graph_fused(
         // Backward pass
         if (right_boundary) {
             for (int k = seg_len - 1; k >= 0; k--) {
-                const float v = static_cast<float>(seg_len - k) * anisotropy;
-                const long int idx = (seg_start + k) * stride;
+                const float v = (seg_len - k) * anisotropy;
+                const int64_t idx = (seg_start + k) * stride;
                 if (v < d[idx]) {
                     d[idx] = v;
                 }
@@ -390,7 +390,7 @@ inline void squared_edt_1d_from_graph_fused(
 
         // Square the distances
         for (int k = 0; k < seg_len; k++) {
-            const long int idx = (seg_start + k) * stride;
+            const int64_t idx = (seg_start + k) * stride;
             d[idx] *= d[idx];
         }
     }
@@ -502,15 +502,15 @@ inline void build_segment_labels_parallel(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Fast path for 2D - direct iteration like EDT passes
     if (dims == 2) {
         const size_t other_axis = (axis == 0) ? 1 : 0;
         const size_t other_n = shape[other_axis];
-        const long int other_stride = static_cast<long int>(strides[other_axis]);
+        const int64_t other_stride = strides[other_axis];
 
         const size_t threads = compute_threads(parallel, other_n, n);
         if (threads <= 1) {
@@ -613,15 +613,15 @@ inline void build_segment_labels_from_graph_parallel(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Fast path for 2D
     if (dims == 2) {
         const size_t other_axis = (axis == 0) ? 1 : 0;
         const size_t other_n = shape[other_axis];
-        const long int other_stride = static_cast<long int>(strides[other_axis]);
+        const int64_t other_stride = strides[other_axis];
 
         const size_t threads = compute_threads(parallel, other_n, n);
         if (threads <= 1) {
@@ -731,15 +731,15 @@ inline void edt_pass0_from_graph_fused_parallel(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Fast path for 2D
     if (dims == 2) {
         const size_t other_axis = (axis == 0) ? 1 : 0;
         const size_t other_n = shape[other_axis];
-        const long int other_stride = static_cast<long int>(strides[other_axis]);
+        const int64_t other_stride = strides[other_axis];
 
         const size_t threads = compute_threads(parallel, other_n, n);
         if (threads <= 1) {
@@ -849,8 +849,8 @@ inline void edt_pass0_from_graph_direct_parallel(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Unified ND path - parallelize over first other dimension like ND v1
@@ -963,7 +963,8 @@ inline void edt_pass0_from_graph_direct_parallel(
 // EDT using Segment Labels (identical to ND algorithm)
 //-----------------------------------------------------------------------------
 
-#define sq(x) (static_cast<float>(x) * static_cast<float>(x))
+// Note: sq() macro removed; use `w2 * (x) * (x)` directly
+// so float w2 promotes x before int overflow can occur.
 
 /*
  * Pass 0: Rosenfeld-Pfaltz style 1D EDT for multi-segment data.
@@ -976,29 +977,29 @@ inline void squared_edt_1d_multi_seg_generic(
     const T* segids,
     float* d,
     const int n,
-    const long int stride,  // long int like ND v1
+    const int64_t stride,  // int64_t like ND v1
     const float anisotropy,
     const bool black_border
 ) {
     if (n <= 0) return;
 
     const float inf = std::numeric_limits<float>::infinity();
-    long int i = 0;  // long int like ND v1
+    int64_t i = 0;  // int64_t like ND v1
 
     while (i < n) {
-        const long int base = i * stride;
+        const int64_t base = i * stride;
         const T label = segids[base];
 
         // Find segment extent - the critical loop
-        long int j = i + 1;
+        int64_t j = i + 1;
         while (j < n && segids[j * stride] == label) {
             ++j;
         }
-        const long int len = j - i;
+        const int64_t len = j - i;
 
         if (label == 0) {
             // Background: write zeros
-            for (long int k = 0; k < len; ++k) {
+            for (int64_t k = 0; k < len; ++k) {
                 d[(i + k) * stride] = 0.0f;
             }
             i = j;
@@ -1011,20 +1012,20 @@ inline void squared_edt_1d_multi_seg_generic(
 
         // Forward pass
         if (left_boundary) {
-            for (long int k = 0; k < len; ++k) {
-                d[(i + k) * stride] = (static_cast<float>(k + 1)) * anisotropy;
+            for (int64_t k = 0; k < len; ++k) {
+                d[(i + k) * stride] = (k + 1) * anisotropy;
             }
         } else {
-            for (long int k = 0; k < len; ++k) {
+            for (int64_t k = 0; k < len; ++k) {
                 d[(i + k) * stride] = inf;
             }
         }
 
         // Backward pass
         if (right_boundary) {
-            for (long int k = len - 1; k >= 0; --k) {
-                const float v = (static_cast<float>(len - k)) * anisotropy;
-                const long int idx = (i + k) * stride;
+            for (int64_t k = len - 1; k >= 0; --k) {
+                const float v = (len - k) * anisotropy;
+                const int64_t idx = (i + k) * stride;
                 if (v < d[idx]) {
                     d[idx] = v;
                 }
@@ -1032,8 +1033,8 @@ inline void squared_edt_1d_multi_seg_generic(
         }
 
         // Square
-        for (long int k = 0; k < len; ++k) {
-            const long int idx = (i + k) * stride;
+        for (int64_t k = 0; k < len; ++k) {
+            const int64_t idx = (i + k) * stride;
             d[idx] *= d[idx];
         }
 
@@ -1056,31 +1057,31 @@ inline void squared_edt_1d_multi_seg_build_seglabels(
     float* d,
     uint32_t* seg_labels,
     const int n,
-    const long int stride,
+    const int64_t stride,
     const float anisotropy,
     const bool black_border
 ) {
     if (n <= 0) return;
 
     const float inf = std::numeric_limits<float>::infinity();
-    long int i = 0;
+    int64_t i = 0;
     uint32_t next_seg_id = 1;  // Local counter (no atomic needed per-scanline)
 
     while (i < n) {
-        const long int base = i * stride;
+        const int64_t base = i * stride;
         const T label = labels[base];
 
         // Find segment extent - the critical loop
-        long int j = i + 1;
+        int64_t j = i + 1;
         while (j < n && labels[j * stride] == label) {
             ++j;
         }
-        const long int len = j - i;
+        const int64_t len = j - i;
 
         if (label == 0) {
             // Background: write zeros to both output and segment labels
-            for (long int k = 0; k < len; ++k) {
-                const long int idx = (i + k) * stride;
+            for (int64_t k = 0; k < len; ++k) {
+                const int64_t idx = (i + k) * stride;
                 d[idx] = 0.0f;
                 seg_labels[idx] = 0;
             }
@@ -1095,14 +1096,14 @@ inline void squared_edt_1d_multi_seg_build_seglabels(
 
         // Forward pass + write segment labels
         if (left_boundary) {
-            for (long int k = 0; k < len; ++k) {
-                const long int idx = (i + k) * stride;
-                d[idx] = (static_cast<float>(k + 1)) * anisotropy;
+            for (int64_t k = 0; k < len; ++k) {
+                const int64_t idx = (i + k) * stride;
+                d[idx] = (k + 1) * anisotropy;
                 seg_labels[idx] = seg_id;
             }
         } else {
-            for (long int k = 0; k < len; ++k) {
-                const long int idx = (i + k) * stride;
+            for (int64_t k = 0; k < len; ++k) {
+                const int64_t idx = (i + k) * stride;
                 d[idx] = inf;
                 seg_labels[idx] = seg_id;
             }
@@ -1110,9 +1111,9 @@ inline void squared_edt_1d_multi_seg_build_seglabels(
 
         // Backward pass (segment labels already written)
         if (right_boundary) {
-            for (long int k = len - 1; k >= 0; --k) {
-                const float v = (static_cast<float>(len - k)) * anisotropy;
-                const long int idx = (i + k) * stride;
+            for (int64_t k = len - 1; k >= 0; --k) {
+                const float v = (len - k) * anisotropy;
+                const int64_t idx = (i + k) * stride;
                 if (v < d[idx]) {
                     d[idx] = v;
                 }
@@ -1120,8 +1121,8 @@ inline void squared_edt_1d_multi_seg_build_seglabels(
         }
 
         // Square
-        for (long int k = 0; k < len; ++k) {
-            const long int idx = (i + k) * stride;
+        for (int64_t k = 0; k < len; ++k) {
+            const int64_t idx = (i + k) * stride;
             d[idx] *= d[idx];
         }
 
@@ -1134,7 +1135,7 @@ inline void squared_edt_1d_multi_seg(
     const uint32_t* segids,
     float* d,
     const int n,
-    const long int stride,  // long int like ND v1
+    const int64_t stride,  // int64_t like ND v1
     const float anisotropy,
     const bool black_border
 ) {
@@ -1152,7 +1153,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
     const GRAPH_T* graph,
     float* f,
     const int n,
-    const long int stride,
+    const int64_t stride,
     const GRAPH_T axis_bit,
     const float anisotropy,
     const bool black_border,
@@ -1175,15 +1176,15 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         for (int j = 0; j < len; ++j) {
             float best = original[j];
             if (left_border) {
-                const float cap_left = anis_sq * static_cast<float>((j + 1) * (j + 1));
+                const float cap_left = anis_sq * (j + 1) * (j + 1);
                 if (cap_left < best) best = cap_left;
             }
             if (right_border) {
-                const float cap_right = anis_sq * static_cast<float>((len - j) * (len - j));
+                const float cap_right = anis_sq * (len - j) * (len - j);
                 if (cap_right < best) best = cap_right;
             }
             for (int q = 0; q < len; ++q) {
-                const float delta = static_cast<float>(j - q);
+                const int delta = j - q;
                 const float candidate = original[q] + anis_sq * delta * delta;
                 if (candidate < best) best = candidate;
             }
@@ -1212,7 +1213,8 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         ranges[0] = -std::numeric_limits<float>::infinity();
         ranges[1] = std::numeric_limits<float>::infinity();
 
-        float s, factor1, factor2;
+        float s, factor1;
+        int factor2;
         const int loop_start = (first_src < len) ? first_src + 1 : len;
         for (int i = loop_start; i < len; i++) {
             if (std::isinf(ff[i])) continue;  // INF never wins the minimum
@@ -1240,27 +1242,27 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
             // Fast path: both borders - always apply envelope (like v1)
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * sq(i - v[k]) + ff[v[k]];
-                const float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(len - i));
+                const float result = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+                const float envelope = std::fminf(w2 * (i + 1) * (i + 1), w2 * (len - i) * (len - i));
                 f[(start + i) * stride] = std::fminf(envelope, result);
             }
         } else if (left_border) {
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * sq(i - v[k]) + ff[v[k]];
-                f[(start + i) * stride] = std::fminf(w2 * sq(i + 1), result);
+                const float result = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+                f[(start + i) * stride] = std::fminf(w2 * (i + 1) * (i + 1), result);
             }
         } else if (right_border) {
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * sq(i - v[k]) + ff[v[k]];
-                f[(start + i) * stride] = std::fminf(w2 * sq(len - i), result);
+                const float result = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+                f[(start + i) * stride] = std::fminf(w2 * (len - i) * (len - i), result);
             }
         } else {
             // No borders - just parabolic result
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                f[(start + i) * stride] = w2 * sq(i - v[k]) + ff[v[k]];
+                f[(start + i) * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
             }
         }
     };
@@ -1322,7 +1324,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
 inline void squared_edt_1d_parabolic_ws(
     float* f,
     const int n,
-    const long int stride,  // long int like ND v1
+    const int64_t stride,  // int64_t like ND v1
     const float anisotropy,
     const bool black_border_left,
     const bool black_border_right,
@@ -1368,16 +1370,16 @@ inline void squared_edt_1d_parabolic_ws(
             k++;
         }
 
-        f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
+        f[i * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
 
         // Apply boundary envelope
         if (black_border_left && black_border_right) {
-            const float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
+            const float envelope = std::fminf(w2 * (i + 1) * (i + 1), w2 * (n - i) * (n - i));
             f[i * stride] = std::fminf(envelope, f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = std::fminf(w2 * sq(i + 1), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * (i + 1) * (i + 1), f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = std::fminf(w2 * sq(n - i), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * (n - i) * (n - i), f[i * stride]);
         }
     }
 }
@@ -1388,7 +1390,7 @@ inline void squared_edt_1d_parabolic_multi_seg_ws_generic(
     const T* segids,
     float* f,
     const int n,
-    const long int stride,  // long int like ND v1
+    const int64_t stride,  // int64_t like ND v1
     const float anisotropy,
     const bool black_border,
     int* v,
@@ -1399,7 +1401,7 @@ inline void squared_edt_1d_parabolic_multi_seg_ws_generic(
     const float anis_sq = anisotropy * anisotropy;
 
     // Fast path for small segments: O(n²) brute force is faster than parabolic envelope
-    auto process_small_run = [&](long int start, int len, bool left_border, bool right_border) {
+    auto process_small_run = [&](int64_t start, int len, bool left_border, bool right_border) {
         float original[SMALL_THRESHOLD];
         for (int q = 0; q < len; ++q) {
             original[q] = f[(start + q) * stride];
@@ -1407,15 +1409,15 @@ inline void squared_edt_1d_parabolic_multi_seg_ws_generic(
         for (int j = 0; j < len; ++j) {
             float best = original[j];
             if (left_border) {
-                const float cap_left = anis_sq * static_cast<float>((j + 1) * (j + 1));
+                const float cap_left = anis_sq * (j + 1) * (j + 1);
                 if (cap_left < best) best = cap_left;
             }
             if (right_border) {
-                const float cap_right = anis_sq * static_cast<float>((len - j) * (len - j));
+                const float cap_right = anis_sq * (len - j) * (len - j);
                 if (cap_right < best) best = cap_right;
             }
             for (int q = 0; q < len; ++q) {
-                const float delta = static_cast<float>(j - q);
+                const int delta = j - q;
                 const float candidate = original[q] + anis_sq * delta * delta;
                 if (candidate < best) best = candidate;
             }
@@ -1472,7 +1474,7 @@ inline void squared_edt_1d_parabolic_multi_seg_ws(
     const uint32_t* segids,
     float* f,
     const int n,
-    const long int stride,  // long int like ND v1
+    const int64_t stride,  // int64_t like ND v1
     const float anisotropy,
     const bool black_border,
     int* v,
@@ -1482,8 +1484,6 @@ inline void squared_edt_1d_parabolic_multi_seg_ws(
     squared_edt_1d_parabolic_multi_seg_ws_generic<uint32_t>(
         segids, f, n, stride, anisotropy, black_border, v, ff, ranges);
 }
-
-#undef sq
 
 //-----------------------------------------------------------------------------
 // Parallel EDT Passes (Optimized with shared pool, templated dispatch)
@@ -1503,15 +1503,15 @@ inline void edt_pass0_parallel_generic(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Fast path for 2D - direct iteration like ND v1
     if (dims == 2) {
         const size_t other_axis = (axis == 0) ? 1 : 0;
         const size_t other_n = shape[other_axis];
-        const long int other_stride = static_cast<long int>(strides[other_axis]);
+        const int64_t other_stride = strides[other_axis];
 
         const size_t threads = compute_threads(parallel, other_n, n);
 
@@ -1618,15 +1618,15 @@ inline void edt_pass_parabolic_parallel_generic(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Fast path for 2D - direct iteration like ND v1
     if (dims == 2) {
         const size_t other_axis = (axis == 0) ? 1 : 0;
         const size_t other_n = shape[other_axis];
-        const long int other_stride = static_cast<long int>(strides[other_axis]);
+        const int64_t other_stride = strides[other_axis];
 
         const size_t threads = compute_threads(parallel, other_n, n);
         if (threads <= 1) {
@@ -1751,15 +1751,15 @@ inline void edt_pass0_build_seglabels_parallel(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Fast path for 2D - direct iteration like ND v1
     if (dims == 2) {
         const size_t other_axis = (axis == 0) ? 1 : 0;
         const size_t other_n = shape[other_axis];
-        const long int other_stride = static_cast<long int>(strides[other_axis]);
+        const int64_t other_stride = strides[other_axis];
 
         const size_t threads = compute_threads(parallel, other_n, n);
         if (threads <= 1) {
@@ -1905,8 +1905,8 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
 ) {
     if (dims == 0) return;
 
-    const int n = static_cast<int>(shape[axis]);
-    const long int stride_ax = static_cast<long int>(strides[axis]);
+    const int n = int(shape[axis]);
+    const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
     // Unified ND path - parallelize over first other dimension like ND v1
@@ -2108,7 +2108,7 @@ inline void edtsq_from_graph(
     bool is_first_pass = true;
     for (size_t axis = dims; axis-- > 0;) {
         // Compute axis bit
-        const GRAPH_T axis_bit = static_cast<GRAPH_T>(1) << (2 * (dims - 1 - axis));
+        const GRAPH_T axis_bit = GRAPH_T(1) << (2 * (dims - 1 - axis));
 
         if (is_first_pass) {
             // FUSED pass 0: Read graph directly, compute EDT
@@ -2148,7 +2148,7 @@ inline void build_connectivity_graph(
 
     int64_t voxels = 1;
     for (size_t d = 0; d < dims; d++) {
-        voxels *= static_cast<int64_t>(shape[d]);
+        voxels *= shape[d];
     }
     if (voxels == 0) return;
 
@@ -2159,7 +2159,7 @@ inline void build_connectivity_graph(
     // 1D path: simple linear scan
     //-------------------------------------------------------------------------
     if (dims == 1) {
-        const int64_t n = static_cast<int64_t>(shape[0]);
+        const int64_t n = shape[0];
         constexpr GRAPH_T BIT = 0x01;  // axis 0 bit for 1D
 
         auto process_1d = [=](int64_t start, int64_t end) {
@@ -2198,11 +2198,11 @@ inline void build_connectivity_graph(
         int64_t s = 1;
         for (size_t d = dims; d-- > 0;) {
             strides[d] = s;
-            shape64[d] = static_cast<int64_t>(shape[d]);
+            shape64[d] = shape[d];
             s *= shape64[d];
         }
         for (size_t d = 0; d < dims; d++) {
-            axis_bits[d] = static_cast<GRAPH_T>(1) << (2 * (dims - 1 - d));
+            axis_bits[d] = GRAPH_T(1) << (2 * (dims - 1 - d));
         }
     }
 
@@ -2367,8 +2367,6 @@ inline void edtsq_from_labels_fused(
 // Parabolic EDT with argmin tracking (for expand_labels/feature_transform)
 //-----------------------------------------------------------------------------
 
-inline float sq_f(float x) { return x * x; }
-
 inline void squared_edt_1d_parabolic_with_arg_stride(
     float* f,
     const size_t n,
@@ -2380,19 +2378,20 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
     const size_t arg_stride
 ) {
     if (n == 0) return;
+    const int nn = int(n);
     const float w2 = anisotropy * anisotropy;
 
     int k = 0;
     std::unique_ptr<int[]> v(new int[n]());
     std::unique_ptr<float[]> ff(new float[n]());
-    for (long int i = 0; i < n; i++) ff[i] = f[i * stride];
+    for (int i = 0; i < nn; i++) ff[i] = f[i * stride];
     std::unique_ptr<float[]> ranges(new float[n + 1]());
     ranges[0] = -std::numeric_limits<float>::infinity();
     ranges[1] = std::numeric_limits<float>::infinity();
 
     float s, factor1;
     int factor2;
-    for (long int i = 1; i < n; i++) {
+    for (int i = 1; i < nn; i++) {
         factor1 = (i - v[k]) * w2;
         factor2 = i + v[k];
         s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
@@ -2410,17 +2409,17 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
 
     k = 0;
     float envelope;
-    for (long int i = 0; i < n; i++) {
+    for (int i = 0; i < nn; i++) {
         while (ranges[k + 1] < i) k++;
-        f[i * stride] = w2 * sq_f(i - v[k]) + ff[v[k]];
+        f[i * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
         arg_out[i * arg_stride] = v[k];
         if (black_border_left && black_border_right) {
-            envelope = std::fminf(w2 * sq_f(i + 1), w2 * sq_f(n - i));
+            envelope = std::fminf(w2 * (i + 1) * (i + 1), w2 * (nn - i) * (nn - i));
             f[i * stride] = std::fminf(envelope, f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = std::fminf(w2 * sq_f(i + 1), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * (i + 1) * (i + 1), f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = std::fminf(w2 * sq_f(n - i), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * (nn - i) * (nn - i), f[i * stride]);
         }
     }
 }

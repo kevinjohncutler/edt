@@ -282,7 +282,7 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     labels, is_fortran = _prepare_array(labels, labels.dtype)
     if labels.dtype != dtype:
         labels = labels.view(dtype)
-    cdef size_t nd = labels.ndim
+    cdef int nd = labels.ndim
     cdef tuple shape = labels.shape
 
     if anisotropy is None:
@@ -401,7 +401,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     ndarray
         Squared Euclidean distance transform (float32).
     """
-    cdef size_t nd = graph.ndim
+    cdef int nd = graph.ndim
     cdef tuple shape = graph.shape
 
     graph_dtype = _graph_dtype(nd)
@@ -517,7 +517,7 @@ def build_graph(labels, parallel=0):
     labels = np.ascontiguousarray(labels, dtype=labels.dtype)
     if labels.dtype != dtype:
         labels = labels.view(dtype)
-    cdef size_t nd = labels.ndim
+    cdef int nd = labels.ndim
     cdef tuple shape = labels.shape
 
     if parallel <= 0:
