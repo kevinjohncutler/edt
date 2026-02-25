@@ -12,31 +12,29 @@ env:
 
 jobs:
   build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build ${{ matrix.archs_linux }}${{ matrix.archs_windows }}${{ matrix.archs_macos }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
-            archs_linux: "x86_64 aarch64"
+            archs_linux: "x86_64"
+          - os: ubuntu-24.04-arm
+            archs_linux: "aarch64"
           - os: windows-latest
             archs_windows: "AMD64"
+          - os: windows-11-arm
+            archs_windows: "ARM64"
           - os: macos-latest
             archs_macos: "arm64"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v3
-
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3.1
         with:
           output-dir: ./wheelhouse
-        # to supply options, put them in 'env', like:
         env:
           CIBW_ARCHS_LINUX: ${{ matrix.archs_linux }}
           CIBW_ARCHS_WINDOWS: ${{ matrix.archs_windows }}
@@ -47,6 +45,6 @@ jobs:
       - name: Upload built wheels
         uses: actions/upload-artifact@v4
         with:
-          name: built-wheels-${{ matrix.os }}
+          name: built-wheels-${{ matrix.os }}-${{ matrix.archs_linux }}${{ matrix.archs_windows }}${{ matrix.archs_macos }}
           path: ./wheelhouse/*.whl
           if-no-files-found: warn
