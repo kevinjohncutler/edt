@@ -8,7 +8,7 @@ on:
 env:
   # Supported stable CPython versions (adjust as versions EOL).
   CIBW_BUILD: "cp310-* cp311-* cp312-*"
-  CIBW_SKIP: "pp* *-musllinux*"
+  CIBW_SKIP: "*-musllinux*"
 
 jobs:
   build_wheels:
@@ -40,7 +40,6 @@ jobs:
         env:
           CIBW_ARCHS_LINUX: ${{ matrix.archs_linux }}
           CIBW_ARCHS_WINDOWS: ${{ matrix.archs_windows }}
-          CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
           CIBW_ARCHS_MACOS: ${{ matrix.archs_macos }}
           # Avoid date-stamped local versions that can cause wheel filename mismatch.
           CIBW_ENVIRONMENT: "SETUPTOOLS_SCM_LOCAL_SCHEME=no-local-version EDT_MARCH_NATIVE=0"
