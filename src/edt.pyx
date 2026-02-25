@@ -274,7 +274,7 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     labels, is_fortran = _prepare_array(labels, labels.dtype)
     if labels.dtype != dtype:
         labels = labels.view(dtype)
-    cdef size_t nd = labels.ndim
+    cdef int nd = labels.ndim
     cdef tuple shape = labels.shape
 
     if anisotropy is None:
@@ -311,7 +311,7 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
             free(canis)
         raise MemoryError('Allocation failure')
 
-    cdef size_t i
+    cdef int i
     for i in range(nd):
         cshape[i] = <size_t>cpp_shape[i]
         canis[i] = <float>cpp_anis[i]
@@ -393,7 +393,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     ndarray
         Squared Euclidean distance transform (float32).
     """
-    cdef size_t nd = graph.ndim
+    cdef int nd = graph.ndim
     cdef tuple shape = graph.shape
 
     graph_dtype = _graph_dtype(nd)
@@ -433,7 +433,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
             free(canis)
         raise MemoryError('Allocation failure')
 
-    cdef size_t i
+    cdef int i
     for i in range(nd):
         cshape[i] = <size_t>shape[i]
         canis[i] = <float>anisotropy[i]
@@ -509,7 +509,7 @@ def build_graph(labels, parallel=0):
     labels = np.ascontiguousarray(labels, dtype=labels.dtype)
     if labels.dtype != dtype:
         labels = labels.view(dtype)
-    cdef size_t nd = labels.ndim
+    cdef int nd = labels.ndim
     cdef tuple shape = labels.shape
 
     if parallel <= 0:
@@ -522,7 +522,7 @@ def build_graph(labels, parallel=0):
     if cshape == NULL:
         raise MemoryError('Allocation failure')
 
-    cdef size_t i
+    cdef int i
     for i in range(nd):
         cshape[i] = <size_t>shape[i]
         total *= cshape[i]
