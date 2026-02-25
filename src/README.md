@@ -87,7 +87,7 @@ result = edt.edtsq(voxel_graph=custom_graph)
 | Shape | Same as input labels |
 | dtype | uint8 (2D-4D), uint16 (5D+) |
 | Background | 0 |
-| Foreground marker | bit 7 (0x80 = 128) |
+| Foreground marker | bit 7 (0b10000000 = 128) |
 
 **Edge bit encoding** (connectivity to next voxel along each axis):
 
@@ -128,7 +128,7 @@ Graph size: 1N bytes (uint8) for 2D-4D, 2N bytes (uint16) for 5D+.
 When using `voxel_graph` input, the bidirectional cc3d format is translated to the internal ND graph format:
 
 1. **Mask out negative direction bits** - voxel_graph uses 2 bits per axis (positive + negative); ND graph uses only forward edges
-2. **Add foreground marker** - bit 7 (0x80) is set for non-zero voxels
+2. **Add foreground marker** - bit 7 (0b10000000) is set for non-zero voxels
 
 This creates a temporary uint8 array (1N bytes), but avoids the grid doubling required by the legacy label-segment approach. Assuming 16-bit labels (2N memory allocation):
 

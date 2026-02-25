@@ -23,7 +23,6 @@ Environment Variables (runtime):
   EDT_ADAPTIVE_THREADS         - 0/1, enable adaptive thread limiting by array size (default: 1)
   EDT_ND_MIN_VOXELS_PER_THREAD - min voxels per thread for ND>=4 arrays (default: 50000)
   EDT_ND_MIN_LINES_PER_THREAD  - min lines per thread for ND>=4 arrays (default: 32)
-  EDT_ND_PROFILE               - set to 1 to enable per-call profiling output
 
 Environment Variables (build-time):
   EDT_MARCH_NATIVE          - 0/1, compile with -march=native (default: 1)
@@ -77,8 +76,6 @@ def _prepare_array(arr, dtype):
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
     cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
-    cdef void _nd_set_force_generic "nd::set_force_generic"(native_bool force) nogil
-
     # EDT from labels (original, unused)
     cdef void edtsq_from_labels[T](
         const T* labels,
@@ -180,11 +177,6 @@ def set_tuning(chunks_per_thread=1, tile=8):
     _nd_set_tuning(chunks_per_thread, tile)
 
 
-def set_force_generic(force):
-    """Force use of generic ND path (for testing/benchmarking). Deprecated - no-op."""
-    _nd_set_force_generic(force)
-
-
 def _voxel_graph_to_nd(voxel_graph, labels=None):
     """
     Convert bidirectional voxel_graph to ND graph format.
@@ -195,7 +187,7 @@ def _voxel_graph_to_nd(voxel_graph, labels=None):
 
     The ND format uses forward edges only + foreground marker:
     - Forward edge for axis a at bit (2*(ndim-1-a))
-    - Bit 7 (0x80) marks foreground
+    - Bit 7 (0b10000000) marks foreground
 
     Since positive direction bits match ND edge bits exactly,
     we just mask out negative bits and add foreground marker.
@@ -220,9 +212,9 @@ def _voxel_graph_to_nd(voxel_graph, labels=None):
 
     # Add foreground marker - infer from voxel_graph if no labels provided
     if labels is not None:
-        graph[labels != 0] |= 0x80
+        graph[labels != 0] |= 0b10000000
     else:
-        graph[voxel_graph != 0] |= 0x80
+        graph[voxel_graph != 0] |= 0b10000000
 
     return graph
 

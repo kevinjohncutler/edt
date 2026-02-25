@@ -34,16 +34,10 @@ namespace nd {
 // Tuning parameters
 static size_t ND_CHUNKS_PER_THREAD = 1;
 static size_t ND_TILE = 8;
-static bool ND_FORCE_GENERIC_GRAPH = false;  // Deprecated: no-op (unified ND path is now default)
 
 inline void set_tuning(size_t chunks_per_thread, size_t tile) {
     if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
     if (tile > 0) ND_TILE = tile;
-}
-
-// Deprecated: no-op since unified ND path is now the only path
-inline void set_force_generic(bool force) {
-    ND_FORCE_GENERIC_GRAPH = force;  // Kept for API compatibility
 }
 
 // Shared thread pool (like ND v1)
@@ -963,8 +957,8 @@ inline void edt_pass0_from_graph_direct_parallel(
 // EDT using Segment Labels (identical to ND algorithm)
 //-----------------------------------------------------------------------------
 
-// Note: sq() macro removed; use `w2 * (x) * (x)` directly
-// so float w2 promotes x before int overflow can occur.
+template <typename T>
+inline float sq(T x) { return float(x) * float(x); }
 
 /*
  * Pass 0: Rosenfeld-Pfaltz style 1D EDT for multi-segment data.
@@ -1242,27 +1236,27 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
             // Fast path: both borders - always apply envelope (like v1)
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
-                const float envelope = std::fminf(w2 * (i + 1) * (i + 1), w2 * (len - i) * (len - i));
+                const float result = w2 * sq(i - v[k]) + ff[v[k]];
+                const float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(len - i));
                 f[(start + i) * stride] = std::fminf(envelope, result);
             }
         } else if (left_border) {
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
-                f[(start + i) * stride] = std::fminf(w2 * (i + 1) * (i + 1), result);
+                const float result = w2 * sq(i - v[k]) + ff[v[k]];
+                f[(start + i) * stride] = std::fminf(w2 * sq(i + 1), result);
             }
         } else if (right_border) {
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
-                f[(start + i) * stride] = std::fminf(w2 * (len - i) * (len - i), result);
+                const float result = w2 * sq(i - v[k]) + ff[v[k]];
+                f[(start + i) * stride] = std::fminf(w2 * sq(len - i), result);
             }
         } else {
             // No borders - just parabolic result
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                f[(start + i) * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+                f[(start + i) * stride] = w2 * sq(i - v[k]) + ff[v[k]];
             }
         }
     };
@@ -1370,16 +1364,16 @@ inline void squared_edt_1d_parabolic_ws(
             k++;
         }
 
-        f[i * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+        f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
 
         // Apply boundary envelope
         if (black_border_left && black_border_right) {
-            const float envelope = std::fminf(w2 * (i + 1) * (i + 1), w2 * (n - i) * (n - i));
+            const float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
             f[i * stride] = std::fminf(envelope, f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = std::fminf(w2 * (i + 1) * (i + 1), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * sq(i + 1), f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = std::fminf(w2 * (n - i) * (n - i), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * sq(n - i), f[i * stride]);
         }
     }
 }
@@ -2153,14 +2147,14 @@ inline void build_connectivity_graph(
     if (voxels == 0) return;
 
     const int threads = std::max(1, parallel);
-    constexpr GRAPH_T FG = 0x80;  // Foreground bit
+    constexpr GRAPH_T FG = 0b10000000;  // Foreground bit (bit 7)
 
     //-------------------------------------------------------------------------
     // 1D path: simple linear scan
     //-------------------------------------------------------------------------
     if (dims == 1) {
         const int64_t n = shape[0];
-        constexpr GRAPH_T BIT = 0x01;  // axis 0 bit for 1D
+        constexpr GRAPH_T BIT = 0b00000001;  // axis 0 bit for 1D
 
         auto process_1d = [=](int64_t start, int64_t end) {
             for (int64_t i = start; i < end; i++) {
@@ -2411,15 +2405,15 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
     float envelope;
     for (int i = 0; i < nn; i++) {
         while (ranges[k + 1] < i) k++;
-        f[i * stride] = w2 * (i - v[k]) * (i - v[k]) + ff[v[k]];
+        f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
         arg_out[i * arg_stride] = v[k];
         if (black_border_left && black_border_right) {
-            envelope = std::fminf(w2 * (i + 1) * (i + 1), w2 * (nn - i) * (nn - i));
+            envelope = std::fminf(w2 * sq(i + 1), w2 * sq(nn - i));
             f[i * stride] = std::fminf(envelope, f[i * stride]);
         } else if (black_border_left) {
-            f[i * stride] = std::fminf(w2 * (i + 1) * (i + 1), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * sq(i + 1), f[i * stride]);
         } else if (black_border_right) {
-            f[i * stride] = std::fminf(w2 * (nn - i) * (nn - i), f[i * stride]);
+            f[i * stride] = std::fminf(w2 * sq(nn - i), f[i * stride]);
         }
     }
 }

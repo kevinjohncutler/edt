@@ -24,7 +24,9 @@ building_wheel = any(arg.startswith("bdist_wheel") or arg == "--wheel" for arg i
 if building_wheel:
   use_native = False
 if sys.platform == 'win32':
-  common_win = ['/std:c++17', '/O2']
+  # /wd4551: suppress "function call missing argument list" from Cython-generated code
+  # (Cython emits `(void) func_name;` to silence unused-function warnings)
+  common_win = ['/std:c++17', '/O2', '/wd4551']
   extra_compile_args_nd += common_win
   extra_compile_args_legacy += common_win
 else:

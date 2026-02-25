@@ -1,12 +1,7 @@
 name: Build Wheels
 
 on:
-  workflow_dispatch:
-    inputs:
-      publish_pypi:
-        description: "Publish wheels to PyPI (tags only)"
-        type: boolean
-        default: false
+  workflow_dispatch: {}
   push:
     tags:
       - '*'
@@ -24,7 +19,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
-            archs_linux: "x86_64"
+            archs_linux: "x86_64 aarch64"
           - os: windows-latest
             archs_windows: "AMD64"
           - os: macos-latest
@@ -33,10 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # QEMU not required since we're only building x86_64 on Linux.
+      - name: Set up QEMU
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22.0
+        uses: pypa/cibuildwheel@v3.3.1
         with:
           output-dir: ./wheelhouse
         # to supply options, put them in 'env', like:
@@ -46,7 +43,7 @@ jobs:
           CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
           CIBW_ARCHS_MACOS: ${{ matrix.archs_macos }}
           # Avoid date-stamped local versions that can cause wheel filename mismatch.
-          CIBW_ENVIRONMENT: "SETUPTOOLS_SCM_LOCAL_SCHEME=no-local-version"
+          CIBW_ENVIRONMENT: "SETUPTOOLS_SCM_LOCAL_SCHEME=no-local-version EDT_MARCH_NATIVE=0"
 
       - name: Upload built wheels
         uses: actions/upload-artifact@v4
@@ -54,21 +51,3 @@ jobs:
           name: built-wheels-${{ matrix.os }}
           path: ./wheelhouse/*.whl
           if-no-files-found: warn
-
-  publish:
-    name: Publish to PyPI
-    runs-on: ubuntu-latest
-    needs: build_wheels
-    if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'workflow_dispatch' && inputs.publish_pypi
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
