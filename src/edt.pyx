@@ -673,8 +673,6 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     cdef uint32_t* fprev_u32
     cdef size_t* fprev_sz
     cdef np.ndarray[np.uint32_t, ndim=1] out_flat
-    cdef np.uint32_t* outp
-    cdef np.uint32_t* labp2
     cdef size_t idx2
     cdef Py_ssize_t total_voxels
     cdef Py_ssize_t a
@@ -737,7 +735,7 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     cdef native_bool bb = False
     if not arr.flags.c_contiguous:
         arr = np.ascontiguousarray(arr)
-    cdef np.ndarray[np.uint8_t, ndim=1] seeds_flat = (arr.ravel(order='K') != 0).astype(np.uint8, order='C')
+    cdef np.ndarray[np.uint8_t, ndim=1] seeds_flat = (arr.ravel(order='K') != 0).view(np.uint8)
     cdef np.ndarray[np.uint32_t, ndim=1] labels_flat = arr.ravel(order='K').astype(np.uint32, order='C')
     cdef tuple shape = arr.shape
     cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
@@ -897,16 +895,14 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     free(bases); free(ord); free(cshape); free(cstrides); free(paxes); free(canis)
     if return_features:
         out_flat = np.empty((total,), dtype=np.uint32)
-        outp = <np.uint32_t*> np.PyArray_DATA(out_flat)
-        labp2 = <np.uint32_t*> np.PyArray_DATA(labels_flat)
         if use_u32_feat:
             for il in range(total):
                 idx2 = fprev_u32[il]
-                outp[il] = labp2[idx2]
+                out_flat[il] = labels_flat[idx2]
         else:
             for il in range(total):
                 idx2 = fprev_sz[il]
-                outp[il] = labp2[idx2]
+                out_flat[il] = labels_flat[idx2]
         return out_flat.reshape(arr.shape), feat_prev.reshape(arr.shape)
     return lab_prev.reshape(arr.shape)
 
