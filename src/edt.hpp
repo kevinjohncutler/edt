@@ -1,16 +1,16 @@
 /*
- * ND EDT - Graph-First Euclidean Distance Transform
+ * Graph-First Euclidean Distance Transform (ND)
  *
- * Key insight: ND's speed comes from cached label comparison in segment finding:
- *   while (j < n && segids[j] == label) { ++j; }
+ * Input: a labels array or a pre-built voxel connectivity graph (bit-encoded uint8/uint16).
  *
- * This encoding creates "segment labels" where each voxel gets a uint32_t segment ID.
- * - Segment ID = 0 for background
- * - Each contiguous connected region gets a unique segment ID
- * - Barriers (from voxel graph or label transitions) create new segment IDs
+ * Pipeline:
+ *   1. Build segment labels: each contiguous same-label region gets a unique uint32_t ID.
+ *      Boundaries are detected from graph edge bits rather than label comparisons,
+ *      saving memory bandwidth (1 byte vs 4 bytes per voxel for uint32 labels).
+ *   2. Run EDT on segment labels using the Meijster/Felzenszwalb separable parabolic
+ *      envelope algorithm — O(N) per scanline, parallelised across scanlines.
  *
- * The EDT code is then IDENTICAL to ND - just use segment labels as input.
- * No graph edge bit checking, no [i-1] access patterns, just equality comparison.
+ * See src/README.md for graph bit encoding, memory layout, and algorithm details.
  */
 
 #ifndef EDT_HPP

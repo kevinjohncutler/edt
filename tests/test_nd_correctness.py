@@ -123,7 +123,6 @@ def _expected_parallel_used(shape, requested):
     return edt._adaptive_thread_limit_nd(parallel, shape, requested)
 
 
-@pytest.mark.skip(reason="Profiling infrastructure not implemented in graph-based EDT")
 def test_nd_thread_limit_heuristics():
     """Verify heuristic caps reduce oversubscription across shapes."""
     arr_128 = np.zeros((128, 128), dtype=np.uint8)

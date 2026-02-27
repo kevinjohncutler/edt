@@ -21,8 +21,8 @@ Programmatic configuration:
 
 Environment Variables (runtime):
   EDT_ADAPTIVE_THREADS         - 0/1, enable adaptive thread limiting by array size (default: 1)
-  EDT_ND_MIN_VOXELS_PER_THREAD - min voxels per thread for ND>=4 arrays (default: 50000)
-  EDT_ND_MIN_LINES_PER_THREAD  - min lines per thread for ND>=4 arrays (default: 32)
+  EDT_ND_MIN_VOXELS_PER_THREAD - min voxels per thread (default: 4000)
+  EDT_ND_MIN_LINES_PER_THREAD  - min scanlines per thread (default: 32)
 
 Environment Variables (build-time):
   EDT_MARCH_NATIVE          - 0/1, compile with -march=native (default: 1)
@@ -46,12 +46,9 @@ import os
 # Profile storage for last edtsq/edtsq_graph call
 _nd_profile_last = None
 
-# Thread limiting heuristics
-_ND_2D_THRESHOLDS = [100000, 500000, 1000000]
-_ND_2D_MAX_THREADS = [1, 2, 4]
-_ND_3D_THRESHOLDS = [64, 128, 256]
-_ND_3D_MAX_THREADS = [1, 2, 4]
-_ND_MIN_VOXELS_PER_THREAD_DEFAULT = 50000
+# Thread limiting: cap threads so each gets at least this much work.
+# Both criteria are computed; whichever allows FEWER threads wins (both must hold).
+_ND_MIN_VOXELS_PER_THREAD_DEFAULT = 4000
 _ND_MIN_LINES_PER_THREAD_DEFAULT = 32
 
 # In-process overrides set via configure(), take priority over env vars
@@ -281,8 +278,12 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     if len(anisotropy) != nd:
         raise ValueError(f"anisotropy must have {nd} elements")
 
+    parallel_requested = parallel
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
+    else:
+        parallel = max(1, min(parallel, multiprocessing.cpu_count()))
+    parallel = _adaptive_thread_limit_nd(parallel, shape)
 
     # For F-contiguous arrays, reverse shape and anisotropy so C++ sees a
     # C-order array of reversed shape — same memory, no copy.
@@ -293,6 +294,7 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     _nd_profile_last = {
         'shape': shape,
         'dims': nd,
+        'parallel_requested': parallel_requested,
         'parallel_used': parallel,
     }
 
@@ -407,13 +409,18 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     if len(anisotropy) != nd:
         raise ValueError(f"anisotropy must have {nd} elements")
 
+    parallel_requested = parallel
     if parallel <= 0:
         parallel = multiprocessing.cpu_count()
+    else:
+        parallel = max(1, min(parallel, multiprocessing.cpu_count()))
+    parallel = _adaptive_thread_limit_nd(parallel, shape)
 
     global _nd_profile_last
     _nd_profile_last = {
         'shape': shape,
         'dims': nd,
+        'parallel_requested': parallel_requested,
         'parallel_used': parallel,
     }
 
@@ -762,46 +769,40 @@ def _env_int(name, default):
     except Exception:
         return default
 
-def _apply_thresholds(val, thresholds, max_threads, capped):
-    for thresh, maxT in zip(thresholds, max_threads):
-        if val < thresh:
-            return min(capped, maxT)
-    return capped
-
 def _adaptive_thread_limit_nd(parallel, shape, requested=None):
-    """General ND thread limiter matching 2D/3D heuristics."""
+    """Cap thread count so each thread has enough work to justify its overhead.
+
+    Two criteria, both must hold (whichever allows fewer threads wins):
+      - voxels per thread >= EDT_ND_MIN_VOXELS_PER_THREAD (default 8000)
+      - scan lines per thread >= EDT_ND_MIN_LINES_PER_THREAD (default 32)
+
+    Applies uniformly for all dims >= 2.
+    Disable entirely with EDT_ADAPTIVE_THREADS=0 or edt.configure(adaptive_threads=False).
+    """
     parallel = max(1, parallel)
-    adapt_enabled = bool(_env_int('EDT_ADAPTIVE_THREADS', 1))
-    if not adapt_enabled:
+    if not bool(_env_int('EDT_ADAPTIVE_THREADS', 1)):
         return parallel
-    dims = len(shape)
-    if dims <= 1:
+    if len(shape) <= 1:
         return parallel
-    capped = parallel
-    if dims == 2:
-        total = int(shape[0] * shape[1])
-        capped = _apply_thresholds(total, _ND_2D_THRESHOLDS, _ND_2D_MAX_THREADS, capped)
-        return max(1, capped)
-    if dims == 3:
-        longest = int(max(shape))
-        capped = _apply_thresholds(longest, _ND_3D_THRESHOLDS, _ND_3D_MAX_THREADS, capped)
-        return max(1, capped)
+
+    total = 1
+    for extent in shape:
+        total *= extent
+    if total == 0:
+        return 1
+
+    longest = max(shape)
+    lines = max(1, total // longest)
+
     min_voxels = _env_int('EDT_ND_MIN_VOXELS_PER_THREAD', _ND_MIN_VOXELS_PER_THREAD_DEFAULT)
     if min_voxels < 1:
         min_voxels = _ND_MIN_VOXELS_PER_THREAD_DEFAULT
     min_lines = _env_int('EDT_ND_MIN_LINES_PER_THREAD', _ND_MIN_LINES_PER_THREAD_DEFAULT)
     if min_lines < 1:
         min_lines = _ND_MIN_LINES_PER_THREAD_DEFAULT
-    total = 1
-    for extent in shape:
-        total *= extent
-    longest = max(shape)
-    lines = max(1, total // longest)
-    cap_lines = max(1, lines // min_lines)
-    cap_voxels = max(1, total // min_voxels)
-    cap = max(cap_lines, cap_voxels)
-    capped = min(capped, cap)
-    return max(1, capped)
+
+    cap = min(max(1, total // min_voxels), max(1, lines // min_lines))
+    return max(1, min(parallel, cap))
 
 
 def feature_transform(data, anisotropy=None, black_border=False, int parallel=1, return_distances=False):
