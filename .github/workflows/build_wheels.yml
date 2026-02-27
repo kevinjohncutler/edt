@@ -7,7 +7,7 @@ on:
       - '*'
 env:
   # Supported stable CPython versions (adjust as versions EOL).
-  CIBW_BUILD: "cp310-* cp311-* cp312-*"
+  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
   CIBW_SKIP: "*-musllinux*"
 
 jobs:
@@ -25,7 +25,9 @@ jobs:
             archs_windows: "AMD64"
           - os: windows-11-arm
             archs_windows: "ARM64"
-            cibw_build: "cp311-* cp312-*"  # cp310 lacks win_arm64 support
+            cibw_build: "cp311-* cp312-* cp313-* cp314-*"  # cp310 lacks win_arm64 support
+          - os: macos-13
+            archs_macos: "x86_64"
           - os: macos-latest
             archs_macos: "arm64"
 
