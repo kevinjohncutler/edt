@@ -58,7 +58,7 @@ def test_feature_transform_return_distances_matches_edtsq_nd():
     feats, dist = edt.feature_transform(
         arr, anisotropy=anis, parallel=1, return_distances=True
     )
-    ref = edt.edtsq_nd((arr != 0).astype(np.uint8), anisotropy=anis, parallel=1)
+    ref = edt.edtsq((arr != 0).astype(np.uint8), anisotropy=anis, parallel=1)
     np.testing.assert_allclose(dist, ref, rtol=1e-6, atol=1e-6)
     assert feats.shape == arr.shape
 
@@ -77,17 +77,6 @@ def test_expand_labels_return_features_consistent_with_feature_transform():
     np.testing.assert_array_equal(feats, ft)
     np.testing.assert_array_equal(labels, arr.ravel()[feats].reshape(shape))
 
-
-def test_feature_transform_features_dtype_options():
-    shape = (4, 4)
-    arr = np.zeros(shape, dtype=np.uint32)
-    arr[0, 0] = 1
-    arr[3, 3] = 2
-
-    feats_u32 = edt.feature_transform(arr, features_dtype="uint32", parallel=1)
-    feats_up = edt.feature_transform(arr, features_dtype="uintp", parallel=1)
-    assert feats_u32.dtype == np.uint32
-    assert feats_up.dtype == np.uintp
 
 
 def test_feature_transform_anisotropy_length_mismatch_raises():

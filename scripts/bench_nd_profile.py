@@ -124,7 +124,7 @@ def run_once(
 ) -> BenchmarkSample:
     # warmup
     spec_fn(arr, anisotropy=anis, black_border=False, parallel=parallel)
-    edt.edtsq_nd(arr, parallel=parallel)
+    edt.edtsq(arr, parallel=parallel)
 
     spec_times: list[float] = []
     nd_times: list[float] = []
@@ -137,7 +137,7 @@ def run_once(
         t1 = time.perf_counter()
 
         t2 = time.perf_counter()
-        nd_tmp = edt.edtsq_nd(arr, parallel=parallel)
+        nd_tmp = edt.edtsq(arr, parallel=parallel)
         t3 = time.perf_counter()
 
         spec_times.append(t1 - t0)
@@ -148,7 +148,7 @@ def run_once(
             max_diff = diff
 
         if os.environ.get('EDT_ND_PROFILE'):
-            last_profile = edt.edtsq_nd_last_profile()
+            last_profile = edt._nd_profile_last
 
     return BenchmarkSample(spec_times, nd_times, max_diff, last_profile)
 
@@ -213,7 +213,7 @@ def measure_variant(
 
     if profile is None:
         with temporary_env(overrides):
-            profile = edt.edtsq_nd_last_profile() or {}
+            profile = edt._nd_profile_last or {}
     else:
         profile = profile or {}
     return spec_time_val, nd_time_val, max_diff, profile

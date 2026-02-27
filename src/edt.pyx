@@ -43,6 +43,20 @@ import numpy as np
 import multiprocessing
 import os
 
+# Profile storage for last edtsq/edtsq_graph call
+_nd_profile_last = None
+
+# Thread limiting heuristics
+_ND_2D_THRESHOLDS = [100000, 500000, 1000000]
+_ND_2D_MAX_THREADS = [1, 2, 4]
+_ND_3D_THRESHOLDS = [64, 128, 256]
+_ND_3D_MAX_THREADS = [1, 2, 4]
+_ND_MIN_VOXELS_PER_THREAD_DEFAULT = 50000
+_ND_MIN_LINES_PER_THREAD_DEFAULT = 32
+
+# In-process overrides set via configure(), take priority over env vars
+_ND_CONFIG = {}
+
 
 def _graph_dtype(ndim):
     """Return the minimal uint dtype for a connectivity graph of ndim dimensions.
@@ -809,22 +823,22 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
         free(cshape); free(cstrides); free(paxes); free(canis)
         raise MemoryError('Allocation failure for bases')
     cdef Py_ssize_t ord_len = nd - 1
-    cdef Py_ssize_t* ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ord == NULL:
+    cdef Py_ssize_t* ax_ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
+    if ax_ord == NULL:
         free(bases); free(cshape); free(cstrides); free(paxes); free(canis)
-        raise MemoryError('Allocation failure for ord')
+        raise MemoryError('Allocation failure for ax_ord')
     cdef Py_ssize_t ord_pos = 0
     for ii in range(nd):
         if ii != ax0:
-            ord[ord_pos] = ii
+            ax_ord[ord_pos] = ii
             ord_pos += 1
     for i_ax in range(1, ord_len):
-        keyi = ord[i_ax]
+        keyi = ax_ord[i_ax]
         j = i_ax - 1
-        while j >= 0 and (cstrides[ord[j]] > cstrides[keyi] or (cstrides[ord[j]] == cstrides[keyi] and cshape[ord[j]] < cshape[keyi])):
-            ord[j+1] = ord[j]
+        while j >= 0 and (cstrides[ax_ord[j]] > cstrides[keyi] or (cstrides[ax_ord[j]] == cstrides[keyi] and cshape[ax_ord[j]] < cshape[keyi])):
+            ax_ord[j+1] = ax_ord[j]
             j -= 1
-        ord[j+1] = keyi
+        ax_ord[j+1] = keyi
     cdef size_t il
     cdef size_t base_b
     cdef size_t tmp_b
@@ -834,9 +848,9 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
             base_b = 0
             tmp_b = il
             for j in range(ord_len):
-                coord_b = tmp_b % cshape[ord[j]]
-                base_b += coord_b * cstrides[ord[j]]
-                tmp_b //= cshape[ord[j]]
+                coord_b = tmp_b % cshape[ax_ord[j]]
+                base_b += coord_b * cstrides[ax_ord[j]]
+                tmp_b //= cshape[ax_ord[j]]
             bases[il] = base_b
     if return_features:
         with nogil:
@@ -850,32 +864,32 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
 
     for a in range(1, nd):
         lines = total // cshape[paxes[a]]
-        free(ord)
+        free(ax_ord)
         ord_len = nd - 1
-        ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-        if ord == NULL:
+        ax_ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
+        if ax_ord == NULL:
             free(bases); free(cshape); free(cstrides); free(paxes); free(canis)
-            raise MemoryError('Allocation failure for ord')
+            raise MemoryError('Allocation failure for ax_ord')
         ord_pos = 0
         for ii in range(nd):
             if ii != paxes[a]:
-                ord[ord_pos] = ii
+                ax_ord[ord_pos] = ii
                 ord_pos += 1
         for i_ax in range(1, ord_len):
-            keyi = ord[i_ax]
+            keyi = ax_ord[i_ax]
             j = i_ax - 1
-            while j >= 0 and (cstrides[ord[j]] > cstrides[keyi] or (cstrides[ord[j]] == cstrides[keyi] and cshape[ord[j]] < cshape[keyi])):
-                ord[j+1] = ord[j]
+            while j >= 0 and (cstrides[ax_ord[j]] > cstrides[keyi] or (cstrides[ax_ord[j]] == cstrides[keyi] and cshape[ax_ord[j]] < cshape[keyi])):
+                ax_ord[j+1] = ax_ord[j]
                 j -= 1
-            ord[j+1] = keyi
+            ax_ord[j+1] = keyi
         with nogil:
             for il in range(lines):
                 base_b = 0
                 tmp_b = il
                 for j in range(ord_len):
-                    coord_b = tmp_b % cshape[ord[j]]
-                    base_b += coord_b * cstrides[ord[j]]
-                    tmp_b //= cshape[ord[j]]
+                    coord_b = tmp_b % cshape[ax_ord[j]]
+                    base_b += coord_b * cstrides[ax_ord[j]]
+                    tmp_b //= cshape[ax_ord[j]]
                 bases[il] = base_b
         n0 = cshape[paxes[a]]
         s0 = cstrides[paxes[a]]
@@ -892,7 +906,7 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
             lprev = <uint32_t*> np.PyArray_DATA(lab_prev)
             lnext = <uint32_t*> np.PyArray_DATA(lab_next)
 
-    free(bases); free(ord); free(cshape); free(cstrides); free(paxes); free(canis)
+    free(bases); free(ax_ord); free(cshape); free(cstrides); free(paxes); free(canis)
     if return_features:
         out_flat = np.empty((total,), dtype=np.uint32)
         if use_u32_feat:
@@ -906,31 +920,6 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
         return out_flat.reshape(arr.shape), feat_prev.reshape(arr.shape)
     return lab_prev.reshape(arr.shape)
 
-
-# ND aliases - our main edt/edtsq already use unified ND path
-def edt_nd(data, anisotropy=None, black_border=False, int parallel=1, voxel_graph=None, order=None):
-    """ND EDT - alias for edt() which uses unified ND implementation."""
-    return edt(data, anisotropy=anisotropy, black_border=black_border, parallel=parallel, voxel_graph=voxel_graph, order=order)
-
-def edtsq_nd(data, anisotropy=None, black_border=False, int parallel=1, voxel_graph=None, order=None):
-    """ND squared EDT - alias for edtsq() which uses unified ND implementation."""
-    return edtsq(data, anisotropy=anisotropy, black_border=black_border, parallel=parallel, voxel_graph=voxel_graph, order=order)
-
-_nd_profile_last = None
-def edtsq_nd_last_profile():
-    """Return the last ND profile."""
-    return _nd_profile_last
-
-# Thread limiting heuristics
-_ND_2D_THRESHOLDS = [100000, 500000, 1000000]
-_ND_2D_MAX_THREADS = [1, 2, 4]
-_ND_3D_THRESHOLDS = [64, 128, 256]
-_ND_3D_MAX_THREADS = [1, 2, 4]
-_ND_MIN_VOXELS_PER_THREAD_DEFAULT = 50000
-_ND_MIN_LINES_PER_THREAD_DEFAULT = 32
-
-# In-process overrides set via configure(), take priority over env vars
-_ND_CONFIG = {}
 
 def configure(
     adaptive_threads=None,
@@ -1010,7 +999,7 @@ def _adaptive_thread_limit_nd(parallel, shape, requested=None):
     return max(1, capped)
 
 
-def feature_transform(data, anisotropy=None, black_border=False, int parallel=1, return_distances=False, features_dtype='auto'):
+def feature_transform(data, anisotropy=None, black_border=False, int parallel=1, return_distances=False):
     """ND feature transform (nearest seed) with optional Euclidean distances.
 
     Parameters
@@ -1025,15 +1014,11 @@ def feature_transform(data, anisotropy=None, black_border=False, int parallel=1,
         Number of threads; if <= 0, uses cpu_count().
     return_distances : bool, optional
         If True, also return the EDT of the seed mask.
-    features_dtype : dtype-like, optional
-        Output dtype for the feature index array. Accepts any value accepted
-        by np.dtype() (e.g. np.uint32, 'uint64'). Defaults to np.uint32 for
-        arrays with fewer than 2**32 voxels, np.uint64 otherwise.
 
     Returns
     -------
     feat : ndarray
-        Linear index of nearest seed for each voxel.
+        Linear index of nearest seed for each voxel (uint32 or uint64).
     dist : ndarray of float32, optional
         Euclidean distance to nearest seed, if return_distances=True.
     """
@@ -1064,16 +1049,7 @@ def feature_transform(data, anisotropy=None, black_border=False, int parallel=1,
 
     labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, parallel, True)
 
-    voxels = arr.size
-    if features_dtype == 'auto' or features_dtype is None:
-        out_dtype = np.uint32 if voxels < 2**32 else np.uint64
-    else:
-        out_dtype = np.dtype(features_dtype)
-        if not np.issubdtype(out_dtype, np.unsignedinteger):
-            raise ValueError(f"features_dtype must be an unsigned integer dtype, got {out_dtype}")
-    feats = feats.astype(out_dtype, copy=False)
-
     if return_distances:
-        dist = edt((arr != 0).astype(np.uint8, copy=False), anis, black_border, parallel)
+        dist = edt(arr != 0, anis, black_border, parallel)
         return feats, dist
     return feats
