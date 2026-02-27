@@ -2090,9 +2090,9 @@ inline void edtsq_from_graph(
     }
     if (total == 0) return;
 
-    // Axis bit encoding (same as barrier graph)
-    // For 2D: axis 0 -> bit 2, axis 1 -> bit 0
-    // For 3D: axis 0 -> bit 4, axis 1 -> bit 2, axis 2 -> bit 0
+    // Axis bit encoding (foreground at bit 0, edge bits at odd positions)
+    // For 2D: axis 0 -> bit 3, axis 1 -> bit 1
+    // For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
 
     // FULLY FUSED: All passes read directly from graph
     // No segment labels allocation needed - saves 64MB for large volumes
@@ -2102,7 +2102,7 @@ inline void edtsq_from_graph(
     bool is_first_pass = true;
     for (size_t axis = dims; axis-- > 0;) {
         // Compute axis bit
-        const GRAPH_T axis_bit = GRAPH_T(1) << (2 * (dims - 1 - axis));
+        const GRAPH_T axis_bit = GRAPH_T(1) << (2 * (dims - 1 - axis) + 1);
 
         if (is_first_pass) {
             // FUSED pass 0: Read graph directly, compute EDT
@@ -2147,14 +2147,14 @@ inline void build_connectivity_graph(
     if (voxels == 0) return;
 
     const int threads = std::max(1, parallel);
-    constexpr GRAPH_T FG = 0b10000000;  // Foreground bit (bit 7)
+    constexpr GRAPH_T FG = 0b00000001;  // Foreground bit (bit 0)
 
     //-------------------------------------------------------------------------
     // 1D path: simple linear scan
     //-------------------------------------------------------------------------
     if (dims == 1) {
         const int64_t n = shape[0];
-        constexpr GRAPH_T BIT = 0b00000001;  // axis 0 bit for 1D
+        constexpr GRAPH_T BIT = 0b00000010;  // axis 0 bit for 1D
 
         auto process_1d = [=](int64_t start, int64_t end) {
             for (int64_t i = start; i < end; i++) {
@@ -2196,7 +2196,7 @@ inline void build_connectivity_graph(
             s *= shape64[d];
         }
         for (size_t d = 0; d < dims; d++) {
-            axis_bits[d] = GRAPH_T(1) << (2 * (dims - 1 - d));
+            axis_bits[d] = GRAPH_T(1) << (2 * (dims - 1 - d) + 1);
         }
     }
 

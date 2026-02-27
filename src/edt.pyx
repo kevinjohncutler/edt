@@ -47,11 +47,12 @@ import os
 def _graph_dtype(ndim):
     """Return the minimal uint dtype for a connectivity graph of ndim dimensions.
 
-    Each axis occupies 2 bits, so max bit = 2*(ndim-1):
-      dims 1-4  -> uint8  (max bit 6)
-      dims 5-8  -> uint16 (max bit 14)
-      dims 9-12 -> uint32 (max bit 22)
-      dims 13-16 -> uint64 (max bit 30)
+    Bit 0 is the foreground marker. Each axis edge occupies bit 2*(ndim-1-axis)+1,
+    so max bit = 2*(ndim-1)+1:
+      dims 1-4  -> uint8  (max bit 7)
+      dims 5-8  -> uint16 (max bit 15)
+      dims 9-12 -> uint32 (max bit 23)
+      dims 13-16 -> uint64 (max bit 31)
     """
     if ndim > 16:
         raise ValueError(f"EDT supports at most 16 dimensions, got {ndim}.")
@@ -186,11 +187,11 @@ def _voxel_graph_to_nd(voxel_graph, labels=None):
     - negative direction at bit (2*(ndim-1-axis)+1)
 
     The ND format uses forward edges only + foreground marker:
-    - Forward edge for axis a at bit (2*(ndim-1-a))
-    - Bit 7 (0b10000000) marks foreground
+    - Forward edge for axis a at bit (2*(ndim-1-a)+1)
+    - Bit 0 (0b00000001) marks foreground
 
-    Since positive direction bits match ND edge bits exactly,
-    we just mask out negative bits and add foreground marker.
+    Positive direction bits are shifted left by 1 to make room for
+    the foreground marker at bit 0, then the marker is added.
 
     If labels is None, foreground is inferred from voxel_graph != 0
     (any voxel with connectivity is foreground).
@@ -199,22 +200,32 @@ def _voxel_graph_to_nd(voxel_graph, labels=None):
     if labels is not None and voxel_graph.shape != labels.shape:
         raise ValueError("voxel_graph shape must match labels")
 
+    # Validate input dtype has enough bits for this dimensionality.
+    # voxel_graph format uses 2*ndim bits (positive + negative per axis).
+    min_bits = 2 * ndim
+    actual_bits = voxel_graph.dtype.itemsize * 8
+    if actual_bits < min_bits:
+        raise ValueError(
+            f"voxel_graph dtype {voxel_graph.dtype} has {actual_bits} bits, "
+            f"but {ndim}D requires at least {min_bits} bits"
+        )
+
     # Build mask for positive direction bits only
     pos_mask = 0
     for axis in range(ndim):
         pos_mask |= (1 << (2 * (ndim - 1 - axis)))
 
-    # Extract positive direction bits (these match ND edge bits)
+    # Extract positive direction bits and shift left by 1 to make room for FG at bit 0
     # Use minimal dtype based on ndim (not input dtype) to avoid large intermediates
     mask_dtype = _graph_dtype(ndim)
-    graph = voxel_graph.astype(mask_dtype, copy=False) & mask_dtype(pos_mask)
+    graph = (voxel_graph.astype(mask_dtype, copy=False) & mask_dtype(pos_mask)) << 1
     # Keep mask_dtype - don't truncate to uint8 (5D+ needs higher bits)
 
-    # Add foreground marker - infer from voxel_graph if no labels provided
+    # Add foreground marker at bit 0 - infer from voxel_graph if no labels provided
     if labels is not None:
-        graph[labels != 0] |= 0b10000000
+        graph[labels != 0] |= 0b00000001
     else:
-        graph[voxel_graph != 0] |= 0b10000000
+        graph[voxel_graph != 0] |= 0b00000001
 
     return graph
 
@@ -379,8 +390,8 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     ----------
     graph : ndarray (uint8 for 2D-4D, uint16 for 5D-8D)
         Voxel connectivity graph. Each element encodes edge bits for each axis.
-        For 2D: axis 0 -> bit 2, axis 1 -> bit 0
-        For 3D: axis 0 -> bit 4, axis 1 -> bit 2, axis 2 -> bit 0
+        For 2D: axis 0 -> bit 3, axis 1 -> bit 1
+        For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
     anisotropy : tuple or None
         Physical voxel size for each dimension.
     black_border : bool
@@ -397,7 +408,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     cdef tuple shape = graph.shape
 
     graph_dtype = _graph_dtype(nd)
-    # Connectivity graphs encode edge bits per axis (axis 0 -> bits 2,3; axis 1 -> bits 0,1; ...).
+    # Connectivity graphs encode edge bits per axis (axis 0 -> bit 3; axis 1 -> bit 1; ...).
     # The axis-reversal trick used for label arrays cannot be applied here: reversing the shape
     # would cause C++ to read axis-0 bits for the axis-1 sweep and vice versa, corrupting
     # direction-specific connectivity. Always copy to C-order to ensure correct bit interpretation.

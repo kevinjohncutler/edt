@@ -71,7 +71,7 @@ def _maybe_plot_grid(title, grid, labels, blocked_arrows=None):
 
 
 def _axis_bits(ndim):
-    return tuple(1 << (2 * (ndim - 1 - axis)) for axis in range(ndim))
+    return tuple(1 << (2 * (ndim - 1 - axis) + 1) for axis in range(ndim))
 
 
 def _random_graph(shape, bits, seed=0):
@@ -263,7 +263,7 @@ def test_voxel_graph_examples_png():
         return
 
     def axis_bits(ndim):
-        return tuple(1 << (2 * (ndim - 1 - axis)) for axis in range(ndim))
+        return tuple(1 << (2 * (ndim - 1 - axis) + 1) for axis in range(ndim))
 
     def make_two_squares(shape, size=6, gap=4):
         h, w = shape

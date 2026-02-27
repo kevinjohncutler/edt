@@ -87,22 +87,22 @@ result = edt.edtsq(voxel_graph=custom_graph)
 | Shape | Same as input labels |
 | dtype | uint8 (2D-4D), uint16 (5D+) |
 | Background | 0 |
-| Foreground marker | bit 7 (0b10000000 = 128) |
+| Foreground marker | bit 0 (0b00000001 = 1) |
 
 **Edge bit encoding** (connectivity to next voxel along each axis):
 
-Formula: `bit_position = 2 * (ndim - 1 - axis)`
+Formula: `bit_position = 2 * (ndim - 1 - axis) + 1`
 
 | Dimension | Axis 0 | Axis 1 | Axis 2 | Axis 3 | dtype |
 |-----------|--------|--------|--------|--------|-------|
-| 2D | bit 2 (4) | bit 0 (1) | - | - | uint8 |
-| 3D | bit 4 (16) | bit 2 (4) | bit 0 (1) | - | uint8 |
-| 4D | bit 6 (64) | bit 4 (16) | bit 2 (4) | bit 0 (1) | uint8 |
-| 5D-8D | bit 8+ | ... | ... | ... | uint16 |
-| 9D-12D | bit 16+ | ... | ... | ... | uint32 |
-| 13D-16D | bit 24+ | ... | ... | ... | uint64 |
+| 2D | bit 3 (8) | bit 1 (2) | - | - | uint8 |
+| 3D | bit 5 (32) | bit 3 (8) | bit 1 (2) | - | uint8 |
+| 4D | bit 7 (128) | bit 5 (32) | bit 3 (8) | bit 1 (2) | uint8 |
+| 5D-8D | bit 9+ | ... | ... | ... | uint16 |
+| 9D-12D | bit 17+ | ... | ... | ... | uint32 |
+| 13D-16D | bit 25+ | ... | ... | ... | uint64 |
 
-Note: Bit 7 is reserved for the foreground marker, so 4D is the maximum for uint8.
+Note: Bit 0 is reserved for the foreground marker, so 4D is the maximum for uint8.
 
 
 ## Memory Usage
@@ -128,7 +128,7 @@ Graph size: 1N bytes (uint8) for 2D-4D, 2N bytes (uint16) for 5D+.
 When using `voxel_graph` input, the bidirectional cc3d format is translated to the internal ND graph format:
 
 1. **Mask out negative direction bits** - voxel_graph uses 2 bits per axis (positive + negative); ND graph uses only forward edges
-2. **Add foreground marker** - bit 7 (0b10000000) is set for non-zero voxels
+2. **Add foreground marker** - bit 0 (0b00000001) is set for non-zero voxels
 
 This creates a temporary uint8 array (1N bytes), but avoids the grid doubling required by the legacy label-segment approach. Assuming 16-bit labels (2N memory allocation):
 
