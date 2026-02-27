@@ -2632,6 +2632,298 @@ inline void _nd_expand_parabolic_labels_bases(
     pool.join();
 }
 
+//-----------------------------------------------------------------------------
+// Fused expand_labels orchestration (C++ replacement for Cython orchestration)
+//
+// expand_labels_fused       - labels-only output
+// expand_labels_features_fused - labels + feature indices output
+//
+// The four _nd_expand_*_bases helpers above do the per-axis work;
+// these functions supply the axis loop, base computation, and memory.
+//-----------------------------------------------------------------------------
+
+// Shared helper: build axis processing order for expand_labels passes.
+// paxes[0..dims-1] will be filled with axis indices sorted so the
+// innermost axis (smallest stride) comes first, with longer axes preferred
+// as a tiebreaker.  strides[] must already be C-order strides.
+inline void _expand_sort_axes(
+    size_t* paxes,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t dims
+) {
+    for (size_t i = 0; i < dims; ++i) paxes[i] = i;
+    // Insertion sort (dims is small)
+    for (size_t i = 1; i < dims; ++i) {
+        size_t key = paxes[i];
+        int j = (int)i - 1;
+        while (j >= 0 && (strides[paxes[j]] > strides[key] ||
+               (strides[paxes[j]] == strides[key] && shape[paxes[j]] < shape[key]))) {
+            paxes[j + 1] = paxes[j];
+            --j;
+        }
+        paxes[j + 1] = key;
+    }
+}
+
+// Compute base offsets for each scanline along axis `ax`, given all other
+// axes in ax_ord[0..ord_len-1] (sorted), filling bases[0..num_lines-1].
+inline void _expand_compute_bases(
+    size_t* bases,
+    const size_t* ax_ord,
+    const size_t* shape,
+    const size_t* strides,
+    const size_t ord_len,
+    const size_t num_lines
+) {
+    for (size_t il = 0; il < num_lines; ++il) {
+        size_t base = 0, tmp = il;
+        for (size_t j = 0; j < ord_len; ++j) {
+            base += (tmp % shape[ax_ord[j]]) * strides[ax_ord[j]];
+            tmp  /= shape[ax_ord[j]];
+        }
+        bases[il] = base;
+    }
+}
+
+// labels-only mode
+template <typename T>
+inline void expand_labels_fused(
+    const T* data,
+    uint32_t* labels_out,
+    const size_t* shape,
+    const float* anisotropy,
+    const size_t dims,
+    const bool black_border,
+    const int parallel
+) {
+    if (dims == 0) return;
+
+    // 1D path
+    if (dims == 1) {
+        const size_t n = shape[0];
+        if (n == 0) return;
+        // Find seeds
+        std::vector<size_t> seeds;
+        for (size_t i = 0; i < n; ++i)
+            if (data[i] != 0) seeds.push_back(i);
+        if (seeds.empty()) {
+            std::fill(labels_out, labels_out + n, uint32_t(0));
+            return;
+        }
+        if (seeds.size() == 1) {
+            std::fill(labels_out, labels_out + n, (uint32_t)data[seeds[0]]);
+            return;
+        }
+        // Midpoints between adjacent seeds (as floats)
+        std::vector<double> mids(seeds.size() - 1);
+        for (size_t i = 0; i < mids.size(); ++i)
+            mids[i] = (seeds[i] + seeds[i + 1]) * 0.5;
+        size_t k = 0;
+        for (size_t i = 0; i < n; ++i) {
+            while (k < mids.size() && (double)i >= mids[k]) ++k;
+            labels_out[i] = (uint32_t)data[seeds[std::min(k, seeds.size() - 1)]];
+        }
+        return;
+    }
+
+    // ND path
+    size_t total = 1;
+    size_t strides[16];
+    {
+        size_t s = 1;
+        for (size_t d = dims; d-- > 0;) {
+            strides[d] = s;
+            s *= shape[d];
+            total *= shape[d];
+        }
+    }
+    if (total == 0) return;
+
+    size_t paxes[16];
+    _expand_sort_axes(paxes, shape, strides, dims);
+
+    size_t max_lines = 0;
+    for (size_t a = 0; a < dims; ++a) {
+        const size_t lines = total / shape[paxes[a]];
+        if (lines > max_lines) max_lines = lines;
+    }
+
+    // Heap allocations
+    std::vector<float>    dist(total);
+    std::vector<size_t>   bases(max_lines);
+    std::vector<size_t>   ax_ord(dims - 1);
+    std::vector<uint32_t> lab_prev(total);
+    std::vector<uint32_t> lab_next(total);
+
+    // Build seeds_flat and labels_flat from data
+    std::vector<uint8_t>  seeds_flat(total);
+    std::vector<uint32_t> labels_flat(total);
+    for (size_t i = 0; i < total; ++i) {
+        seeds_flat[i]  = (data[i] != 0) ? 1 : 0;
+        labels_flat[i] = (uint32_t)data[i];
+    }
+
+    for (size_t a = 0; a < dims; ++a) {
+        const size_t ax  = paxes[a];
+        const size_t n0  = shape[ax];
+        const size_t s0  = strides[ax];
+        const size_t lines = total / n0;
+        const float  anis  = anisotropy[ax];
+
+        // Build ax_ord for this pass
+        size_t op = 0;
+        for (size_t ii = 0; ii < dims; ++ii)
+            if (ii != ax) ax_ord[op++] = ii;
+        // Sort ax_ord by stride (insertion sort)
+        for (size_t i = 1; i < op; ++i) {
+            size_t key = ax_ord[i];
+            int j = (int)i - 1;
+            while (j >= 0 && (strides[ax_ord[j]] > strides[key] ||
+                   (strides[ax_ord[j]] == strides[key] && shape[ax_ord[j]] < shape[key]))) {
+                ax_ord[j + 1] = ax_ord[j];
+                --j;
+            }
+            ax_ord[j + 1] = key;
+        }
+
+        _expand_compute_bases(bases.data(), ax_ord.data(), shape, strides, op, lines);
+
+        if (a == 0) {
+            _nd_expand_init_labels_bases(
+                seeds_flat.data(), dist.data(), bases.data(),
+                lines, n0, s0, anis, black_border,
+                labels_flat.data(), lab_prev.data(), parallel);
+        } else {
+            _nd_expand_parabolic_labels_bases(
+                dist.data(), bases.data(),
+                lines, n0, s0, anis, black_border,
+                lab_prev.data(), lab_next.data(), parallel);
+            std::swap(lab_prev, lab_next);
+        }
+    }
+
+    std::copy(lab_prev.begin(), lab_prev.end(), labels_out);
+}
+
+// labels + feature indices mode
+template <typename T, typename INDEX>
+inline void expand_labels_features_fused(
+    const T* data,
+    uint32_t* labels_out,
+    INDEX* features_out,
+    const size_t* shape,
+    const float* anisotropy,
+    const size_t dims,
+    const bool black_border,
+    const int parallel
+) {
+    if (dims == 0) return;
+
+    // 1D path
+    if (dims == 1) {
+        const size_t n = shape[0];
+        if (n == 0) return;
+        std::vector<size_t> seeds;
+        for (size_t i = 0; i < n; ++i)
+            if (data[i] != 0) seeds.push_back(i);
+        if (seeds.empty()) {
+            std::fill(labels_out, labels_out + n, uint32_t(0));
+            std::fill(features_out, features_out + n, INDEX(0));
+            return;
+        }
+        if (seeds.size() == 1) {
+            std::fill(labels_out, labels_out + n, (uint32_t)data[seeds[0]]);
+            std::fill(features_out, features_out + n, INDEX(seeds[0]));
+            return;
+        }
+        std::vector<double> mids(seeds.size() - 1);
+        for (size_t i = 0; i < mids.size(); ++i)
+            mids[i] = (seeds[i] + seeds[i + 1]) * 0.5;
+        size_t k = 0;
+        for (size_t i = 0; i < n; ++i) {
+            while (k < mids.size() && (double)i >= mids[k]) ++k;
+            const size_t si = seeds[std::min(k, seeds.size() - 1)];
+            labels_out[i]   = (uint32_t)data[si];
+            features_out[i] = INDEX(si);
+        }
+        return;
+    }
+
+    // ND path
+    size_t total = 1;
+    size_t strides[16];
+    {
+        size_t s = 1;
+        for (size_t d = dims; d-- > 0;) {
+            strides[d] = s;
+            s *= shape[d];
+            total *= shape[d];
+        }
+    }
+    if (total == 0) return;
+
+    size_t paxes[16];
+    _expand_sort_axes(paxes, shape, strides, dims);
+
+    size_t max_lines = 0;
+    for (size_t a = 0; a < dims; ++a) {
+        const size_t lines = total / shape[paxes[a]];
+        if (lines > max_lines) max_lines = lines;
+    }
+
+    std::vector<float>    dist(total);
+    std::vector<size_t>   bases(max_lines);
+    std::vector<size_t>   ax_ord(dims - 1);
+    std::vector<uint8_t>  seeds_flat(total);
+    std::vector<uint32_t> labels_flat(total);
+
+    for (size_t i = 0; i < total; ++i) {
+        seeds_flat[i]  = (data[i] != 0) ? 1 : 0;
+        labels_flat[i] = (uint32_t)data[i];
+    }
+
+    for (size_t a = 0; a < dims; ++a) {
+        const size_t ax  = paxes[a];
+        const size_t n0  = shape[ax];
+        const size_t s0  = strides[ax];
+        const size_t lines = total / n0;
+        const float  anis  = anisotropy[ax];
+
+        size_t op = 0;
+        for (size_t ii = 0; ii < dims; ++ii)
+            if (ii != ax) ax_ord[op++] = ii;
+        for (size_t i = 1; i < op; ++i) {
+            size_t key = ax_ord[i];
+            int j = (int)i - 1;
+            while (j >= 0 && (strides[ax_ord[j]] > strides[key] ||
+                   (strides[ax_ord[j]] == strides[key] && shape[ax_ord[j]] < shape[key]))) {
+                ax_ord[j + 1] = ax_ord[j];
+                --j;
+            }
+            ax_ord[j + 1] = key;
+        }
+
+        _expand_compute_bases(bases.data(), ax_ord.data(), shape, strides, op, lines);
+
+        if (a == 0) {
+            _nd_expand_init_bases<INDEX>(
+                seeds_flat.data(), dist.data(), bases.data(),
+                lines, n0, s0, anis, black_border,
+                features_out, parallel);
+        } else {
+            _nd_expand_parabolic_bases<INDEX>(
+                dist.data(), bases.data(),
+                lines, n0, s0, anis, black_border,
+                features_out, parallel);
+        }
+    }
+
+    // Resolve feature indices to labels
+    for (size_t i = 0; i < total; ++i)
+        labels_out[i] = labels_flat[(size_t)features_out[i]];
+}
+
 } // namespace nd
 
 #endif // EDT_HPP

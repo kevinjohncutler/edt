@@ -133,56 +133,25 @@ cdef extern from "edt.hpp" namespace "nd":
         int parallel
     ) nogil
 
-    # Expand labels helpers
-    cdef void _nd_expand_init_bases[INDEX](
-        const uint8_t* seeds,
-        float* dist,
-        const size_t* bases,
-        size_t num_lines,
-        size_t n,
-        size_t s,
-        float anis,
+    # Fused expand_labels (orchestration in C++)
+    cdef void expand_labels_fused[T](
+        const T* data,
+        uint32_t* labels_out,
+        const size_t* shape,
+        const float* anisotropy,
+        size_t dims,
         native_bool black_border,
-        INDEX* feat_out,
         int parallel
     ) nogil
 
-    cdef void _nd_expand_parabolic_bases[INDEX](
-        float* dist,
-        const size_t* bases,
-        size_t num_lines,
-        size_t n,
-        size_t s,
-        float anis,
+    cdef void expand_labels_features_fused[T, INDEX](
+        const T* data,
+        uint32_t* labels_out,
+        INDEX* features_out,
+        const size_t* shape,
+        const float* anisotropy,
+        size_t dims,
         native_bool black_border,
-        INDEX* feat,
-        int parallel
-    ) nogil
-
-    cdef void _nd_expand_init_labels_bases(
-        const uint8_t* seeds,
-        float* dist,
-        const size_t* bases,
-        size_t num_lines,
-        size_t n,
-        size_t s,
-        float anis,
-        native_bool black_border,
-        const uint32_t* labelsp,
-        uint32_t* label_out,
-        int parallel
-    ) nogil
-
-    cdef void _nd_expand_parabolic_labels_bases(
-        float* dist,
-        const size_t* bases,
-        size_t num_lines,
-        size_t n,
-        size_t s,
-        float anis,
-        native_bool black_border,
-        const uint32_t* label_in,
-        uint32_t* label_out,
         int parallel
     ) nogil
 
@@ -677,248 +646,84 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     features : ndarray, optional
         If return_features=True, the nearest-seed linear indices.
     """
-    cdef np.ndarray[np.uint32_t, ndim=1] out1
-    cdef np.ndarray pos
-    cdef np.ndarray mids
-    cdef Py_ssize_t i = 0
-    cdef Py_ssize_t k = 0
-    cdef Py_ssize_t s
-    cdef np.ndarray feat_prev
-    cdef uint32_t* fprev_u32
-    cdef size_t* fprev_sz
-    cdef np.ndarray[np.uint32_t, ndim=1] out_flat
-    cdef size_t idx2
-    cdef Py_ssize_t total_voxels
-    cdef Py_ssize_t a
     cdef Py_ssize_t nd
+    cdef int cpu_cap
+    cdef size_t total
+    cdef size_t* cshape
+    cdef float* canis
+    cdef const uint32_t* data_p
+    cdef uint32_t* lout_p
+    cdef uint32_t* feat_u32_p
+    cdef size_t* feat_sz_p
+    cdef bint use_u32_feat
+    cdef np.ndarray[np.uint32_t, ndim=1] labels_out
+    cdef np.ndarray[np.uint32_t, ndim=1] feat_u32
+    cdef np.ndarray feat_sz
+    cdef Py_ssize_t ii
 
     arr = np.require(data, dtype=np.uint32, requirements='C')
-    dims = arr.ndim
-    nd = dims
-    cdef tuple anis
+    nd = arr.ndim
+
     if anisotropy is None:
-        anis = (1.0,) * dims
+        anis = (1.0,) * nd
     else:
-        anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * dims
-        if len(anis) != dims:
+        anis = tuple(anisotropy) if hasattr(anisotropy, '__len__') else (float(anisotropy),) * nd
+        if len(anis) != nd:
             raise ValueError('anisotropy length must match data.ndim')
 
-    cdef int cpu_cap = 1
+    cpu_cap = 1
     try:
         cpu_cap = multiprocessing.cpu_count()
     except Exception:
         cpu_cap = max(1, parallel)
-
     if parallel <= 0:
         parallel = cpu_cap
     else:
         parallel = max(1, min(parallel, cpu_cap))
 
-    if dims == 1:
-        n1 = arr.shape[0]
-        out1 = np.empty((n1,), dtype=np.uint32)
-        seed_pos = np.flatnonzero(arr)
-        if seed_pos.size == 0:
-            out1.fill(0)
-            if return_features:
-                return out1, np.zeros((n1,), dtype=np.uintp)
-            return out1
-        if seed_pos.size == 1:
-            out1.fill(<np.uint32_t>arr[int(seed_pos[0])])
-            if return_features:
-                feat1 = np.full((n1,), int(seed_pos[0]), dtype=np.uintp)
-                return out1, feat1
-            return out1
-        mids_arr = (seed_pos[:seed_pos.size-1] + seed_pos[1:]) * 0.5
-        for i in range(n1):
-            while k < mids_arr.size and i >= mids_arr[k]:
-                k += 1
-            s = <Py_ssize_t>seed_pos[min(k, seed_pos.size-1)]
-            out1[i] = <np.uint32_t>arr[s]
-        if return_features:
-            feat1 = np.empty((n1,), dtype=np.uintp)
-            k = 0
-            for i in range(n1):
-                while k < mids_arr.size and i >= mids_arr[k]:
-                    k += 1
-                feat1[i] = <Py_ssize_t>seed_pos[min(k, seed_pos.size-1)]
-            return out1, feat1
-        return out1
-
-    # General ND implementation (dims >= 2)
-    cdef native_bool bb = False
-    if not arr.flags.c_contiguous:
-        arr = np.ascontiguousarray(arr)
-    cdef np.ndarray[np.uint8_t, ndim=1] seeds_flat = (arr.ravel(order='K') != 0).view(np.uint8)
-    cdef np.ndarray[np.uint32_t, ndim=1] labels_flat = arr.ravel(order='K').astype(np.uint32, order='C')
-    cdef tuple shape = arr.shape
-    cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
-    cdef size_t* cstrides = <size_t*> malloc(nd * sizeof(size_t))
-    cdef Py_ssize_t* paxes = <Py_ssize_t*> malloc(nd * sizeof(Py_ssize_t))
-    cdef float* canis = <float*> malloc(nd * sizeof(float))
-    if cshape == NULL or cstrides == NULL or paxes == NULL or canis == NULL:
+    cshape = <size_t*> malloc(nd * sizeof(size_t))
+    canis = <float*> malloc(nd * sizeof(float))
+    if cshape == NULL or canis == NULL:
         if cshape != NULL: free(cshape)
-        if cstrides != NULL: free(cstrides)
-        if paxes != NULL: free(paxes)
         if canis != NULL: free(canis)
         raise MemoryError('Allocation failure in expand_labels')
-    cdef Py_ssize_t i_ax
-    cdef Py_ssize_t ii
+
+    total = 1
     for ii in range(nd):
-        cshape[ii] = <size_t>shape[ii]
+        cshape[ii] = <size_t>arr.shape[ii]
         canis[ii] = <float>anis[ii]
-    cstrides[nd-1] = 1
-    for ii in range(nd-2, -1, -1):
-        cstrides[ii] = cstrides[ii+1] * cshape[ii+1]
-    for ii in range(nd): paxes[ii] = ii
-    cdef Py_ssize_t j
-    cdef Py_ssize_t keyi
-    for ii in range(1, nd):
-        keyi = paxes[ii]
-        j = ii - 1
-        while j >= 0 and (cstrides[paxes[j]] > cstrides[keyi] or (cstrides[paxes[j]] == cstrides[keyi] and cshape[paxes[j]] < cshape[keyi])):
-            paxes[j+1] = paxes[j]
-            j -= 1
-        paxes[j+1] = keyi
+        total *= cshape[ii]
 
-    cdef size_t total = 1
-    for ii in range(nd): total *= cshape[ii]
-    cdef np.ndarray[np.float32_t, ndim=1] dist = np.empty((total,), dtype=np.float32)
-    cdef float* distp = <float*> np.PyArray_DATA(dist)
-    cdef bint use_u32_feat = (total < (1<<32))
-    cdef np.ndarray[np.uint32_t, ndim=1] lab_prev
-    cdef np.ndarray[np.uint32_t, ndim=1] lab_next
-    cdef np.ndarray[np.uint32_t, ndim=1] tmpL
-    cdef uint32_t* labp = <uint32_t*> np.PyArray_DATA(labels_flat)
-    cdef uint32_t* lprev
-    cdef uint32_t* lnext
-    feat_prev = None
-    fprev_u32 = NULL
-    fprev_sz = NULL
+    labels_out = np.empty((total,), dtype=np.uint32)
+    lout_p = <uint32_t*> np.PyArray_DATA(labels_out)
+    data_p = <const uint32_t*> np.PyArray_DATA(arr)
+
     if return_features:
+        use_u32_feat = (total < (<size_t>1 << 32))
         if use_u32_feat:
-            feat_prev = np.empty((total,), dtype=np.uint32)
-            fprev_u32 = <uint32_t*> np.PyArray_DATA(feat_prev)
+            feat_u32 = np.empty((total,), dtype=np.uint32)
+            feat_u32_p = <uint32_t*> np.PyArray_DATA(feat_u32)
+            with nogil:
+                expand_labels_features_fused[uint32_t, uint32_t](
+                    data_p, lout_p, feat_u32_p,
+                    cshape, canis, <size_t>nd, False, parallel)
+            free(cshape); free(canis)
+            return labels_out.reshape(arr.shape), feat_u32.reshape(arr.shape)
         else:
-            feat_prev = np.empty((total,), dtype=np.uintp)
-            fprev_sz = <size_t*> np.PyArray_DATA(feat_prev)
-    else:
-        lab_prev = np.empty((total,), dtype=np.uint32)
-        lab_next = np.empty((total,), dtype=np.uint32)
-        lprev = <uint32_t*> np.PyArray_DATA(lab_prev)
-        lnext = <uint32_t*> np.PyArray_DATA(lab_next)
-    cdef uint8_t* seedsp = <uint8_t*> np.PyArray_DATA(seeds_flat)
-    cdef uint32_t* labelsp = <uint32_t*> np.PyArray_DATA(labels_flat)
-
-    cdef Py_ssize_t ax0 = paxes[0]
-    cdef size_t n0 = cshape[ax0]
-    cdef size_t s0 = cstrides[ax0]
-    cdef size_t lines = total // n0
-    cdef size_t max_lines = lines
-    for ii in range(1, nd):
-        if total // cshape[paxes[ii]] > max_lines:
-            max_lines = total // cshape[paxes[ii]]
-    cdef size_t* bases = <size_t*> malloc(max_lines * sizeof(size_t))
-    if bases == NULL:
-        free(cshape); free(cstrides); free(paxes); free(canis)
-        raise MemoryError('Allocation failure for bases')
-    cdef Py_ssize_t ord_len = nd - 1
-    cdef Py_ssize_t* ax_ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-    if ax_ord == NULL:
-        free(bases); free(cshape); free(cstrides); free(paxes); free(canis)
-        raise MemoryError('Allocation failure for ax_ord')
-    cdef Py_ssize_t ord_pos = 0
-    for ii in range(nd):
-        if ii != ax0:
-            ax_ord[ord_pos] = ii
-            ord_pos += 1
-    for i_ax in range(1, ord_len):
-        keyi = ax_ord[i_ax]
-        j = i_ax - 1
-        while j >= 0 and (cstrides[ax_ord[j]] > cstrides[keyi] or (cstrides[ax_ord[j]] == cstrides[keyi] and cshape[ax_ord[j]] < cshape[keyi])):
-            ax_ord[j+1] = ax_ord[j]
-            j -= 1
-        ax_ord[j+1] = keyi
-    cdef size_t il
-    cdef size_t base_b
-    cdef size_t tmp_b
-    cdef size_t coord_b
-    with nogil:
-        for il in range(lines):
-            base_b = 0
-            tmp_b = il
-            for j in range(ord_len):
-                coord_b = tmp_b % cshape[ax_ord[j]]
-                base_b += coord_b * cstrides[ax_ord[j]]
-                tmp_b //= cshape[ax_ord[j]]
-            bases[il] = base_b
-    if return_features:
-        with nogil:
-            if use_u32_feat:
-                _nd_expand_init_bases[uint32_t](seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, fprev_u32, parallel)
-            else:
-                _nd_expand_init_bases[size_t](seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, fprev_sz, parallel)
+            feat_sz = np.empty((total,), dtype=np.uintp)
+            feat_sz_p = <size_t*> np.PyArray_DATA(feat_sz)
+            with nogil:
+                expand_labels_features_fused[uint32_t, size_t](
+                    data_p, lout_p, feat_sz_p,
+                    cshape, canis, <size_t>nd, False, parallel)
+            free(cshape); free(canis)
+            return labels_out.reshape(arr.shape), feat_sz.reshape(arr.shape)
     else:
         with nogil:
-            _nd_expand_init_labels_bases(seedsp, distp, bases, lines, n0, s0, canis[ax0], bb, labp, lprev, parallel)
-
-    for a in range(1, nd):
-        lines = total // cshape[paxes[a]]
-        free(ax_ord)
-        ord_len = nd - 1
-        ax_ord = <Py_ssize_t*> malloc(ord_len * sizeof(Py_ssize_t))
-        if ax_ord == NULL:
-            free(bases); free(cshape); free(cstrides); free(paxes); free(canis)
-            raise MemoryError('Allocation failure for ax_ord')
-        ord_pos = 0
-        for ii in range(nd):
-            if ii != paxes[a]:
-                ax_ord[ord_pos] = ii
-                ord_pos += 1
-        for i_ax in range(1, ord_len):
-            keyi = ax_ord[i_ax]
-            j = i_ax - 1
-            while j >= 0 and (cstrides[ax_ord[j]] > cstrides[keyi] or (cstrides[ax_ord[j]] == cstrides[keyi] and cshape[ax_ord[j]] < cshape[keyi])):
-                ax_ord[j+1] = ax_ord[j]
-                j -= 1
-            ax_ord[j+1] = keyi
-        with nogil:
-            for il in range(lines):
-                base_b = 0
-                tmp_b = il
-                for j in range(ord_len):
-                    coord_b = tmp_b % cshape[ax_ord[j]]
-                    base_b += coord_b * cstrides[ax_ord[j]]
-                    tmp_b //= cshape[ax_ord[j]]
-                bases[il] = base_b
-        n0 = cshape[paxes[a]]
-        s0 = cstrides[paxes[a]]
-        if return_features:
-            with nogil:
-                if use_u32_feat:
-                    _nd_expand_parabolic_bases[uint32_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_u32, parallel)
-                else:
-                    _nd_expand_parabolic_bases[size_t](distp, bases, lines, n0, s0, canis[paxes[a]], bb, fprev_sz, parallel)
-        else:
-            with nogil:
-                _nd_expand_parabolic_labels_bases(distp, bases, lines, n0, s0, canis[paxes[a]], bb, lprev, lnext, parallel)
-            tmpL = lab_prev; lab_prev = lab_next; lab_next = tmpL
-            lprev = <uint32_t*> np.PyArray_DATA(lab_prev)
-            lnext = <uint32_t*> np.PyArray_DATA(lab_next)
-
-    free(bases); free(ax_ord); free(cshape); free(cstrides); free(paxes); free(canis)
-    if return_features:
-        out_flat = np.empty((total,), dtype=np.uint32)
-        if use_u32_feat:
-            for il in range(total):
-                idx2 = fprev_u32[il]
-                out_flat[il] = labels_flat[idx2]
-        else:
-            for il in range(total):
-                idx2 = fprev_sz[il]
-                out_flat[il] = labels_flat[idx2]
-        return out_flat.reshape(arr.shape), feat_prev.reshape(arr.shape)
-    return lab_prev.reshape(arr.shape)
+            expand_labels_fused[uint32_t](
+                data_p, lout_p, cshape, canis, <size_t>nd, False, parallel)
+        free(cshape); free(canis)
+        return labels_out.reshape(arr.shape)
 
 
 def configure(
