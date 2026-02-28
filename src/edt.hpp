@@ -83,8 +83,7 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
  * Graph-first design: This function reads the voxel connectivity graph
  * and computes the Rosenfeld-Pfaltz 1D EDT (pass 0) directly.
  *
- * This version doesn't write segment labels - use when parabolic passes
- * are also fused and don't need segment labels.
+ * All parabolic passes read the graph directly; no version writes segment labels.
  */
 template <typename GRAPH_T>
 inline void squared_edt_1d_from_graph_direct(
@@ -207,8 +206,7 @@ inline void edt_pass0_from_graph_direct_parallel(
 
     const size_t threads = compute_threads(parallel, total_lines, n);
 
-    // Recursive iteration over remaining dimensions (after first)
-    // This is a nested loop unrolled at runtime
+    // Iterative nested loop over remaining dimensions (after first)
     auto for_each_inner = [&](size_t offset, auto& kernel) {
         if (num_other_dims <= 1) {
             kernel(offset);
@@ -616,7 +614,6 @@ inline void edtsq_from_graph(
     }
     if (total == 0) return;
 
-    // Axis bit encoding (foreground at bit 0, edge bits at odd positions)
     // Axis bit encoding: bit 0 = foreground; axis a -> bit (2*(dims-1-a)+1).
     // For 2D: axis 0 -> bit 3, axis 1 -> bit 1
     // For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
@@ -877,7 +874,7 @@ inline void edtsq_from_labels_fused(
         build_connectivity_graph<T, uint8_t>(labels, graph.get(), shape, dims, parallel);
         edtsq_from_graph<uint8_t>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);
     } else {
-        // 5D+: use uint16 for graph bits (supports up to 8D; for 9D+ use edtsq_from_graph directly) for graph bits
+        // 5D+: use uint16 for graph bits (supports up to 8D; for 9D+ use edtsq_from_graph directly)
         std::unique_ptr<uint16_t[]> graph(new uint16_t[total]);
         build_connectivity_graph<T, uint16_t>(labels, graph.get(), shape, dims, parallel);
         edtsq_from_graph<uint16_t>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);
