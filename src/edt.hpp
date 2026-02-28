@@ -1,14 +1,18 @@
 /*
  * Graph-First Euclidean Distance Transform (ND)
  *
- * Input: a labels array or a pre-built voxel connectivity graph (bit-encoded uint8/uint16).
+ * Input: a labels array or a pre-built voxel connectivity graph
+ *        (bit-encoded uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-12D, uint64 for 13-16D).
  *
- * Pipeline:
- *   1. Build segment labels: each contiguous same-label region gets a unique uint32_t ID.
- *      Boundaries are detected from graph edge bits rather than label comparisons,
- *      saving memory bandwidth (1 byte vs 4 bytes per voxel for uint32 labels).
- *   2. Run EDT on segment labels using the Meijster/Felzenszwalb separable parabolic
- *      envelope algorithm — O(N) per scanline, parallelised across scanlines.
+ * Pipeline (edtsq / edtsq_from_labels_fused):
+ *   1. Build a compact connectivity graph (uint8 for 1-4D, uint16 for 5-8D): each voxel
+ *      stores a bitmask of forward edges plus a foreground marker at bit 0.
+ *   2. Run all EDT passes directly from the graph — no intermediate segment label array:
+ *      - Pass 0 (innermost axis): Rosenfeld-Pfaltz scan detects boundaries from graph
+ *        edge bits and writes squared 1D distances.
+ *      - Passes 1..N-1: parabolic envelope reads graph edge bits per scanline in-place.
+ *   O(N) per scanline, parallelised across scanlines.
+ *   For edtsq_graph: step 1 is skipped (caller supplies the pre-built graph).
  *
  * See src/README.md for graph bit encoding, memory layout, and algorithm details.
  */
@@ -17,7 +21,6 @@
 #define EDT_HPP
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -52,13 +55,15 @@ inline ThreadPool& shared_pool_for(size_t threads) {
     return *entry;
 }
 
-// Compute effective thread count (like ND v1 capping)
+// Per-pass thread cap: further limits threads based on work in a single EDT axis pass.
+// This is a C++-level inner cap applied per axis pass; the caller-supplied `desired`
+// is already capped at the Python level by _adaptive_thread_limit_nd.
 inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_length) {
     if (desired <= 1 || total_lines <= 1) return 1;
 
     size_t threads = std::min<size_t>(desired, total_lines);
 
-    // Cap based on total work (like ND v1)
+    // Further cap based on work per pass (total_work = voxels along this axis sweep)
     const size_t total_work = axis_length * total_lines;
     if (total_work <= 60000) {
         threads = std::min<size_t>(threads, 4);
@@ -71,160 +76,6 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
     return std::max<size_t>(1, threads);
 }
 
-// for_each_range template (matching ND v1's constexpr pattern)
-// This helps the compiler optimize the iteration loop
-template <typename Fn>
-inline void for_each_range_1d(size_t extent, size_t stride, size_t begin, size_t end, Fn&& fn) {
-    begin = std::min(begin, extent);
-    end = std::min(end, extent);
-    size_t offset = begin * stride;
-    for (size_t i = begin; i < end; ++i) {
-        fn(offset);
-        offset += stride;
-    }
-}
-
-//-----------------------------------------------------------------------------
-// Segment Label Building
-//-----------------------------------------------------------------------------
-
-/*
- * Build segment labels from a label array for a single scanline.
- *
- * For each scanline along the axis:
- * - Background (label=0) gets segment ID = 0
- * - Each run of same non-zero labels gets a unique segment ID
- * - Label transitions create new segment IDs
- *
- * NOTE: Segment IDs only need to be unique within each scanline because
- * EDT processes each scanline independently. This eliminates atomic contention.
- */
-template <typename T>
-inline void build_segment_labels_1d_local(
-    uint32_t* seg_labels,
-    const T* labels,
-    const int n,
-    const int64_t stride
-) {
-    if (n <= 0) return;
-
-    uint32_t next_seg_id = 1;  // Local counter, no atomic needed
-    int i = 0;
-
-    while (i < n) {
-        const int64_t base_idx = i * stride;
-        const T label = labels[base_idx];
-
-        if (label == 0) {
-            // Background: segment ID = 0
-            seg_labels[base_idx] = 0;
-            i++;
-            continue;
-        }
-
-        // Foreground: find extent of same-label run
-        const int seg_start = i;
-        i++;
-        while (i < n && labels[i * stride] == label) {
-            i++;
-        }
-        const int seg_len = i - seg_start;
-
-        // Assign unique segment ID to this run (local to this scanline)
-        const uint32_t seg_id = next_seg_id++;
-        for (int k = 0; k < seg_len; k++) {
-            seg_labels[(seg_start + k) * stride] = seg_id;
-        }
-    }
-}
-
-// Legacy version with atomic for backward compatibility
-template <typename T>
-inline void build_segment_labels_1d(
-    uint32_t* seg_labels,
-    const T* labels,
-    const int n,
-    const size_t stride,
-    std::atomic<uint32_t>& next_seg_id
-) {
-    if (n <= 0) return;
-
-    int i = 0;
-    while (i < n) {
-        const size_t base_idx = i * stride;
-        const T label = labels[base_idx];
-
-        if (label == 0) {
-            seg_labels[base_idx] = 0;
-            i++;
-            continue;
-        }
-
-        const int seg_start = i;
-        i++;
-        while (i < n && labels[i * stride] == label) {
-            i++;
-        }
-        const int seg_len = i - seg_start;
-
-        const uint32_t seg_id = next_seg_id.fetch_add(1, std::memory_order_relaxed);
-        for (int k = 0; k < seg_len; k++) {
-            seg_labels[(seg_start + k) * stride] = seg_id;
-        }
-    }
-}
-
-/*
- * Build segment labels from a voxel graph for a single axis.
- *
- * The voxel graph encodes connectivity:
- * - graph[i] == 0 means background (no edges)
- * - graph[i] & axis_bit means connected to i+1 along this axis
- *
- * A segment boundary exists when:
- * - graph[i] is background (0)
- * - graph[i-1] & axis_bit == 0 (no edge from i-1 to i)
- */
-// Local counter version for graph (no atomic contention)
-template <typename GRAPH_T>
-inline void build_segment_labels_from_graph_1d_local(
-    uint32_t* seg_labels,
-    const GRAPH_T* graph,
-    const int n,
-    const int64_t stride,
-    const GRAPH_T axis_bit
-) {
-    if (n <= 0) return;
-
-    uint32_t next_seg_id = 1;  // Local counter
-    int i = 0;
-
-    while (i < n) {
-        const int64_t base_idx = i * stride;
-
-        if (graph[base_idx] == 0) {
-            seg_labels[base_idx] = 0;
-            i++;
-            continue;
-        }
-
-        const int seg_start = i;
-        GRAPH_T edge = graph[base_idx];
-        i++;
-
-        while (i < n && (edge & axis_bit)) {
-            edge = graph[i * stride];
-            if (edge == 0) break;
-            i++;
-        }
-        const int seg_len = i - seg_start;
-
-        const uint32_t seg_id = next_seg_id++;
-        for (int k = 0; k < seg_len; k++) {
-            seg_labels[(seg_start + k) * stride] = seg_id;
-        }
-    }
-}
 
 /*
  * FUSED Pass 0 from Graph (no segment label output)
@@ -307,527 +158,10 @@ inline void squared_edt_1d_from_graph_direct(
     }
 }
 
-/*
- * FUSED Pass 0 + Segment Label Building from Graph (legacy version with seg_labels output)
- */
-template <typename GRAPH_T>
-inline void squared_edt_1d_from_graph_fused(
-    const GRAPH_T* graph,
-    float* d,
-    uint32_t* seg_labels,
-    const int n,
-    const int64_t stride,
-    const GRAPH_T axis_bit,
-    const float anisotropy,
-    const bool black_border
-) {
-    if (n <= 0) return;
-
-    const float inf = std::numeric_limits<float>::infinity();
-    uint32_t next_seg_id = 1;
-    int i = 0;
-
-    while (i < n) {
-        const int64_t base_idx = i * stride;
-
-        // Check if this voxel is background (graph == 0)
-        if (graph[base_idx] == 0) {
-            d[base_idx] = 0.0f;
-            seg_labels[base_idx] = 0;
-            i++;
-            continue;
-        }
-
-        // Foreground: find segment extent using connectivity bits
-        const int seg_start = i;
-        GRAPH_T edge = graph[base_idx];
-        i++;
-
-        // Follow connectivity along axis
-        while (i < n && (edge & axis_bit)) {
-            edge = graph[i * stride];
-            if (edge == 0) break;
-            i++;
-        }
-        const int seg_len = i - seg_start;
-
-        // Assign segment ID and compute EDT in one pass
-        const uint32_t seg_id = next_seg_id++;
-        const bool left_boundary = (seg_start > 0) || black_border;
-        const bool right_boundary = (i < n) || black_border;
-
-        // Forward pass: write distances and segment labels
-        if (left_boundary) {
-            for (int k = 0; k < seg_len; k++) {
-                const int64_t idx = (seg_start + k) * stride;
-                d[idx] = (k + 1) * anisotropy;
-                seg_labels[idx] = seg_id;
-            }
-        } else {
-            for (int k = 0; k < seg_len; k++) {
-                const int64_t idx = (seg_start + k) * stride;
-                d[idx] = inf;
-                seg_labels[idx] = seg_id;
-            }
-        }
-
-        // Backward pass
-        if (right_boundary) {
-            for (int k = seg_len - 1; k >= 0; k--) {
-                const float v = (seg_len - k) * anisotropy;
-                const int64_t idx = (seg_start + k) * stride;
-                if (v < d[idx]) {
-                    d[idx] = v;
-                }
-            }
-        }
-
-        // Square the distances
-        for (int k = 0; k < seg_len; k++) {
-            const int64_t idx = (seg_start + k) * stride;
-            d[idx] *= d[idx];
-        }
-    }
-}
-
-// Legacy version with atomic
-template <typename GRAPH_T>
-inline void build_segment_labels_from_graph_1d(
-    uint32_t* seg_labels,
-    const GRAPH_T* graph,
-    const int n,
-    const size_t stride,
-    const GRAPH_T axis_bit,
-    std::atomic<uint32_t>& next_seg_id
-) {
-    if (n <= 0) return;
-
-    int i = 0;
-    while (i < n) {
-        const size_t base_idx = i * stride;
-
-        if (graph[base_idx] == 0) {
-            seg_labels[base_idx] = 0;
-            i++;
-            continue;
-        }
-
-        const int seg_start = i;
-        GRAPH_T edge = graph[base_idx];
-        i++;
-
-        while (i < n && (edge & axis_bit)) {
-            edge = graph[i * stride];
-            if (edge == 0) break;
-            i++;
-        }
-        const int seg_len = i - seg_start;
-
-        const uint32_t seg_id = next_seg_id.fetch_add(1, std::memory_order_relaxed);
-        for (int k = 0; k < seg_len; k++) {
-            seg_labels[(seg_start + k) * stride] = seg_id;
-        }
-    }
-}
-
-/*
- * Build segment labels from labels with explicit barriers for a single axis.
- *
- * barriers: uint8_t array where barriers[i] & axis_bit means barrier after position i
- *           (segment boundary between i and i+1)
- */
-template <typename T>
-inline void build_segment_labels_with_barriers_1d(
-    uint32_t* seg_labels,
-    const T* labels,
-    const uint8_t* barriers,
-    const int n,
-    const size_t stride,
-    const uint8_t axis_bit,
-    std::atomic<uint32_t>& next_seg_id
-) {
-    if (n <= 0) return;
-
-    int i = 0;
-    while (i < n) {
-        const size_t base_idx = i * stride;
-        const T label = labels[base_idx];
-
-        if (label == 0) {
-            // Background: segment ID = 0
-            seg_labels[base_idx] = 0;
-            i++;
-            continue;
-        }
-
-        // Foreground: find extent considering both label transitions AND barriers
-        const int seg_start = i;
-        i++;
-        while (i < n) {
-            // Stop if label changes
-            if (labels[i * stride] != label) break;
-            // Stop if barrier after previous position
-            if (barriers[(i - 1) * stride] & axis_bit) break;
-            i++;
-        }
-        const int seg_len = i - seg_start;
-
-        // Assign unique segment ID
-        const uint32_t seg_id = next_seg_id.fetch_add(1, std::memory_order_relaxed);
-        for (int k = 0; k < seg_len; k++) {
-            seg_labels[(seg_start + k) * stride] = seg_id;
-        }
-    }
-}
-
 //-----------------------------------------------------------------------------
-// Parallel Segment Label Building (optimized with shared pool, local counters)
+// Pass 0 from Graph (parallel dispatch, fully fused - reads graph directly)
 //-----------------------------------------------------------------------------
 
-template <typename T>
-inline void build_segment_labels_parallel(
-    uint32_t* seg_labels,
-    const T* labels,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    const int n = int(shape[axis]);
-    const int64_t stride_ax = strides[axis];
-    if (n == 0) return;
-
-    // Fast path for 2D - direct iteration like EDT passes
-    if (dims == 2) {
-        const size_t other_axis = (axis == 0) ? 1 : 0;
-        const size_t other_n = shape[other_axis];
-        const int64_t other_stride = strides[other_axis];
-
-        const size_t threads = compute_threads(parallel, other_n, n);
-        if (threads <= 1) {
-            size_t offset = 0;
-            for (size_t i = 0; i < other_n; i++) {
-                build_segment_labels_1d_local<T>(
-                    seg_labels + offset, labels + offset, n, stride_ax
-                );
-                offset += other_stride;
-            }
-            return;
-        }
-
-        ThreadPool& pool = shared_pool_for(threads);
-        const size_t per_thread = (other_n + threads - 1) / threads;
-        std::vector<std::future<void>> pending;
-        pending.reserve(threads);
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t begin = t * per_thread;
-            if (begin >= other_n) break;
-            const size_t end = std::min(other_n, begin + per_thread);
-            pending.push_back(pool.enqueue([=]() {
-                size_t offset = begin * other_stride;
-                for (size_t i = begin; i < end; i++) {
-                    build_segment_labels_1d_local<T>(
-                        seg_labels + offset, labels + offset, n, stride_ax
-                    );
-                    offset += other_stride;
-                }
-            }));
-        }
-        for (auto& f : pending) f.get();
-        return;
-    }
-
-    // Generic fallback for 3D+
-    size_t total_lines = 1;
-    for (size_t d = 0; d < dims; d++) {
-        if (d != axis) total_lines *= shape[d];
-    }
-
-    std::vector<size_t> bases(total_lines);
-    size_t idx = 0;
-    std::vector<size_t> coords(dims, 0);
-    for (size_t line = 0; line < total_lines; line++) {
-        size_t base = 0;
-        for (size_t d = 0; d < dims; d++) {
-            if (d != axis) base += coords[d] * strides[d];
-        }
-        bases[idx++] = base;
-        for (size_t d = 0; d < dims; d++) {
-            if (d == axis) continue;
-            coords[d]++;
-            if (coords[d] < shape[d]) break;
-            coords[d] = 0;
-        }
-    }
-
-    const size_t threads = compute_threads(parallel, total_lines, n);
-    if (threads <= 1) {
-        for (size_t i = 0; i < total_lines; i++) {
-            build_segment_labels_1d_local<T>(
-                seg_labels + bases[i], labels + bases[i], n, stride_ax
-            );
-        }
-        return;
-    }
-
-    ThreadPool& pool = shared_pool_for(threads);
-    const size_t per_thread = (total_lines + threads - 1) / threads;
-    std::vector<std::future<void>> pending;
-    pending.reserve(threads);
-
-    for (size_t t = 0; t < threads; t++) {
-        const size_t begin = t * per_thread;
-        if (begin >= total_lines) break;
-        const size_t end = std::min(total_lines, begin + per_thread);
-        pending.push_back(pool.enqueue([=, &bases]() {
-            for (size_t i = begin; i < end; i++) {
-                build_segment_labels_1d_local<T>(
-                    seg_labels + bases[i], labels + bases[i], n, stride_ax
-                );
-            }
-        }));
-    }
-    for (auto& f : pending) f.get();
-}
-
-template <typename GRAPH_T>
-inline void build_segment_labels_from_graph_parallel(
-    uint32_t* seg_labels,
-    const GRAPH_T* graph,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const GRAPH_T axis_bit,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    const int n = int(shape[axis]);
-    const int64_t stride_ax = strides[axis];
-    if (n == 0) return;
-
-    // Fast path for 2D
-    if (dims == 2) {
-        const size_t other_axis = (axis == 0) ? 1 : 0;
-        const size_t other_n = shape[other_axis];
-        const int64_t other_stride = strides[other_axis];
-
-        const size_t threads = compute_threads(parallel, other_n, n);
-        if (threads <= 1) {
-            size_t offset = 0;
-            for (size_t i = 0; i < other_n; i++) {
-                build_segment_labels_from_graph_1d_local<GRAPH_T>(
-                    seg_labels + offset, graph + offset, n, stride_ax, axis_bit
-                );
-                offset += other_stride;
-            }
-            return;
-        }
-
-        ThreadPool& pool = shared_pool_for(threads);
-        const size_t per_thread = (other_n + threads - 1) / threads;
-        std::vector<std::future<void>> pending;
-        pending.reserve(threads);
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t begin = t * per_thread;
-            if (begin >= other_n) break;
-            const size_t end = std::min(other_n, begin + per_thread);
-            pending.push_back(pool.enqueue([=]() {
-                size_t offset = begin * other_stride;
-                for (size_t i = begin; i < end; i++) {
-                    build_segment_labels_from_graph_1d_local<GRAPH_T>(
-                        seg_labels + offset, graph + offset, n, stride_ax, axis_bit
-                    );
-                    offset += other_stride;
-                }
-            }));
-        }
-        for (auto& f : pending) f.get();
-        return;
-    }
-
-    // Generic fallback for 3D+
-    size_t total_lines = 1;
-    for (size_t d = 0; d < dims; d++) {
-        if (d != axis) total_lines *= shape[d];
-    }
-
-    std::vector<size_t> bases(total_lines);
-    size_t idx = 0;
-    std::vector<size_t> coords(dims, 0);
-    for (size_t line = 0; line < total_lines; line++) {
-        size_t base = 0;
-        for (size_t d = 0; d < dims; d++) {
-            if (d != axis) base += coords[d] * strides[d];
-        }
-        bases[idx++] = base;
-        for (size_t d = 0; d < dims; d++) {
-            if (d == axis) continue;
-            coords[d]++;
-            if (coords[d] < shape[d]) break;
-            coords[d] = 0;
-        }
-    }
-
-    const size_t threads = compute_threads(parallel, total_lines, n);
-    if (threads <= 1) {
-        for (size_t i = 0; i < total_lines; i++) {
-            build_segment_labels_from_graph_1d_local<GRAPH_T>(
-                seg_labels + bases[i], graph + bases[i], n, stride_ax, axis_bit
-            );
-        }
-        return;
-    }
-
-    ThreadPool& pool = shared_pool_for(threads);
-    const size_t per_thread = (total_lines + threads - 1) / threads;
-    std::vector<std::future<void>> pending;
-    pending.reserve(threads);
-
-    for (size_t t = 0; t < threads; t++) {
-        const size_t begin = t * per_thread;
-        if (begin >= total_lines) break;
-        const size_t end = std::min(total_lines, begin + per_thread);
-        pending.push_back(pool.enqueue([=, &bases]() {
-            for (size_t i = begin; i < end; i++) {
-                build_segment_labels_from_graph_1d_local<GRAPH_T>(
-                    seg_labels + bases[i], graph + bases[i], n, stride_ax, axis_bit
-                );
-            }
-        }));
-    }
-    for (auto& f : pending) f.get();
-}
-
-//-----------------------------------------------------------------------------
-// FUSED Pass 0 from Graph (parallel dispatch)
-//-----------------------------------------------------------------------------
-
-template <typename GRAPH_T>
-inline void edt_pass0_from_graph_fused_parallel(
-    const GRAPH_T* graph,
-    float* output,
-    uint32_t* seg_labels,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const GRAPH_T axis_bit,
-    const float anisotropy,
-    const bool black_border,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    const int n = int(shape[axis]);
-    const int64_t stride_ax = strides[axis];
-    if (n == 0) return;
-
-    // Fast path for 2D
-    if (dims == 2) {
-        const size_t other_axis = (axis == 0) ? 1 : 0;
-        const size_t other_n = shape[other_axis];
-        const int64_t other_stride = strides[other_axis];
-
-        const size_t threads = compute_threads(parallel, other_n, n);
-        if (threads <= 1) {
-            size_t offset = 0;
-            for (size_t i = 0; i < other_n; i++) {
-                squared_edt_1d_from_graph_fused<GRAPH_T>(
-                    graph + offset, output + offset, seg_labels + offset,
-                    n, stride_ax, axis_bit, anisotropy, black_border
-                );
-                offset += other_stride;
-            }
-            return;
-        }
-
-        ThreadPool& pool = shared_pool_for(threads);
-        const size_t per_thread = (other_n + threads - 1) / threads;
-        std::vector<std::future<void>> pending;
-        pending.reserve(threads);
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t begin = t * per_thread;
-            if (begin >= other_n) break;
-            const size_t end = std::min(other_n, begin + per_thread);
-            pending.push_back(pool.enqueue([=]() {
-                size_t offset = begin * other_stride;
-                for (size_t i = begin; i < end; i++) {
-                    squared_edt_1d_from_graph_fused<GRAPH_T>(
-                        graph + offset, output + offset, seg_labels + offset,
-                        n, stride_ax, axis_bit, anisotropy, black_border
-                    );
-                    offset += other_stride;
-                }
-            }));
-        }
-        for (auto& f : pending) f.get();
-        return;
-    }
-
-    // Generic fallback for 3D+
-    size_t total_lines = 1;
-    for (size_t d = 0; d < dims; d++) {
-        if (d != axis) total_lines *= shape[d];
-    }
-
-    std::vector<size_t> bases(total_lines);
-    size_t idx = 0;
-    std::vector<size_t> coords(dims, 0);
-    for (size_t line = 0; line < total_lines; line++) {
-        size_t base = 0;
-        for (size_t d = 0; d < dims; d++) {
-            if (d != axis) base += coords[d] * strides[d];
-        }
-        bases[idx++] = base;
-        for (size_t d = 0; d < dims; d++) {
-            if (d == axis) continue;
-            coords[d]++;
-            if (coords[d] < shape[d]) break;
-            coords[d] = 0;
-        }
-    }
-
-    const size_t threads = compute_threads(parallel, total_lines, n);
-    if (threads <= 1) {
-        for (size_t i = 0; i < total_lines; i++) {
-            squared_edt_1d_from_graph_fused<GRAPH_T>(
-                graph + bases[i], output + bases[i], seg_labels + bases[i],
-                n, stride_ax, axis_bit, anisotropy, black_border
-            );
-        }
-        return;
-    }
-
-    ThreadPool& pool = shared_pool_for(threads);
-    const size_t per_thread = (total_lines + threads - 1) / threads;
-    std::vector<std::future<void>> pending;
-    pending.reserve(threads);
-
-    for (size_t t = 0; t < threads; t++) {
-        const size_t begin = t * per_thread;
-        if (begin >= total_lines) break;
-        const size_t end = std::min(total_lines, begin + per_thread);
-        pending.push_back(pool.enqueue([=, &bases]() {
-            for (size_t i = begin; i < end; i++) {
-                squared_edt_1d_from_graph_fused<GRAPH_T>(
-                    graph + bases[i], output + bases[i], seg_labels + bases[i],
-                    n, stride_ax, axis_bit, anisotropy, black_border
-                );
-            }
-        }));
-    }
-    for (auto& f : pending) f.get();
-}
-
-// Direct version (no seg_labels output) - for fully fused graph path
 template <typename GRAPH_T>
 inline void edt_pass0_from_graph_direct_parallel(
     const GRAPH_T* graph,
@@ -848,12 +182,13 @@ inline void edt_pass0_from_graph_direct_parallel(
     if (n == 0) return;
 
     // Unified ND path - parallelize over first other dimension like ND v1
-    // Build arrays of extents and strides for dimensions other than axis
+    // Build arrays of extents and strides for dimensions other than axis.
+    // Size 16 supports up to 16D total (at most 15 other dims per axis pass).
     size_t num_other_dims = 0;
-    size_t other_extents[8];  // Max 8D support
-    size_t other_strides[8];
+    size_t other_extents[16];
+    size_t other_strides[16];
     size_t total_lines = 1;
-    for (size_t d = 0; d < dims && num_other_dims < 8; d++) {
+    for (size_t d = 0; d < dims && num_other_dims < 16; d++) {
         if (d != axis) {
             other_extents[num_other_dims] = shape[d];
             other_strides[num_other_dims] = strides[d];
@@ -880,7 +215,7 @@ inline void edt_pass0_from_graph_direct_parallel(
             return;
         }
         // Iterate dims 1..num_other_dims-1
-        size_t coords[8] = {0};
+        size_t coords[16] = {0};
         size_t base = offset;
         for (size_t i = 0; i < rest_product; i++) {
             kernel(base);
@@ -934,7 +269,7 @@ inline void edt_pass0_from_graph_direct_parallel(
                 if (num_other_dims <= 1) {
                     inner_kernel(offset);
                 } else {
-                    size_t coords[8] = {0};
+                    size_t coords[16] = {0};
                     size_t base = offset;
                     for (size_t i = 0; i < rest_product; i++) {
                         inner_kernel(base);
@@ -953,188 +288,8 @@ inline void edt_pass0_from_graph_direct_parallel(
     for (auto& f : pending) f.get();
 }
 
-//-----------------------------------------------------------------------------
-// EDT using Segment Labels (identical to ND algorithm)
-//-----------------------------------------------------------------------------
-
 template <typename T>
 inline float sq(T x) { return float(x) * float(x); }
-
-/*
- * Pass 0: Rosenfeld-Pfaltz style 1D EDT for multi-segment data.
- * This is IDENTICAL to ND's _squared_edt_1d_multi_seg_run.
- * Templated to work with any segment ID type.
- */
-// Match ND v1's exact types for optimal codegen
-template <typename T>
-inline void squared_edt_1d_multi_seg_generic(
-    const T* segids,
-    float* d,
-    const int n,
-    const int64_t stride,  // int64_t like ND v1
-    const float anisotropy,
-    const bool black_border
-) {
-    if (n <= 0) return;
-
-    const float inf = std::numeric_limits<float>::infinity();
-    int64_t i = 0;  // int64_t like ND v1
-
-    while (i < n) {
-        const int64_t base = i * stride;
-        const T label = segids[base];
-
-        // Find segment extent - the critical loop
-        int64_t j = i + 1;
-        while (j < n && segids[j * stride] == label) {
-            ++j;
-        }
-        const int64_t len = j - i;
-
-        if (label == 0) {
-            // Background: write zeros
-            for (int64_t k = 0; k < len; ++k) {
-                d[(i + k) * stride] = 0.0f;
-            }
-            i = j;
-            continue;
-        }
-
-        // Foreground segment
-        const bool left_boundary = (i > 0) || black_border;
-        const bool right_boundary = (j < n) || black_border;
-
-        // Forward pass
-        if (left_boundary) {
-            for (int64_t k = 0; k < len; ++k) {
-                d[(i + k) * stride] = (k + 1) * anisotropy;
-            }
-        } else {
-            for (int64_t k = 0; k < len; ++k) {
-                d[(i + k) * stride] = inf;
-            }
-        }
-
-        // Backward pass
-        if (right_boundary) {
-            for (int64_t k = len - 1; k >= 0; --k) {
-                const float v = (len - k) * anisotropy;
-                const int64_t idx = (i + k) * stride;
-                if (v < d[idx]) {
-                    d[idx] = v;
-                }
-            }
-        }
-
-        // Square
-        for (int64_t k = 0; k < len; ++k) {
-            const int64_t idx = (i + k) * stride;
-            d[idx] *= d[idx];
-        }
-
-        i = j;
-    }
-}
-
-/*
- * FUSED Pass 0 + Segment Label Building
- *
- * Graph-first design: Labels MUST be converted to segment labels.
- * This function does BOTH pass 0 EDT AND builds segment labels in one pass,
- * avoiding the overhead of a separate segment building pass.
- *
- * The segment labels are then used by subsequent parabolic passes.
- */
-template <typename T>
-inline void squared_edt_1d_multi_seg_build_seglabels(
-    const T* labels,
-    float* d,
-    uint32_t* seg_labels,
-    const int n,
-    const int64_t stride,
-    const float anisotropy,
-    const bool black_border
-) {
-    if (n <= 0) return;
-
-    const float inf = std::numeric_limits<float>::infinity();
-    int64_t i = 0;
-    uint32_t next_seg_id = 1;  // Local counter (no atomic needed per-scanline)
-
-    while (i < n) {
-        const int64_t base = i * stride;
-        const T label = labels[base];
-
-        // Find segment extent - the critical loop
-        int64_t j = i + 1;
-        while (j < n && labels[j * stride] == label) {
-            ++j;
-        }
-        const int64_t len = j - i;
-
-        if (label == 0) {
-            // Background: write zeros to both output and segment labels
-            for (int64_t k = 0; k < len; ++k) {
-                const int64_t idx = (i + k) * stride;
-                d[idx] = 0.0f;
-                seg_labels[idx] = 0;
-            }
-            i = j;
-            continue;
-        }
-
-        // Foreground segment: assign unique segment ID
-        const uint32_t seg_id = next_seg_id++;
-        const bool left_boundary = (i > 0) || black_border;
-        const bool right_boundary = (j < n) || black_border;
-
-        // Forward pass + write segment labels
-        if (left_boundary) {
-            for (int64_t k = 0; k < len; ++k) {
-                const int64_t idx = (i + k) * stride;
-                d[idx] = (k + 1) * anisotropy;
-                seg_labels[idx] = seg_id;
-            }
-        } else {
-            for (int64_t k = 0; k < len; ++k) {
-                const int64_t idx = (i + k) * stride;
-                d[idx] = inf;
-                seg_labels[idx] = seg_id;
-            }
-        }
-
-        // Backward pass (segment labels already written)
-        if (right_boundary) {
-            for (int64_t k = len - 1; k >= 0; --k) {
-                const float v = (len - k) * anisotropy;
-                const int64_t idx = (i + k) * stride;
-                if (v < d[idx]) {
-                    d[idx] = v;
-                }
-            }
-        }
-
-        // Square
-        for (int64_t k = 0; k < len; ++k) {
-            const int64_t idx = (i + k) * stride;
-            d[idx] *= d[idx];
-        }
-
-        i = j;
-    }
-}
-
-// Non-templated version for backward compatibility
-inline void squared_edt_1d_multi_seg(
-    const uint32_t* segids,
-    float* d,
-    const int n,
-    const int64_t stride,  // int64_t like ND v1
-    const float anisotropy,
-    const bool black_border
-) {
-    squared_edt_1d_multi_seg_generic<uint32_t>(segids, d, n, stride, anisotropy, black_border);
-}
 
 /*
  * FUSED Parabolic Pass from Graph
@@ -1311,575 +466,6 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
     }
 }
 
-/*
- * Parabolic envelope EDT for Pass 1+
- * Also identical to ND's implementation.
- */
-inline void squared_edt_1d_parabolic_ws(
-    float* f,
-    const int n,
-    const int64_t stride,  // int64_t like ND v1
-    const float anisotropy,
-    const bool black_border_left,
-    const bool black_border_right,
-    int* v,
-    float* ff,
-    float* ranges
-) {
-    if (n == 0) return;
-
-    const float w2 = anisotropy * anisotropy;
-    int k = 0;
-
-    for (int i = 0; i < n; i++) {
-        ff[i] = f[i * stride];
-    }
-
-    ranges[0] = -std::numeric_limits<float>::infinity();
-    ranges[1] = std::numeric_limits<float>::infinity();
-
-    float s, factor1;
-    int factor2;
-    for (int i = 1; i < n; i++) {
-        factor1 = (i - v[k]) * w2;
-        factor2 = i + v[k];
-        s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
-
-        while (k > 0 && s <= ranges[k]) {
-            k--;
-            factor1 = (i - v[k]) * w2;
-            factor2 = i + v[k];
-            s = (ff[i] - ff[v[k]] + factor1 * factor2) / (2.0f * factor1);
-        }
-
-        k++;
-        v[k] = i;
-        ranges[k] = s;
-        ranges[k + 1] = std::numeric_limits<float>::infinity();
-    }
-
-    k = 0;
-    for (int i = 0; i < n; i++) {
-        while (ranges[k + 1] < i) {
-            k++;
-        }
-
-        f[i * stride] = w2 * sq(i - v[k]) + ff[v[k]];
-
-        // Apply boundary envelope
-        if (black_border_left && black_border_right) {
-            const float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(n - i));
-            f[i * stride] = std::fminf(envelope, f[i * stride]);
-        } else if (black_border_left) {
-            f[i * stride] = std::fminf(w2 * sq(i + 1), f[i * stride]);
-        } else if (black_border_right) {
-            f[i * stride] = std::fminf(w2 * sq(n - i), f[i * stride]);
-        }
-    }
-}
-
-// Match ND v1's exact multi-seg parabolic implementation with SMALL_THRESHOLD optimization
-template <typename T>
-inline void squared_edt_1d_parabolic_multi_seg_ws_generic(
-    const T* segids,
-    float* f,
-    const int n,
-    const int64_t stride,  // int64_t like ND v1
-    const float anisotropy,
-    const bool black_border,
-    int* v,
-    float* ff,
-    float* ranges
-) {
-    constexpr int SMALL_THRESHOLD = 8;
-    const float anis_sq = anisotropy * anisotropy;
-
-    // Fast path for small segments: O(n²) brute force is faster than parabolic envelope
-    auto process_small_run = [&](int64_t start, int len, bool left_border, bool right_border) {
-        float original[SMALL_THRESHOLD];
-        for (int q = 0; q < len; ++q) {
-            original[q] = f[(start + q) * stride];
-        }
-        for (int j = 0; j < len; ++j) {
-            float best = original[j];
-            if (left_border) {
-                const float cap_left = anis_sq * (j + 1) * (j + 1);
-                if (cap_left < best) best = cap_left;
-            }
-            if (right_border) {
-                const float cap_right = anis_sq * (len - j) * (len - j);
-                if (cap_right < best) best = cap_right;
-            }
-            for (int q = 0; q < len; ++q) {
-                const int delta = j - q;
-                const float candidate = original[q] + anis_sq * delta * delta;
-                if (candidate < best) best = candidate;
-            }
-            f[(start + j) * stride] = best;
-        }
-    };
-
-    T working_segid = segids[0];
-    int last = 0;
-
-    for (int i = 1; i < n; i++) {
-        const T segid = segids[i * stride];
-        if (segid != working_segid) {
-            if (working_segid != 0) {
-                const int run_len = i - last;
-                const bool left_border = (black_border || last > 0);
-                const bool right_border = true;  // always true at segment transition
-                if (run_len <= SMALL_THRESHOLD) {
-                    process_small_run(last, run_len, left_border, right_border);
-                } else {
-                    squared_edt_1d_parabolic_ws(
-                        f + last * stride,
-                        run_len, stride, anisotropy,
-                        left_border, right_border,
-                        v, ff, ranges
-                    );
-                }
-            }
-            working_segid = segid;
-            last = i;
-        }
-    }
-
-    // Handle last segment
-    if (working_segid != 0 && last < n) {
-        const int run_len = n - last;
-        const bool left_border = (black_border || last > 0);
-        const bool right_border = black_border;  // only at image boundary
-        if (run_len <= SMALL_THRESHOLD) {
-            process_small_run(last, run_len, left_border, right_border);
-        } else {
-            squared_edt_1d_parabolic_ws(
-                f + last * stride,
-                run_len, stride, anisotropy,
-                left_border, right_border,
-                v, ff, ranges
-            );
-        }
-    }
-}
-
-// Non-templated version for backward compatibility
-inline void squared_edt_1d_parabolic_multi_seg_ws(
-    const uint32_t* segids,
-    float* f,
-    const int n,
-    const int64_t stride,  // int64_t like ND v1
-    const float anisotropy,
-    const bool black_border,
-    int* v,
-    float* ff,
-    float* ranges
-) {
-    squared_edt_1d_parabolic_multi_seg_ws_generic<uint32_t>(
-        segids, f, n, stride, anisotropy, black_border, v, ff, ranges);
-}
-
-//-----------------------------------------------------------------------------
-// Parallel EDT Passes (Optimized with shared pool, templated dispatch)
-//-----------------------------------------------------------------------------
-
-template <typename T>
-inline void edt_pass0_parallel_generic(
-    const T* seg_labels,
-    float* output,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const float anisotropy,
-    const bool black_border,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    const int n = int(shape[axis]);
-    const int64_t stride_ax = strides[axis];
-    if (n == 0) return;
-
-    // Fast path for 2D - direct iteration like ND v1
-    if (dims == 2) {
-        const size_t other_axis = (axis == 0) ? 1 : 0;
-        const size_t other_n = shape[other_axis];
-        const int64_t other_stride = strides[other_axis];
-
-        const size_t threads = compute_threads(parallel, other_n, n);
-
-        if (threads <= 1) {
-            size_t offset = 0;
-            for (size_t i = 0; i < other_n; i++) {
-                squared_edt_1d_multi_seg_generic<T>(
-                    seg_labels + offset, output + offset, n, stride_ax, anisotropy, black_border
-                );
-                offset += other_stride;
-            }
-            return;
-        }
-
-        ThreadPool& pool = shared_pool_for(threads);
-        const size_t per_thread = (other_n + threads - 1) / threads;
-        std::vector<std::future<void>> pending;
-        pending.reserve(threads);
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t begin = t * per_thread;
-            if (begin >= other_n) break;
-            const size_t end = std::min(other_n, begin + per_thread);
-
-            // Direct loop - explicit captures for optimal performance
-            pending.push_back(pool.enqueue([seg_labels, output, n, stride_ax, other_stride, anisotropy, black_border, begin, end]() {
-                size_t offset = begin * other_stride;
-                for (size_t i = begin; i < end; i++) {
-                    squared_edt_1d_multi_seg_generic<T>(
-                        seg_labels + offset, output + offset, n, stride_ax, anisotropy, black_border
-                    );
-                    offset += other_stride;
-                }
-            }));
-        }
-        for (auto& f : pending) f.get();
-        return;
-    }
-
-    // Generic fallback for 3D+
-    size_t total_lines = 1;
-    for (size_t d = 0; d < dims; d++) {
-        if (d != axis) total_lines *= shape[d];
-    }
-
-    std::vector<size_t> bases(total_lines);
-    size_t idx = 0;
-    std::vector<size_t> coords(dims, 0);
-    for (size_t line = 0; line < total_lines; line++) {
-        size_t base = 0;
-        for (size_t d = 0; d < dims; d++) {
-            if (d != axis) base += coords[d] * strides[d];
-        }
-        bases[idx++] = base;
-        for (size_t d = 0; d < dims; d++) {
-            if (d == axis) continue;
-            coords[d]++;
-            if (coords[d] < shape[d]) break;
-            coords[d] = 0;
-        }
-    }
-
-    const size_t threads = compute_threads(parallel, total_lines, n);
-    if (threads <= 1) {
-        for (size_t i = 0; i < total_lines; i++) {
-            squared_edt_1d_multi_seg_generic<T>(
-                seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border
-            );
-        }
-        return;
-    }
-
-    ThreadPool& pool = shared_pool_for(threads);
-    const size_t per_thread = (total_lines + threads - 1) / threads;
-    std::vector<std::future<void>> pending;
-    pending.reserve(threads);
-
-    for (size_t t = 0; t < threads; t++) {
-        const size_t begin = t * per_thread;
-        if (begin >= total_lines) break;
-        const size_t end = std::min(total_lines, begin + per_thread);
-        pending.push_back(pool.enqueue([=, &bases]() {
-            for (size_t i = begin; i < end; i++) {
-                squared_edt_1d_multi_seg_generic<T>(
-                    seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border
-                );
-            }
-        }));
-    }
-    for (auto& f : pending) f.get();
-}
-
-template <typename T>
-inline void edt_pass_parabolic_parallel_generic(
-    const T* seg_labels,
-    float* output,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const float anisotropy,
-    const bool black_border,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    const int n = int(shape[axis]);
-    const int64_t stride_ax = strides[axis];
-    if (n == 0) return;
-
-    // Fast path for 2D - direct iteration like ND v1
-    if (dims == 2) {
-        const size_t other_axis = (axis == 0) ? 1 : 0;
-        const size_t other_n = shape[other_axis];
-        const int64_t other_stride = strides[other_axis];
-
-        const size_t threads = compute_threads(parallel, other_n, n);
-        if (threads <= 1) {
-            std::vector<int> v(n);
-            std::vector<float> ff(n);
-            std::vector<float> ranges(n + 1);
-            size_t offset = 0;
-            for (size_t i = 0; i < other_n; i++) {
-                squared_edt_1d_parabolic_multi_seg_ws_generic<T>(
-                    seg_labels + offset, output + offset, n, stride_ax, anisotropy, black_border,
-                    v.data(), ff.data(), ranges.data()
-                );
-                offset += other_stride;
-            }
-            return;
-        }
-
-        ThreadPool& pool = shared_pool_for(threads);
-        const size_t per_thread = (other_n + threads - 1) / threads;
-        std::vector<std::future<void>> pending;
-        pending.reserve(threads);
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t begin = t * per_thread;
-            if (begin >= other_n) break;
-            const size_t end = std::min(other_n, begin + per_thread);
-
-            // Direct loop - workspace allocated per-thread for cache locality
-            pending.push_back(pool.enqueue([seg_labels, output, n, stride_ax, other_stride, anisotropy, black_border, begin, end]() {
-                std::vector<int> v(n);
-                std::vector<float> ff(n);
-                std::vector<float> ranges(n + 1);
-
-                size_t offset = begin * other_stride;
-                for (size_t i = begin; i < end; i++) {
-                    squared_edt_1d_parabolic_multi_seg_ws_generic<T>(
-                        seg_labels + offset, output + offset, n, stride_ax, anisotropy, black_border,
-                        v.data(), ff.data(), ranges.data()
-                    );
-                    offset += other_stride;
-                }
-            }));
-        }
-        for (auto& f : pending) f.get();
-        return;
-    }
-
-    // Generic fallback for 3D+
-    size_t total_lines = 1;
-    for (size_t d = 0; d < dims; d++) {
-        if (d != axis) total_lines *= shape[d];
-    }
-
-    std::vector<size_t> bases(total_lines);
-    size_t idx = 0;
-    std::vector<size_t> coords(dims, 0);
-    for (size_t line = 0; line < total_lines; line++) {
-        size_t base = 0;
-        for (size_t d = 0; d < dims; d++) {
-            if (d != axis) base += coords[d] * strides[d];
-        }
-        bases[idx++] = base;
-        for (size_t d = 0; d < dims; d++) {
-            if (d == axis) continue;
-            coords[d]++;
-            if (coords[d] < shape[d]) break;
-            coords[d] = 0;
-        }
-    }
-
-    const size_t threads = compute_threads(parallel, total_lines, n);
-    if (threads <= 1) {
-        std::vector<int> v(n);
-        std::vector<float> ff(n);
-        std::vector<float> ranges(n + 1);
-        for (size_t i = 0; i < total_lines; i++) {
-            squared_edt_1d_parabolic_multi_seg_ws_generic<T>(
-                seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border,
-                v.data(), ff.data(), ranges.data()
-            );
-        }
-        return;
-    }
-
-    ThreadPool& pool = shared_pool_for(threads);
-    const size_t per_thread = (total_lines + threads - 1) / threads;
-    std::vector<std::future<void>> pending;
-    pending.reserve(threads);
-
-    for (size_t t = 0; t < threads; t++) {
-        const size_t begin = t * per_thread;
-        if (begin >= total_lines) break;
-        const size_t end = std::min(total_lines, begin + per_thread);
-        pending.push_back(pool.enqueue([=, &bases]() {
-            std::vector<int> v(n);
-            std::vector<float> ff(n);
-            std::vector<float> ranges(n + 1);
-            for (size_t i = begin; i < end; i++) {
-                squared_edt_1d_parabolic_multi_seg_ws_generic<T>(
-                    seg_labels + bases[i], output + bases[i], n, stride_ax, anisotropy, black_border,
-                    v.data(), ff.data(), ranges.data()
-                );
-            }
-        }));
-    }
-    for (auto& f : pending) f.get();
-}
-
-// Fused Pass 0 + Segment Label Building (parallel version)
-template <typename T>
-inline void edt_pass0_build_seglabels_parallel(
-    const T* labels,
-    float* output,
-    uint32_t* seg_labels,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const float anisotropy,
-    const bool black_border,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    const int n = int(shape[axis]);
-    const int64_t stride_ax = strides[axis];
-    if (n == 0) return;
-
-    // Fast path for 2D - direct iteration like ND v1
-    if (dims == 2) {
-        const size_t other_axis = (axis == 0) ? 1 : 0;
-        const size_t other_n = shape[other_axis];
-        const int64_t other_stride = strides[other_axis];
-
-        const size_t threads = compute_threads(parallel, other_n, n);
-        if (threads <= 1) {
-            size_t offset = 0;
-            for (size_t i = 0; i < other_n; i++) {
-                squared_edt_1d_multi_seg_build_seglabels<T>(
-                    labels + offset, output + offset, seg_labels + offset,
-                    n, stride_ax, anisotropy, black_border
-                );
-                offset += other_stride;
-            }
-            return;
-        }
-
-        ThreadPool& pool = shared_pool_for(threads);
-        const size_t per_thread = (other_n + threads - 1) / threads;
-        std::vector<std::future<void>> pending;
-        pending.reserve(threads);
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t begin = t * per_thread;
-            if (begin >= other_n) break;
-            const size_t end = std::min(other_n, begin + per_thread);
-            pending.push_back(pool.enqueue([=]() {
-                size_t offset = begin * other_stride;
-                for (size_t i = begin; i < end; i++) {
-                    squared_edt_1d_multi_seg_build_seglabels<T>(
-                        labels + offset, output + offset, seg_labels + offset,
-                        n, stride_ax, anisotropy, black_border
-                    );
-                    offset += other_stride;
-                }
-            }));
-        }
-        for (auto& f : pending) f.get();
-        return;
-    }
-
-    // Generic fallback for 3D+
-    size_t total_lines = 1;
-    for (size_t d = 0; d < dims; d++) {
-        if (d != axis) total_lines *= shape[d];
-    }
-
-    std::vector<size_t> bases(total_lines);
-    size_t idx = 0;
-    std::vector<size_t> coords(dims, 0);
-    for (size_t line = 0; line < total_lines; line++) {
-        size_t base = 0;
-        for (size_t d = 0; d < dims; d++) {
-            if (d != axis) base += coords[d] * strides[d];
-        }
-        bases[idx++] = base;
-        for (size_t d = 0; d < dims; d++) {
-            if (d == axis) continue;
-            coords[d]++;
-            if (coords[d] < shape[d]) break;
-            coords[d] = 0;
-        }
-    }
-
-    const size_t threads = compute_threads(parallel, total_lines, n);
-    if (threads <= 1) {
-        for (size_t i = 0; i < total_lines; i++) {
-            squared_edt_1d_multi_seg_build_seglabels<T>(
-                labels + bases[i], output + bases[i], seg_labels + bases[i],
-                n, stride_ax, anisotropy, black_border
-            );
-        }
-        return;
-    }
-
-    ThreadPool& pool = shared_pool_for(threads);
-    const size_t per_thread = (total_lines + threads - 1) / threads;
-    std::vector<std::future<void>> pending;
-    pending.reserve(threads);
-
-    for (size_t t = 0; t < threads; t++) {
-        const size_t begin = t * per_thread;
-        if (begin >= total_lines) break;
-        const size_t end = std::min(total_lines, begin + per_thread);
-        pending.push_back(pool.enqueue([=, &bases]() {
-            for (size_t i = begin; i < end; i++) {
-                squared_edt_1d_multi_seg_build_seglabels<T>(
-                    labels + bases[i], output + bases[i], seg_labels + bases[i],
-                    n, stride_ax, anisotropy, black_border
-                );
-            }
-        }));
-    }
-    for (auto& f : pending) f.get();
-}
-
-// Non-templated wrappers for backward compatibility
-inline void edt_pass0_parallel(
-    const uint32_t* seg_labels,
-    float* output,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const float anisotropy,
-    const bool black_border,
-    const int parallel
-) {
-    edt_pass0_parallel_generic<uint32_t>(
-        seg_labels, output, shape, strides, dims, axis, anisotropy, black_border, parallel
-    );
-}
-
-inline void edt_pass_parabolic_parallel(
-    const uint32_t* seg_labels,
-    float* output,
-    const size_t* shape,
-    const size_t* strides,
-    const size_t dims,
-    const size_t axis,
-    const float anisotropy,
-    const bool black_border,
-    const int parallel
-) {
-    edt_pass_parabolic_parallel_generic<uint32_t>(
-        seg_labels, output, shape, strides, dims, axis, anisotropy, black_border, parallel
-    );
-}
-
 //-----------------------------------------------------------------------------
 // FUSED Parabolic Pass from Graph (parallel dispatch)
 //-----------------------------------------------------------------------------
@@ -1903,12 +489,13 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
     const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
-    // Unified ND path - parallelize over first other dimension like ND v1
+    // Unified ND path - parallelize over first other dimension like ND v1.
+    // Size 16 supports up to 16D total (at most 15 other dims per axis pass).
     size_t num_other_dims = 0;
-    size_t other_extents[8];  // Max 8D support
-    size_t other_strides[8];
+    size_t other_extents[16];
+    size_t other_strides[16];
     size_t total_lines = 1;
-    for (size_t d = 0; d < dims && num_other_dims < 8; d++) {
+    for (size_t d = 0; d < dims && num_other_dims < 16; d++) {
         if (d != axis) {
             other_extents[num_other_dims] = shape[d];
             other_strides[num_other_dims] = strides[d];
@@ -1940,7 +527,7 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
                     anisotropy, black_border, v.data(), ff.data(), ranges.data()
                 );
             } else {
-                size_t coords[8] = {0};
+                size_t coords[16] = {0};
                 size_t base = offset;
                 for (size_t i = 0; i < rest_product; i++) {
                     squared_edt_1d_parabolic_from_graph_ws<GRAPH_T>(
@@ -1982,7 +569,7 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
                         anisotropy, black_border, v.data(), ff.data(), ranges.data()
                     );
                 } else {
-                    size_t coords[8] = {0};
+                    size_t coords[16] = {0};
                     size_t base = offset;
                     for (size_t i = 0; i < rest_product; i++) {
                         squared_edt_1d_parabolic_from_graph_ws<GRAPH_T>(
@@ -2002,67 +589,6 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
         }));
     }
     for (auto& f : pending) f.get();
-}
-
-//-----------------------------------------------------------------------------
-// Full EDT from Labels (Graph-First Design: Build Segment Labels)
-//-----------------------------------------------------------------------------
-
-/*
- * Graph-First Design: Labels MUST be converted to segment labels.
- *
- * Key insight: For labels input, the labels themselves serve as segment labels.
- * Label value = segment ID semantically (same label = same segment).
- *
- * This is the "conversion" - we interpret labels AS segment labels.
- * The EDT algorithm finds segments by comparing label values, which is
- * semantically equivalent to comparing pre-computed segment IDs.
- *
- * This achieves the graph-first architecture (uniform segment-based processing)
- * while avoiding the overhead of explicit segment label allocation/building.
- */
-template <typename T>
-inline void edtsq_from_labels(
-    const T* labels,
-    float* output,
-    const size_t* shape,
-    const float* anisotropy,
-    const size_t dims,
-    const bool black_border,
-    const int parallel
-) {
-    if (dims == 0) return;
-
-    // Compute total voxels and strides
-    size_t total = 1;
-    std::vector<size_t> strides(dims);
-    for (size_t d = dims; d-- > 0;) {
-        strides[d] = total;
-        total *= shape[d];
-    }
-    if (total == 0) return;
-
-    // Process axes from innermost to outermost (like V1) for cache efficiency
-    // Innermost axis has stride=1, so pass 0 should process it first
-    bool is_first_pass = true;
-    for (size_t axis = dims; axis-- > 0;) {
-        if (is_first_pass) {
-            // Pass 0: Rosenfeld-Pfaltz using labels as segment IDs
-            edt_pass0_parallel_generic<T>(
-                labels, output,
-                shape, strides.data(), dims, axis,
-                anisotropy[axis], black_border, parallel
-            );
-            is_first_pass = false;
-        } else {
-            // Pass 1+: Parabolic using labels as segment IDs
-            edt_pass_parabolic_parallel_generic<T>(
-                labels, output,
-                shape, strides.data(), dims, axis,
-                anisotropy[axis], black_border, parallel
-            );
-        }
-    }
 }
 
 //-----------------------------------------------------------------------------
@@ -2091,11 +617,11 @@ inline void edtsq_from_graph(
     if (total == 0) return;
 
     // Axis bit encoding (foreground at bit 0, edge bits at odd positions)
+    // Axis bit encoding: bit 0 = foreground; axis a -> bit (2*(dims-1-a)+1).
     // For 2D: axis 0 -> bit 3, axis 1 -> bit 1
     // For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
 
-    // FULLY FUSED: All passes read directly from graph
-    // No segment labels allocation needed - saves 64MB for large volumes
+    // FULLY FUSED: All passes read directly from graph — no segment labels allocation.
 
     // Process axes from innermost to outermost (like V1) for cache efficiency
     // Innermost axis has stride=1, so pass 0 should process it first
@@ -2124,10 +650,11 @@ inline void edtsq_from_graph(
 }
 
 //-----------------------------------------------------------------------------
-// Build graph from labels - SINGLE-PASS with explicit 2D/3D specializations
+// Build graph from labels - SINGLE-PASS, unified ND algorithm
 //
-// For best performance, we inline neighbor checks for common dimensions (2D, 3D).
-// Generic ND falls back to a loop-based approach.
+// 1D: dedicated linear scan.
+// 2D+: unified ND path (chunk-based background skipping on innermost dim).
+// Fixed internal arrays support up to 8D (expand if needed for 9D+).
 //-----------------------------------------------------------------------------
 
 template <typename T, typename GRAPH_T = uint8_t>
@@ -2341,16 +868,16 @@ inline void edtsq_from_labels_fused(
     }
     if (total == 0) return;
 
-    // Graph bit encoding: axis d uses bit (1 << (2*(dims-1-d)))
-    // Max bit for axis 0 = 1 << (2*(dims-1))
-    // uint8 supports dims <= 4 (max bit = 64)
-    // uint16 supports dims <= 8 (max bit = 16384)
+    // Graph bit encoding: bit 0 = foreground marker; axis d uses bit (1 << (2*(dims-1-d)+1)).
+    // Max bit index for D dimensions = 2*(D-1)+1.
+    // uint8  supports dims <= 4 (max bit index 7,  1<<7  = 128  <= 255)
+    // uint16 supports dims <= 8 (max bit index 15, 1<<15 = 32768 <= 65535)
     if (dims <= 4) {
         std::unique_ptr<uint8_t[]> graph(new uint8_t[total]);
         build_connectivity_graph<T, uint8_t>(labels, graph.get(), shape, dims, parallel);
         edtsq_from_graph<uint8_t>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);
     } else {
-        // 5D-8D: need uint16 for graph bits
+        // 5D+: use uint16 for graph bits (supports up to 8D; for 9D+ use edtsq_from_graph directly) for graph bits
         std::unique_ptr<uint16_t[]> graph(new uint16_t[total]);
         build_connectivity_graph<T, uint16_t>(labels, graph.get(), shape, dims, parallel);
         edtsq_from_graph<uint16_t>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);

@@ -3,7 +3,7 @@
 Multi-label Euclidean Distance Transform based on the algorithms of
 Saito et al (1994), Meijster et al (2002), and Felzenszwalb & Huttenlocher (2012).
 
-Uses connectivity graphs internally (uint8 for 2D-4D, uint16 for 5D+).
+Uses connectivity graphs internally (uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-12D, uint64 for 13-16D).
 Memory-efficient for larger input dtypes (up to 38% savings for uint32 input
 vs label-segment approaches).
 Supports custom voxel_graph input for user-defined boundaries.
@@ -13,8 +13,9 @@ Key methods:
   edt_graph, edtsq_graph - EDT from pre-built connectivity graph
   build_graph - build connectivity graph from labels
 
-Additional utilities (from edt_barrier):
-  feature_transform, expand_labels, each, sdf
+Additional utilities:
+  feature_transform, expand_labels, sdf  (defined here, ported from barrier impl)
+  each  (imported from edt_legacy)
 
 Programmatic configuration:
   edt.configure(...) - set threading parameters in-process (see configure docstring)
@@ -88,16 +89,6 @@ def _prepare_array(arr, dtype):
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
     cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
-    # EDT from labels (original, unused)
-    cdef void edtsq_from_labels[T](
-        const T* labels,
-        float* output,
-        const size_t* shape,
-        const float* anisotropy,
-        size_t dims,
-        native_bool black_border,
-        int parallel
-    ) nogil
 
     # EDT from voxel graph
     cdef void edtsq_from_graph[GRAPH_T](
@@ -214,8 +205,9 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     """
     Compute squared Euclidean distance transform via graph-first architecture.
 
-    Converts labels to a uint8 connectivity graph internally, then computes EDT.
-    The graph is built and freed in C++ for maximum efficiency.
+    Converts labels to a connectivity graph internally (uint8 for 1-4D, uint16 for 5-8D),
+    then computes EDT. The graph is built and freed in C++ for maximum efficiency.
+    For 9D+ label arrays, use edtsq_graph with a pre-built graph from build_graph.
 
     Parameters
     ----------
@@ -373,7 +365,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     Parameters
     ----------
-    graph : ndarray (uint8 for 2D-4D, uint16 for 5D-8D)
+    graph : ndarray (uint8 for 2D-4D, uint16 for 5D-8D, uint32 for 9D-12D, uint64 for 13D-16D)
         Voxel connectivity graph. Each element encodes edge bits for each axis.
         For 2D: axis 0 -> bit 3, axis 1 -> bit 1
         For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
@@ -393,7 +385,9 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     cdef tuple shape = graph.shape
 
     graph_dtype = _graph_dtype(nd)
-    # Connectivity graphs encode edge bits per axis (axis 0 -> bit 3; axis 1 -> bit 1; ...).
+    # Connectivity graphs encode direction-specific edge bits per axis.
+    # General formula: axis a -> bit (2*(ndim-1-a)+1); bit 0 = foreground.
+    # For 2D: axis 0 -> bit 3, axis 1 -> bit 1.
     # The axis-reversal trick used for label arrays cannot be applied here: reversing the shape
     # would cause C++ to read axis-0 bits for the axis-1 sweep and vice versa, corrupting
     # direction-specific connectivity. Always copy to C-order to ensure correct bit interpretation.
@@ -493,8 +487,8 @@ def build_graph(labels, parallel=0):
     Returns
     -------
     ndarray
-        Connectivity graph (uint8 for 1D-4D, uint16 for 5D-8D) where each
-        element encodes per-axis edge bits.
+        Connectivity graph (uint8 for 1D-4D, uint16 for 5D-8D, uint32 for 9D-12D,
+        uint64 for 13D-16D) where each element encodes per-axis edge bits.
     """
     # Preserve input dtype where possible to avoid copies.
     # For signed/float types, use .view() to reinterpret as same-width
@@ -748,10 +742,10 @@ def configure(
         Enable adaptive thread limiting based on array size.
         Overrides EDT_ADAPTIVE_THREADS.
     min_voxels_per_thread : int or None
-        Minimum voxels per thread for ND>=4 arrays.
+        Minimum voxels per thread (applied for all dims >= 2).
         Overrides EDT_ND_MIN_VOXELS_PER_THREAD.
     min_lines_per_thread : int or None
-        Minimum lines per thread for ND>=4 arrays.
+        Minimum scanlines per thread (applied for all dims >= 2).
         Overrides EDT_ND_MIN_LINES_PER_THREAD.
     """
     if adaptive_threads is not None:
@@ -773,7 +767,7 @@ def _adaptive_thread_limit_nd(parallel, shape, requested=None):
     """Cap thread count so each thread has enough work to justify its overhead.
 
     Two criteria, both must hold (whichever allows fewer threads wins):
-      - voxels per thread >= EDT_ND_MIN_VOXELS_PER_THREAD (default 8000)
+      - voxels per thread >= EDT_ND_MIN_VOXELS_PER_THREAD (default 4000)
       - scan lines per thread >= EDT_ND_MIN_LINES_PER_THREAD (default 32)
 
     Applies uniformly for all dims >= 2.
