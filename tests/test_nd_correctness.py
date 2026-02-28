@@ -162,6 +162,64 @@ def test_nd_random_label_bench_patterns(shape):
             err_msg=f"Random benchmark array mismatch for shape={shape} parallel={parallel}"
         )
 
+def _hypercube_m(D: int) -> int:
+    """Largest M such that (2*M)**D <= 3,200,000, capped at 50.
+
+    Budget chosen so each dimension stays under ~100ms on a single thread:
+    D=6→M=6, D=7→M=4, D=8→M=3, D=9→M=2, D=10→M=2.
+    """
+    for m in range(50, 0, -1):
+        if (2 * m) ** D <= 3_200_000:
+            return m
+    return 1
+
+
+def test_edt_all_dims_1_to_32():
+    """Correctness + crash test for edt across all supported dimensions (1-32).
+
+    For D=1..20: uses make_label_matrix(D, M) — a hypercube of 2^D equal-sized
+    label regions each of side length M.  The max EDT over all foreground voxels
+    equals float(M) exactly (the center of each region is M steps from its
+    boundary in every axis direction).  M is chosen as the largest value keeping
+    total voxels ≤ ~1.1M.
+
+    For D=21..32: make_label_matrix cannot be used (2^D voxels would exceed
+    memory).  A single foreground voxel is placed at the array corner in a
+    (2,)*20 + (1,)*(D-20) shape; its squared EDT to the nearest boundary = 1.0.
+
+    Graph type coverage:
+      D= 1-4  → uint8  graph
+      D= 5-8  → uint16 graph
+      D= 9-16 → uint32 graph
+      D=17-32 → uint64 graph  (D=21-32 use the corner-voxel path)
+    """
+    # D=1..20: hypercube max-value correctness
+    for D in range(1, 21):
+        M = _hypercube_m(D)
+        masks = make_label_matrix(D, M).astype(np.uint32)
+        result = edt.edt(masks, parallel=1)
+
+        assert result.shape == masks.shape, f"D={D} M={M}: shape mismatch"
+        assert np.all(np.isfinite(result)), f"D={D} M={M}: non-finite values"
+        expected_max = float(M)
+        np.testing.assert_allclose(
+            result.max(), expected_max, rtol=1e-5, atol=1e-5 * expected_max,
+            err_msg=f"D={D} M={M}: hypercube max-EDT mismatch"
+        )
+
+    # D=21..32: corner-voxel smoke test (array too large for full hypercube)
+    for D in range(21, 33):
+        shape = (2,) * 20 + (1,) * (D - 20)
+        data = np.zeros(shape, dtype=np.uint32)
+        data[(0,) * D] = 1
+        out = edt.edtsq(data, parallel=1)
+
+        assert out.shape == shape, f"D={D}: output shape mismatch"
+        assert out[(0,) * D] == pytest.approx(1.0), (
+            f"D={D}: corner voxel expected squared-dist=1.0, got {out[(0,)*D]}"
+        )
+
+
 if __name__ == "__main__":
     test_nd_correctness_2d()
     print("2D tests passed!")
@@ -171,4 +229,6 @@ if __name__ == "__main__":
     print("4D tests passed!")
     test_nd_threading_consistency()
     print("Threading tests passed!")
+    test_edt_all_dims_1_to_32()
+    print("All-dims 1-32 correctness test passed!")
     print("All tests passed!")

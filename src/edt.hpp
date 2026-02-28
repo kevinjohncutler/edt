@@ -2,16 +2,16 @@
  * Graph-First Euclidean Distance Transform (ND)
  *
  * Input: a labels array or a pre-built voxel connectivity graph
- *        (bit-encoded uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-12D, uint64 for 13-16D).
+ *        (bit-encoded uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-16D, uint64 for 17-32D).
  *
  * Pipeline (edtsq / edtsq_from_labels_fused):
- *   1. Build a compact connectivity graph (uint8 for 1-4D, uint16 for 5-8D): each voxel
+ *   1. Build a compact connectivity graph (uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-16D, uint64 for 17-32D): each voxel
  *      stores a bitmask of forward edges plus a foreground marker at bit 0.
  *   2. Run all EDT passes directly from the graph — no intermediate segment label array:
  *      - Pass 0 (innermost axis): Rosenfeld-Pfaltz scan detects boundaries from graph
  *        edge bits and writes squared 1D distances.
  *      - Passes 1..N-1: parabolic envelope reads graph edge bits per scanline in-place.
- *   O(N) per scanline, parallelised across scanlines.
+ *   O(N) per scanline, parallelized across scanlines.
  *   For edtsq_graph: step 1 is skipped (caller supplies the pre-built graph).
  *
  * See src/README.md for graph bit encoding, memory layout, and algorithm details.
@@ -176,14 +176,14 @@ inline void edt_pass0_from_graph_direct_parallel(
     const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
-    // Unified ND path - parallelize over first other dimension like ND v1
+    // Parallelize over first other dimension (outer) across threads.
     // Build arrays of extents and strides for dimensions other than axis.
-    // Size 16 supports up to 16D total (at most 15 other dims per axis pass).
+    // Size 32 supports up to 32D total (at most 31 other dims per axis pass).
     size_t num_other_dims = 0;
-    size_t other_extents[16];
-    size_t other_strides[16];
+    size_t other_extents[32];
+    size_t other_strides[32];
     size_t total_lines = 1;
-    for (size_t d = 0; d < dims && num_other_dims < 16; d++) {
+    for (size_t d = 0; d < dims && num_other_dims < 32; d++) {
         if (d != axis) {
             other_extents[num_other_dims] = shape[d];
             other_strides[num_other_dims] = strides[d];
@@ -209,7 +209,7 @@ inline void edt_pass0_from_graph_direct_parallel(
             return;
         }
         // Iterate dims 1..num_other_dims-1
-        size_t coords[16] = {0};
+        size_t coords[32] = {0};
         size_t base = offset;
         for (size_t i = 0; i < rest_product; i++) {
             kernel(base);
@@ -263,7 +263,7 @@ inline void edt_pass0_from_graph_direct_parallel(
                 if (num_other_dims <= 1) {
                     inner_kernel(offset);
                 } else {
-                    size_t coords[16] = {0};
+                    size_t coords[32] = {0};
                     size_t base = offset;
                     for (size_t i = 0; i < rest_product; i++) {
                         inner_kernel(base);
@@ -481,13 +481,13 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
     const int64_t stride_ax = strides[axis];
     if (n == 0) return;
 
-    // Unified ND path - parallelize over first other dimension like ND v1.
-    // Size 16 supports up to 16D total (at most 15 other dims per axis pass).
+    // Parallelize over first other dimension (outer) across threads.
+    // Size 32 supports up to 32D total (at most 31 other dims per axis pass).
     size_t num_other_dims = 0;
-    size_t other_extents[16];
-    size_t other_strides[16];
+    size_t other_extents[32];
+    size_t other_strides[32];
     size_t total_lines = 1;
-    for (size_t d = 0; d < dims && num_other_dims < 16; d++) {
+    for (size_t d = 0; d < dims && num_other_dims < 32; d++) {
         if (d != axis) {
             other_extents[num_other_dims] = shape[d];
             other_strides[num_other_dims] = strides[d];
@@ -561,7 +561,7 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
                         anisotropy, black_border, v.data(), ff.data(), ranges.data()
                     );
                 } else {
-                    size_t coords[16] = {0};
+                    size_t coords[32] = {0};
                     size_t base = offset;
                     for (size_t i = 0; i < rest_product; i++) {
                         squared_edt_1d_parabolic_from_graph_ws<GRAPH_T>(
@@ -641,7 +641,7 @@ inline void edtsq_from_graph(
 //
 // 1D: dedicated linear scan.
 // 2D+: unified ND path (chunk-based background skipping on innermost dim).
-// Fixed internal arrays support up to 8D (expand if needed for 9D+).
+// Fixed internal arrays support up to 32D.
 //-----------------------------------------------------------------------------
 
 template <typename T, typename GRAPH_T = uint8_t>
@@ -699,9 +699,9 @@ inline void build_connectivity_graph(
     // Unified ND path for 2D+ - parallelize over first dimension with
     // chunk-based background skipping on the inner loop
     //-------------------------------------------------------------------------
-    int64_t strides[8];
-    int64_t shape64[8];
-    GRAPH_T axis_bits[8];
+    int64_t strides[32];
+    int64_t shape64[32];
+    GRAPH_T axis_bits[32];
     {
         int64_t s = 1;
         for (size_t d = dims; d-- > 0;) {
@@ -732,16 +732,16 @@ inline void build_connectivity_graph(
     // Process range of first dimension (outer loop) for 2D+
     auto process_dim0_range = [&](int64_t d0_start, int64_t d0_end) {
         // Thread-local storage for precomputed middle dimension info
-        const T* mid_neighbor_row[6];  // Neighbor row pointers for middle dims
-        bool mid_can_check[6];         // Whether we can check each mid neighbor
-        GRAPH_T mid_bits[6];           // Bit to set for each mid dimension
+        const T* mid_neighbor_row[30];  // Neighbor row pointers for middle dims (max 30 for 32D)
+        bool mid_can_check[30];         // Whether we can check each mid neighbor
+        GRAPH_T mid_bits[30];           // Bit to set for each mid dimension
 
         for (int64_t d0 = d0_start; d0 < d0_end; d0++) {
             const int64_t base0 = d0 * first_stride;
             const bool can_d0 = (d0 + 1 < first_extent);
 
             // Iterate middle dimensions (dims 1 to dims-2)
-            int64_t mid_coords[7] = {0};  // For dims 1..dims-2
+            int64_t mid_coords[30] = {0};  // For dims 1..dims-2 (max 30 for 32D)
             int64_t mid_offset = 0;
 
             for (int64_t m = 0; m < mid_product; m++) {
@@ -836,6 +836,18 @@ inline void build_connectivity_graph(
 // 3. Thread pool is already warm from graph build
 //-----------------------------------------------------------------------------
 
+// Internal: allocate graph of type GRAPH_T, build connectivity, run EDT, free.
+template <typename T, typename GRAPH_T>
+inline void _edtsq_fused_typed(
+    const T* labels, float* output, const size_t* shape,
+    const float* anisotropy, const size_t dims,
+    const bool black_border, const int parallel, const size_t total
+) {
+    std::unique_ptr<GRAPH_T[]> graph(new GRAPH_T[total]);
+    build_connectivity_graph<T, GRAPH_T>(labels, graph.get(), shape, dims, parallel);
+    edtsq_from_graph<GRAPH_T>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);
+}
+
 template <typename T>
 inline void edtsq_from_labels_fused(
     const T* labels,
@@ -847,28 +859,17 @@ inline void edtsq_from_labels_fused(
     const int parallel
 ) {
     if (dims == 0) return;
-
-    // Compute total voxels
     size_t total = 1;
-    for (size_t d = 0; d < dims; d++) {
-        total *= shape[d];
-    }
+    for (size_t d = 0; d < dims; d++) total *= shape[d];
     if (total == 0) return;
 
-    // Graph bit encoding: bit 0 = foreground marker; axis d uses bit (1 << (2*(dims-1-d)+1)).
-    // Max bit index for D dimensions = 2*(D-1)+1.
-    // uint8  supports dims <= 4 (max bit index 7,  1<<7  = 128  <= 255)
-    // uint16 supports dims <= 8 (max bit index 15, 1<<15 = 32768 <= 65535)
-    if (dims <= 4) {
-        std::unique_ptr<uint8_t[]> graph(new uint8_t[total]);
-        build_connectivity_graph<T, uint8_t>(labels, graph.get(), shape, dims, parallel);
-        edtsq_from_graph<uint8_t>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);
-    } else {
-        // 5D+: use uint16 for graph bits (supports up to 8D; for 9D+ use edtsq_from_graph directly)
-        std::unique_ptr<uint16_t[]> graph(new uint16_t[total]);
-        build_connectivity_graph<T, uint16_t>(labels, graph.get(), shape, dims, parallel);
-        edtsq_from_graph<uint16_t>(graph.get(), output, shape, anisotropy, dims, black_border, parallel);
-    }
+    // Graph type: smallest unsigned integer fitting 2*(dims-1)+1 bits.
+    // uint8 <=4D (max bit 7), uint16 <=8D (max bit 15),
+    // uint32 <=16D (max bit 31), uint64 <=32D (max bit 63).
+    if      (dims <=  4) _edtsq_fused_typed<T, uint8_t> (labels, output, shape, anisotropy, dims, black_border, parallel, total);
+    else if (dims <=  8) _edtsq_fused_typed<T, uint16_t>(labels, output, shape, anisotropy, dims, black_border, parallel, total);
+    else if (dims <= 16) _edtsq_fused_typed<T, uint32_t>(labels, output, shape, anisotropy, dims, black_border, parallel, total);
+    else                 _edtsq_fused_typed<T, uint64_t>(labels, output, shape, anisotropy, dims, black_border, parallel, total);
 }
 
 //-----------------------------------------------------------------------------

@@ -15,7 +15,7 @@ Key methods:
 
 Additional utilities:
   feature_transform, expand_labels, sdf  (defined here, ported from barrier impl)
-  each  (imported from edt_legacy)
+  each  (imported from edt_legacy)  # LEGACY COMPAT
 
 Programmatic configuration:
   edt.configure(...) - set threading parameters in-process (see configure docstring)
@@ -618,7 +618,7 @@ def sdfsq(data, anisotropy=None, black_border=False, int parallel=1):
     dt -= edtsq(data == 0, anisotropy=anisotropy, black_border=black_border, parallel=parallel)
     return dt
 
-# Import utilities from edt_legacy for backwards compatibility
+# LEGACY COMPAT (remove when edt_legacy is retired):
 try:
     from edt_legacy import each, draw, erase
     import edt_legacy as legacy
