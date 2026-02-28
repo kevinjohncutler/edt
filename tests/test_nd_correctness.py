@@ -192,31 +192,54 @@ def test_edt_all_dims_1_to_32():
       D= 5-8  → uint16 graph
       D= 9-16 → uint32 graph
       D=17-32 → uint64 graph  (D=21-32 use the corner-voxel path)
+
+    Both parallel=1 and parallel=4 are tested, and their outputs are compared,
+    so that bugs in either code path (single-threaded vs parallel coordinate
+    iteration) are caught independently.
     """
-    # D=1..20: hypercube max-value correctness
+    # D=1..20: hypercube max-value correctness, single and multi-threaded
     for D in range(1, 21):
         M = _hypercube_m(D)
         masks = make_label_matrix(D, M).astype(np.uint32)
-        result = edt.edt(masks, parallel=1)
+        r1 = edt.edt(masks, parallel=1)
+        r4 = edt.edt(masks, parallel=4)
 
-        assert result.shape == masks.shape, f"D={D} M={M}: shape mismatch"
-        assert np.all(np.isfinite(result)), f"D={D} M={M}: non-finite values"
+        assert r1.shape == masks.shape, f"D={D} M={M}: shape mismatch (parallel=1)"
+        assert np.all(np.isfinite(r1)), f"D={D} M={M}: non-finite values (parallel=1)"
         expected_max = float(M)
         np.testing.assert_allclose(
-            result.max(), expected_max, rtol=1e-5, atol=1e-5 * expected_max,
-            err_msg=f"D={D} M={M}: hypercube max-EDT mismatch"
+            r1.max(), expected_max, rtol=1e-5, atol=1e-5 * expected_max,
+            err_msg=f"D={D} M={M}: hypercube max-EDT mismatch (parallel=1)"
+        )
+        np.testing.assert_allclose(
+            r1, r4, rtol=1e-5, atol=1e-5,
+            err_msg=f"D={D} M={M}: parallel=1 vs parallel=4 mismatch"
         )
 
-    # D=21..32: corner-voxel smoke test (array too large for full hypercube)
+    # D=21..32: single foreground voxel in (2,)*20 + (1,)*(D-20) shape.
+    # Checks:
+    #   - Only 1 voxel has nonzero distance (the foreground voxel)
+    #   - That voxel's squared EDT equals 1.0 (adjacent to background in each
+    #     non-singleton axis)
+    #   - parallel=1 and parallel=4 produce identical results
     for D in range(21, 33):
         shape = (2,) * 20 + (1,) * (D - 20)
         data = np.zeros(shape, dtype=np.uint32)
         data[(0,) * D] = 1
-        out = edt.edtsq(data, parallel=1)
+        out1 = edt.edtsq(data, parallel=1)
+        out4 = edt.edtsq(data, parallel=4)
 
-        assert out.shape == shape, f"D={D}: output shape mismatch"
-        assert out[(0,) * D] == pytest.approx(1.0), (
-            f"D={D}: corner voxel expected squared-dist=1.0, got {out[(0,)*D]}"
+        assert out1.shape == shape, f"D={D}: output shape mismatch"
+        fg_count = int((out1 > 0).sum())
+        assert fg_count == 1, (
+            f"D={D}: expected 1 nonzero voxel (parallel=1), got {fg_count}"
+        )
+        assert out1[(0,) * D] == pytest.approx(1.0), (
+            f"D={D}: corner voxel expected squared-dist=1.0, got {out1[(0,)*D]} (parallel=1)"
+        )
+        np.testing.assert_allclose(
+            out1, out4, rtol=1e-5, atol=1e-5,
+            err_msg=f"D={D}: parallel=1 vs parallel=4 mismatch"
         )
 
 
