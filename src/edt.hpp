@@ -34,16 +34,14 @@
 
 namespace nd {
 
-// Tuning parameters
+// Tuning parameter
 static size_t ND_CHUNKS_PER_THREAD = 1;
-static size_t ND_TILE = 8;
 
-inline void set_tuning(size_t chunks_per_thread, size_t tile) {
+inline void set_tuning(size_t chunks_per_thread) {
     if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
-    if (tile > 0) ND_TILE = tile;
 }
 
-// Shared thread pool (like ND v1)
+// Shared thread pool keyed by thread count; created lazily on first use
 inline ThreadPool& shared_pool_for(size_t threads) {
     static std::mutex mutex;
     static std::unordered_map<size_t, std::unique_ptr<ThreadPool>> pools;
@@ -78,12 +76,10 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
 
 
 /*
- * FUSED Pass 0 from Graph (no segment label output)
+ * Pass 0 from Graph
  *
- * Graph-first design: This function reads the voxel connectivity graph
- * and computes the Rosenfeld-Pfaltz 1D EDT (pass 0) directly.
- *
- * All parabolic passes read the graph directly; no version writes segment labels.
+ * Reads the voxel connectivity graph and computes the Rosenfeld-Pfaltz
+ * 1D EDT (pass 0) directly. No version writes segment labels.
  */
 template <typename GRAPH_T>
 inline void squared_edt_1d_from_graph_direct(
@@ -158,7 +154,7 @@ inline void squared_edt_1d_from_graph_direct(
 }
 
 //-----------------------------------------------------------------------------
-// Pass 0 from Graph (parallel dispatch, fully fused - reads graph directly)
+// Pass 0 from Graph (parallel dispatch)
 //-----------------------------------------------------------------------------
 
 template <typename GRAPH_T>
@@ -196,7 +192,7 @@ inline void edt_pass0_from_graph_direct_parallel(
         }
     }
 
-    // Compute rest_product (product of all dims except first)
+    // rest_product: size of inner slab (other dims 1..N-1 per first-dim slice)
     const size_t first_extent = (num_other_dims > 0) ? other_extents[0] : 1;
     const size_t first_stride = (num_other_dims > 0) ? other_strides[0] : 0;
     size_t rest_product = 1;
@@ -243,7 +239,7 @@ inline void edt_pass0_from_graph_direct_parallel(
         return;
     }
 
-    // Parallel: distribute first dimension like ND v1
+    // Parallel: distribute first dimension across threads
     ThreadPool& pool = shared_pool_for(threads);
     const size_t per_thread = (first_extent + threads - 1) / threads;
     std::vector<std::future<void>> pending;
@@ -290,10 +286,10 @@ template <typename T>
 inline float sq(T x) { return float(x) * float(x); }
 
 /*
- * FUSED Parabolic Pass from Graph
+ * Parabolic Pass from Graph
  *
- * Graph-first design: Reads voxel connectivity graph directly and computes
- * parabolic EDT in a single pass, avoiding separate segment label building.
+ * Reads voxel connectivity graph directly; no separate segment label
+ * building step.
  */
 template <typename GRAPH_T>
 inline void squared_edt_1d_parabolic_from_graph_ws(
@@ -309,8 +305,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
     float* ranges
 ) {
     constexpr int SMALL_THRESHOLD = 8;
-    const float anis_sq = anisotropy * anisotropy;
-    const float w2 = anis_sq;
+    const float w2 = anisotropy * anisotropy;
 
     if (n <= 0) return;
 
@@ -323,16 +318,16 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         for (int j = 0; j < len; ++j) {
             float best = original[j];
             if (left_border) {
-                const float cap_left = anis_sq * (j + 1) * (j + 1);
+                const float cap_left = w2 * (j + 1) * (j + 1);
                 if (cap_left < best) best = cap_left;
             }
             if (right_border) {
-                const float cap_right = anis_sq * (len - j) * (len - j);
+                const float cap_right = w2 * (len - j) * (len - j);
                 if (cap_right < best) best = cap_right;
             }
             for (int q = 0; q < len; ++q) {
                 const int delta = j - q;
-                const float candidate = original[q] + anis_sq * delta * delta;
+                const float candidate = original[q] + w2 * delta * delta;
                 if (candidate < best) best = candidate;
             }
             f[(start + j) * stride] = best;
@@ -386,7 +381,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         // Output pass - use specialized loops to avoid per-iteration conditionals
         k = 0;
         if (left_border && right_border) {
-            // Fast path: both borders - always apply envelope (like v1)
+            // Both borders: take min of border distances and parabolic result
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
                 const float result = w2 * sq(i - v[k]) + ff[v[k]];
@@ -414,10 +409,9 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         }
     };
 
-    // Scan graph to find segments - V1-style single loop
+    // Scan graph to find foreground segments - single loop
     // Key insight: segment boundary when prev didn't connect forward (!(prev & axis_bit))
     // Background has graph=0, so axis_bit check handles both cases
-    if (n <= 0) return;
 
     // Skip leading background
     int i = 0;
@@ -465,7 +459,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
 }
 
 //-----------------------------------------------------------------------------
-// FUSED Parabolic Pass from Graph (parallel dispatch)
+// Parabolic Pass from Graph (parallel dispatch)
 //-----------------------------------------------------------------------------
 
 template <typename GRAPH_T>
@@ -502,7 +496,7 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
         }
     }
 
-    // Compute rest_product (product of all dims except first)
+    // rest_product: size of inner slab (other dims 1..N-1 per first-dim slice)
     const size_t first_extent = (num_other_dims > 0) ? other_extents[0] : 1;
     const size_t first_stride = (num_other_dims > 0) ? other_strides[0] : 0;
     size_t rest_product = 1;
@@ -545,7 +539,7 @@ inline void edt_pass_parabolic_from_graph_fused_parallel(
         return;
     }
 
-    // Parallel: distribute first dimension like ND v1
+    // Parallel: distribute first dimension across threads
     ThreadPool& pool = shared_pool_for(threads);
     const size_t per_thread = (first_extent + threads - 1) / threads;
     std::vector<std::future<void>> pending;
@@ -618,17 +612,14 @@ inline void edtsq_from_graph(
     // For 2D: axis 0 -> bit 3, axis 1 -> bit 1
     // For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
 
-    // FULLY FUSED: All passes read directly from graph — no segment labels allocation.
-
-    // Process axes from innermost to outermost (like V1) for cache efficiency
-    // Innermost axis has stride=1, so pass 0 should process it first
+    // Process axes from innermost to outermost for cache efficiency
+    // (innermost axis has stride=1 and is processed first as pass 0)
     bool is_first_pass = true;
     for (size_t axis = dims; axis-- > 0;) {
         // Compute axis bit
         const GRAPH_T axis_bit = GRAPH_T(1) << (2 * (dims - 1 - axis) + 1);
 
         if (is_first_pass) {
-            // FUSED pass 0: Read graph directly, compute EDT
             edt_pass0_from_graph_direct_parallel<GRAPH_T>(
                 graph, output,
                 shape, strides.data(), dims, axis, axis_bit,
@@ -636,7 +627,6 @@ inline void edtsq_from_graph(
             );
             is_first_pass = false;
         } else {
-            // FUSED parabolic: Read graph directly
             edt_pass_parabolic_from_graph_fused_parallel<GRAPH_T>(
                 graph, output,
                 shape, strides.data(), dims, axis, axis_bit,
@@ -730,16 +720,16 @@ inline void build_connectivity_graph(
     const GRAPH_T last_bit = axis_bits[dims - 1];
     const GRAPH_T first_bit = axis_bits[0];
 
-    // Middle dimensions product (dims 1 to dims-2) - for 4D+
+    // Middle dimensions product (dims 1 to dims-2); zero for 2D (empty product = 1)
     int64_t mid_product = 1;
     for (size_t d = 1; d + 1 < dims; d++) {
         mid_product *= shape64[d];
     }
 
-    // Number of middle dimensions (dims between first and last) - for 4D+
+    // Number of middle dimensions (dims between first and last); 0 for 2D, 1 for 3D, etc.
     const size_t num_mid = dims - 2;
 
-    // Process range of first dimension (outer loop) for 3D+
+    // Process range of first dimension (outer loop) for 2D+
     auto process_dim0_range = [&](int64_t d0_start, int64_t d0_end) {
         // Thread-local storage for precomputed middle dimension info
         const T* mid_neighbor_row[6];  // Neighbor row pointers for middle dims
@@ -1190,8 +1180,8 @@ inline void _expand_sort_axes(
     }
 }
 
-// Compute base offsets for each scanline along axis `ax`, given all other
-// axes in ax_ord[0..ord_len-1] (sorted), filling bases[0..num_lines-1].
+// Compute start offsets for each of `num_lines` scanlines, given the axes
+// in ax_ord[0..ord_len-1], filling bases[0..num_lines-1].
 inline void _expand_compute_bases(
     size_t* bases,
     const size_t* ax_ord,

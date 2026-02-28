@@ -88,7 +88,7 @@ def _prepare_array(arr, dtype):
 
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
-    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread, size_t tile) nogil
+    cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread) nogil
 
     # EDT from voxel graph
     cdef void edtsq_from_graph[GRAPH_T](
@@ -144,9 +144,9 @@ cdef extern from "edt.hpp" namespace "nd":
     ) nogil
 
 
-def set_tuning(chunks_per_thread=1, tile=8):
+def set_tuning(chunks_per_thread=1):
     """Set tuning parameters for ND EDT."""
-    _nd_set_tuning(chunks_per_thread, tile)
+    _nd_set_tuning(chunks_per_thread)
 
 
 def _voxel_graph_to_nd(voxel_graph, labels=None):
