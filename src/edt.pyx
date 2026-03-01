@@ -3,7 +3,7 @@
 Multi-label Euclidean Distance Transform based on the algorithms of
 Saito et al (1994), Meijster et al (2002), and Felzenszwalb & Huttenlocher (2012).
 
-Uses connectivity graphs internally (uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-12D, uint64 for 13-16D).
+Uses connectivity graphs internally (uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-16D, uint64 for 17-32D).
 Memory-efficient for larger input dtypes (up to 38% savings for uint32 input
 vs label-segment approaches).
 Supports custom voxel_graph input for user-defined boundaries.
@@ -61,14 +61,17 @@ def _graph_dtype(ndim):
 
     Bit 0 is the foreground marker. Each axis edge occupies bit 2*(ndim-1-axis)+1,
     so max bit = 2*(ndim-1)+1:
-      dims 1-4  -> uint8  (max bit 7)
-      dims 5-8  -> uint16 (max bit 15)
-      dims 9-12 -> uint32 (max bit 23)
-      dims 13-16 -> uint64 (max bit 31)
+      dims 1-4   -> uint8  (max bit 7)
+      dims 5-8   -> uint16 (max bit 15)
+      dims 9-16  -> uint32 (max bit 31)
+      dims 17-32 -> uint64 (max bit 63)
     """
-    if ndim > 16:
-        raise ValueError(f"EDT supports at most 16 dimensions, got {ndim}.")
-    return (np.uint8, np.uint16, np.uint32, np.uint64)[(ndim - 1) // 4]
+    if ndim > 32:
+        raise ValueError(f"EDT supports at most 32 dimensions, got {ndim}.")
+    if ndim <= 4:  return np.uint8
+    if ndim <= 8:  return np.uint16
+    if ndim <= 16: return np.uint32
+    return np.uint64
 
 
 def _prepare_array(arr, dtype):
@@ -205,9 +208,9 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     """
     Compute squared Euclidean distance transform via graph-first architecture.
 
-    Converts labels to a connectivity graph internally (uint8 for 1-4D, uint16 for 5-8D),
-    then computes EDT. The graph is built and freed in C++ for maximum efficiency.
-    For 9D+ label arrays, use edtsq_graph with a pre-built graph from build_graph.
+    Builds a connectivity graph internally (uint8 for 1-4D, uint16 for 5-8D,
+    uint32 for 9-16D, uint64 for 17-32D) then computes EDT. Graph is built and
+    freed in C++ — no Python-visible intermediate allocation.
 
     Parameters
     ----------
@@ -260,8 +263,11 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     cdef int nd = labels.ndim
     cdef tuple shape = labels.shape
 
+    if nd > 32:
+        raise ValueError(f"EDT supports at most 32 dimensions, got {nd}.")
+
     if anisotropy is None:
-        anisotropy = tuple([1.0] * nd)
+        anisotropy = (1.0,) * nd
     elif not hasattr(anisotropy, '__len__'):
         anisotropy = (float(anisotropy),) * nd
     else:
@@ -365,7 +371,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
     Parameters
     ----------
-    graph : ndarray (uint8 for 2D-4D, uint16 for 5D-8D, uint32 for 9D-12D, uint64 for 13D-16D)
+    graph : ndarray (uint8 for 1D-4D, uint16 for 5D-8D, uint32 for 9D-16D, uint64 for 17D-32D)
         Voxel connectivity graph. Each element encodes edge bits for each axis.
         For 2D: axis 0 -> bit 3, axis 1 -> bit 1
         For 3D: axis 0 -> bit 5, axis 1 -> bit 3, axis 2 -> bit 1
@@ -394,7 +400,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     graph = np.ascontiguousarray(graph, dtype=graph_dtype)
 
     if anisotropy is None:
-        anisotropy = tuple([1.0] * nd)
+        anisotropy = (1.0,) * nd
     elif not hasattr(anisotropy, '__len__'):
         anisotropy = (float(anisotropy),) * nd
     else:
@@ -450,7 +456,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
         elif nd <= 8:
             with nogil:
                 edtsq_from_graph[uint16_t](<uint16_t*>graphp, outp, cshape, canis, nd, bb, par)
-        elif nd <= 12:
+        elif nd <= 16:
             with nogil:
                 edtsq_from_graph[uint32_t](<uint32_t*>graphp, outp, cshape, canis, nd, bb, par)
         else:
@@ -487,8 +493,8 @@ def build_graph(labels, parallel=0):
     Returns
     -------
     ndarray
-        Connectivity graph (uint8 for 1D-4D, uint16 for 5D-8D, uint32 for 9D-12D,
-        uint64 for 13D-16D) where each element encodes per-axis edge bits.
+        Connectivity graph (uint8 for 1D-4D, uint16 for 5D-8D, uint32 for 9D-16D, uint64 for 17D-32D)
+        where each element encodes per-axis edge bits.
     """
     # Preserve input dtype where possible to avoid copies.
     # For signed/float types, use .view() to reinterpret as same-width
@@ -540,6 +546,8 @@ def build_graph(labels, parallel=0):
     cdef uint64_t* labelsp64
     cdef uint8_t* graphp8
     cdef uint16_t* graphp16
+    cdef uint32_t* graphp32
+    cdef uint64_t* graphp64
 
     try:
         if nd <= 4:
@@ -560,7 +568,7 @@ def build_graph(labels, parallel=0):
                 labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
                 with nogil:
                     build_connectivity_graph[uint64_t, uint8_t](labelsp64, graphp8, cshape, nd, par)
-        else:
+        elif nd <= 8:
             graphp16 = <uint16_t*> np.PyArray_DATA(graph)
             if dtype_code == 0:
                 labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
@@ -578,6 +586,42 @@ def build_graph(labels, parallel=0):
                 labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
                 with nogil:
                     build_connectivity_graph[uint64_t, uint16_t](labelsp64, graphp16, cshape, nd, par)
+        elif nd <= 16:
+            graphp32 = <uint32_t*> np.PyArray_DATA(graph)
+            if dtype_code == 0:
+                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint8_t, uint32_t](labelsp8, graphp32, cshape, nd, par)
+            elif dtype_code == 1:
+                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint16_t, uint32_t](labelsp16, graphp32, cshape, nd, par)
+            elif dtype_code == 2:
+                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint32_t, uint32_t](labelsp32, graphp32, cshape, nd, par)
+            else:
+                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint64_t, uint32_t](labelsp64, graphp32, cshape, nd, par)
+        else:
+            graphp64 = <uint64_t*> np.PyArray_DATA(graph)
+            if dtype_code == 0:
+                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint8_t, uint64_t](labelsp8, graphp64, cshape, nd, par)
+            elif dtype_code == 1:
+                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint16_t, uint64_t](labelsp16, graphp64, cshape, nd, par)
+            elif dtype_code == 2:
+                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint32_t, uint64_t](labelsp32, graphp64, cshape, nd, par)
+            else:
+                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+                with nogil:
+                    build_connectivity_graph[uint64_t, uint64_t](labelsp64, graphp64, cshape, nd, par)
     finally:
         free(cshape)
 
@@ -662,7 +706,16 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     cdef np.ndarray feat_sz
     cdef Py_ssize_t ii
 
-    arr = np.require(data, dtype=np.uint32, requirements='C')
+    arr = np.asarray(data)
+    if arr.dtype == np.uint32:
+        if not arr.flags.c_contiguous:
+            arr = np.ascontiguousarray(arr)
+    elif arr.dtype == np.int32:
+        # Same width — reinterpret without copy; label values are non-negative so
+        # bit patterns are identical to the uint32 representation.
+        arr = np.ascontiguousarray(arr).view(np.uint32)
+    else:
+        arr = np.ascontiguousarray(arr, dtype=np.uint32)
     nd = arr.ndim
 
     if anisotropy is None:
@@ -847,7 +900,7 @@ def feature_transform(data, anisotropy=None, black_border=False, int parallel=1,
         except Exception:
             parallel = max(1, parallel)
 
-    labels, feats = expand_labels(arr.astype(np.uint32, copy=False), anis, parallel, True)
+    labels, feats = expand_labels(arr, anis, parallel, True)
 
     if return_distances:
         dist = edt(arr != 0, anis, black_border, parallel)

@@ -5,14 +5,14 @@
  *        (bit-encoded uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-16D, uint64 for 17-32D).
  *
  * Pipeline (edtsq / edtsq_from_labels_fused):
- *   1. Build a compact connectivity graph (uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-16D, uint64 for 17-32D): each voxel
- *      stores a bitmask of forward edges plus a foreground marker at bit 0.
+ *   1. Build a compact connectivity graph: each voxel stores a bitmask of
+ *      forward edges plus a foreground marker at bit 0.
  *   2. Run all EDT passes directly from the graph — no intermediate segment label array:
  *      - Pass 0 (innermost axis): Rosenfeld-Pfaltz scan detects boundaries from graph
  *        edge bits and writes squared 1D distances.
  *      - Passes 1..N-1: parabolic envelope reads graph edge bits per scanline in-place.
  *   O(N) per scanline, parallelized across scanlines.
- *   For edtsq_graph: step 1 is skipped (caller supplies the pre-built graph).
+ *   For edtsq_from_graph: step 1 is skipped (caller supplies the pre-built graph).
  *
  * See src/README.md for graph bit encoding, memory layout, and algorithm details.
  */
@@ -129,7 +129,7 @@ struct AxisPassInfo {
     //
     // For the ND branch, coords[1..num_other-1] are guaranteed to return to
     // all-zeros after exactly rest_prod inner iterations, so they are
-    // allocated once and not re-initialized per i0 row.
+    // initialized once and not re-initialized per i0 row.
     template <typename F>
     void for_each_line(size_t begin, size_t end, F fn) const {
         if (num_other <= 1) {
@@ -161,7 +161,7 @@ struct AxisPassInfo {
  * Pass 0 from Graph
  *
  * Reads the voxel connectivity graph and computes the Rosenfeld-Pfaltz
- * 1D EDT (pass 0) directly. No version writes segment labels.
+ * 1D EDT (pass 0) directly. Does not write segment labels.
  */
 template <typename GRAPH_T>
 inline void squared_edt_1d_from_graph_direct(
@@ -175,7 +175,6 @@ inline void squared_edt_1d_from_graph_direct(
 ) {
     if (n <= 0) return;
 
-    const float inf = std::numeric_limits<float>::infinity();
     const float anis_sq = anisotropy * anisotropy;
     int i = 0;
 
@@ -214,6 +213,7 @@ inline void squared_edt_1d_from_graph_direct(
                 d[(seg_start + k) * stride] = anis_sq * kf * kf;
             }
         } else {
+            const float inf = std::numeric_limits<float>::infinity();
             for (int k = 0; k < seg_len; k++) {
                 d[(seg_start + k) * stride] = inf;
             }
@@ -292,10 +292,10 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
     float* ff,
     float* ranges
 ) {
+    if (n <= 0) return;
+
     constexpr int SMALL_THRESHOLD = 8;
     const float w2 = anisotropy * anisotropy;
-
-    if (n <= 0) return;
 
     // Fast path for small segments: O(n²) brute force
     auto process_small_run = [&](int start, int len, bool left_border, bool right_border) {
@@ -306,16 +306,15 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         for (int j = 0; j < len; ++j) {
             float best = original[j];
             if (left_border) {
-                const float cap_left = w2 * (j + 1) * (j + 1);
+                const float cap_left = w2 * sq(j + 1);
                 if (cap_left < best) best = cap_left;
             }
             if (right_border) {
-                const float cap_right = w2 * (len - j) * (len - j);
+                const float cap_right = w2 * sq(len - j);
                 if (cap_right < best) best = cap_right;
             }
             for (int q = 0; q < len; ++q) {
-                const int delta = j - q;
-                const float candidate = original[q] + w2 * delta * delta;
+                const float candidate = original[q] + w2 * sq(j - q);
                 if (candidate < best) best = candidate;
             }
             f[(start + j) * stride] = best;
@@ -344,9 +343,11 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         ranges[1] = std::numeric_limits<float>::infinity();
 
         // Intersection of the two parabolas centered at ff[a] and ff[b].
+        // Use double arithmetic to avoid catastrophic cancellation when
+        // ff[b] - ff[a] is tiny relative to the large squared-distance values.
         auto intersect = [&](int a, int b) -> float {
-            const float f1 = float(b - a) * w2;
-            return (ff[b] - ff[a] + f1 * float(a + b)) / (2.0f * f1);
+            const double d1 = double(b - a) * double(w2);
+            return float((double(ff[b]) - double(ff[a]) + d1 * double(a + b)) / (2.0 * d1));
         };
 
         float s;
@@ -373,7 +374,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
                 const float result = w2 * sq(i - v[k]) + ff[v[k]];
-                const float envelope = std::fminf(w2 * sq(i + 1), w2 * sq(len - i));
+                const float envelope = w2 * std::fminf(sq(i + 1), sq(len - i));
                 f[(start + i) * stride] = std::fminf(envelope, result);
             }
         } else if (left_border) {
@@ -557,10 +558,8 @@ inline void build_connectivity_graph(
 ) {
     if (dims == 0) return;
 
-    int64_t voxels = 1;
-    for (size_t d = 0; d < dims; d++) {
-        voxels *= shape[d];
-    }
+    size_t voxels = 1;
+    for (size_t d = 0; d < dims; d++) voxels *= shape[d];
     if (voxels == 0) return;
 
     const int threads = std::max(1, parallel);
@@ -612,7 +611,7 @@ inline void build_connectivity_graph(
     const GRAPH_T last_bit = axis_bits[dims - 1];
     const GRAPH_T first_bit = axis_bits[0];
 
-    // Middle dimensions product (dims 1 to dims-2); zero for 2D (empty product = 1)
+    // Middle dimensions product (dims 1 to dims-2); = 1 for 2D (empty product)
     int64_t mid_product = 1;
     for (size_t d = 1; d + 1 < dims; d++) {
         mid_product *= shape64[d];
@@ -719,7 +718,8 @@ inline void build_connectivity_graph(
 // 3. Thread pool is already warm from graph build
 //-----------------------------------------------------------------------------
 
-// Internal: allocate graph of type GRAPH_T, build connectivity, run EDT, free.
+// Internal: allocate graph of type GRAPH_T, build connectivity, run EDT.
+// `total` (precomputed by caller) is passed to avoid recomputing for the allocation.
 template <typename T, typename GRAPH_T>
 inline void _edtsq_fused_typed(
     const T* labels, float* output, const size_t* shape,
@@ -762,8 +762,8 @@ inline void edtsq_from_labels_fused(
 // Workspace arrays (v_ws[n], ff_ws[n], ranges_ws[n+1]) must be caller-allocated.
 // Callers should allocate once per chunk and reuse across scanlines to avoid
 // repeated heap churn inside tight per-line loops.
-// Note: v_ws[0] must be 0 on first call; this function sets it explicitly so
-// workspace does not need to be zero-initialized by the caller.
+// Workspace does not need to be initialized by the caller; this function sets
+// all required entries before use.
 inline void squared_edt_1d_parabolic_with_arg_stride(
     float* f,
     const size_t n,
@@ -788,9 +788,10 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
     ranges[0] = -std::numeric_limits<float>::infinity();
     ranges[1] = std::numeric_limits<float>::infinity();
 
+    // Use double arithmetic for the same cancellation-resistance as process_large_run.
     auto intersect = [&](int a, int b) -> float {
-        const float f1 = float(b - a) * w2;
-        return (ff[b] - ff[a] + f1 * float(a + b)) / (2.0f * f1);
+        const double d1 = double(b - a) * double(w2);
+        return float((double(ff[b]) - double(ff[a]) + d1 * double(a + b)) / (2.0 * d1));
     };
 
     float s;
@@ -812,7 +813,7 @@ inline void squared_edt_1d_parabolic_with_arg_stride(
         for (int i = 0; i < nn; i++) {
             while (ranges[k + 1] < i) k++;
             const float parabola = w2 * sq(i - v[k]) + ff[v[k]];
-            const float border   = std::fminf(w2 * sq(i + 1), w2 * sq(nn - i));
+            const float border   = w2 * std::fminf(sq(i + 1), sq(nn - i));
             f[i * stride] = std::fminf(border, parabola);
             arg_out[i] = v[k];
         }
@@ -873,7 +874,7 @@ inline void _nd_expand_init_bases(
         }
     };
 
-    dispatch_parallel(threads, num_lines, threads, process_chunk);
+    dispatch_parallel(threads, num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD, process_chunk);
 }
 
 template <typename INDEX=size_t>
@@ -960,7 +961,7 @@ inline void _nd_expand_init_labels_bases(
         }
     };
 
-    dispatch_parallel(threads, num_lines, (size_t)threads, process_chunk);
+    dispatch_parallel(threads, num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD, process_chunk);
 }
 
 inline void _nd_expand_parabolic_labels_bases(
@@ -971,7 +972,7 @@ inline void _nd_expand_parabolic_labels_bases(
     const size_t s,
     const float anis,
     const bool black_border,
-    const uint32_t* label_in,
+    const uint32_t* labels_in,
     uint32_t* label_out,
     const int parallel
 ) {
@@ -993,18 +994,18 @@ inline void _nd_expand_parabolic_labels_bases(
                     arg.data(),
                     v_ws.data(), ff_ws.data(), ranges_ws.data());
                 for (size_t j = 0; j < n; ++j) {
-                    label_out[base + j * s] = label_in[base + arg[j] * s];
+                    label_out[base + j * s] = labels_in[base + arg[j] * s];
                 }
             } else {
                 // All seeds: copy labels unchanged (self-reference)
                 for (size_t j = 0; j < n; ++j) {
-                    label_out[base + j * s] = label_in[base + j * s];
+                    label_out[base + j * s] = labels_in[base + j * s];
                 }
             }
         }
     };
 
-    dispatch_parallel(threads, num_lines, (size_t)threads, process_chunk);
+    dispatch_parallel(threads, num_lines, (size_t)threads * ND_CHUNKS_PER_THREAD, process_chunk);
 }
 
 //-----------------------------------------------------------------------------
