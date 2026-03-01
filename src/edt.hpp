@@ -157,6 +157,9 @@ struct AxisPassInfo {
     }
 };
 
+template <typename T>
+inline float sq(T x) { return float(x) * float(x); }
+
 /*
  * Pass 0 from Graph
  *
@@ -209,8 +212,7 @@ inline void squared_edt_1d_from_graph_direct(
         // Forward pass: squared distance from left boundary
         if (left_boundary) {
             for (int k = 0; k < seg_len; k++) {
-                const float kf = float(k + 1);
-                d[(seg_start + k) * stride] = anis_sq * kf * kf;
+                d[(seg_start + k) * stride] = anis_sq * sq(k + 1);
             }
         } else {
             const float inf = std::numeric_limits<float>::infinity();
@@ -222,8 +224,7 @@ inline void squared_edt_1d_from_graph_direct(
         // Backward pass: take min with squared distance from right boundary
         if (right_boundary) {
             for (int k = seg_len - 1; k >= 0; k--) {
-                const float rf = float(seg_len - k);
-                const float v_sq = anis_sq * rf * rf;
+                const float v_sq = anis_sq * sq(seg_len - k);
                 const int64_t idx = (seg_start + k) * stride;
                 if (v_sq < d[idx]) {
                     d[idx] = v_sq;
@@ -269,9 +270,6 @@ inline void edt_pass0_from_graph_direct_parallel(
 
     dispatch_parallel(threads, info.first_ext, threads, process_range);
 }
-
-template <typename T>
-inline float sq(T x) { return float(x) * float(x); }
 
 /*
  * Parabolic Pass from Graph
@@ -380,14 +378,12 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
         } else if (left_border) {
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * sq(i - v[k]) + ff[v[k]];
-                f[(start + i) * stride] = std::fminf(w2 * sq(i + 1), result);
+                f[(start + i) * stride] = std::fminf(w2 * sq(i + 1), w2 * sq(i - v[k]) + ff[v[k]]);
             }
         } else if (right_border) {
             for (int i = 0; i < len; i++) {
                 while (ranges[k + 1] < i) k++;
-                const float result = w2 * sq(i - v[k]) + ff[v[k]];
-                f[(start + i) * stride] = std::fminf(w2 * sq(len - i), result);
+                f[(start + i) * stride] = std::fminf(w2 * sq(len - i), w2 * sq(i - v[k]) + ff[v[k]]);
             }
         } else {
             // No borders - just parabolic result
@@ -899,9 +895,9 @@ inline void _nd_expand_parabolic_bases(
         std::vector<float> ff_ws(n), ranges_ws(n + 1);
         for (size_t i = start; i < end; ++i) {
             const size_t base = bases[i];
-            bool any_nonzero = false;
-            for (size_t j = 0; j < n; ++j) any_nonzero |= (dist[base + j * s] != 0.0f);
-            if (!any_nonzero) continue;  // all seeds, feat already holds self-references
+            bool any_nonseed = false;
+            for (size_t j = 0; j < n; ++j) any_nonseed |= (dist[base + j * s] != 0.0f);
+            if (!any_nonseed) continue;  // all seeds: dist=0 everywhere, feat already holds self-references
             for (size_t j = 0; j < n; ++j) feat_line[j] = feat[base + j * s];
             squared_edt_1d_parabolic_with_arg_stride(
                 dist + base, n, s, anis,

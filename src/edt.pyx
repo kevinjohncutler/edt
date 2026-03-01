@@ -56,6 +56,11 @@ _ND_MIN_LINES_PER_THREAD_DEFAULT = 32
 _ND_CONFIG = {}
 
 
+def _check_dims(nd):
+    if nd > 32:
+        raise ValueError(f"EDT supports at most 32 dimensions, got {nd}.")
+
+
 def _graph_dtype(ndim):
     """Return the minimal uint dtype for a connectivity graph of ndim dimensions.
 
@@ -66,8 +71,7 @@ def _graph_dtype(ndim):
       dims 9-16  -> uint32 (max bit 31)
       dims 17-32 -> uint64 (max bit 63)
     """
-    if ndim > 32:
-        raise ValueError(f"EDT supports at most 32 dimensions, got {ndim}.")
+    _check_dims(ndim)
     if ndim <= 4:  return np.uint8
     if ndim <= 8:  return np.uint16
     if ndim <= 16: return np.uint32
@@ -263,8 +267,7 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     cdef int nd = labels.ndim
     cdef tuple shape = labels.shape
 
-    if nd > 32:
-        raise ValueError(f"EDT supports at most 32 dimensions, got {nd}.")
+    _check_dims(nd)
 
     if anisotropy is None:
         anisotropy = (1.0,) * nd
@@ -717,6 +720,7 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     else:
         arr = np.ascontiguousarray(arr, dtype=np.uint32)
     nd = arr.ndim
+    _check_dims(nd)
 
     if anisotropy is None:
         anis = (1.0,) * nd
@@ -752,32 +756,36 @@ def expand_labels(data, anisotropy=None, int parallel=1, return_features=False):
     lout_p = <uint32_t*> np.PyArray_DATA(labels_out)
     data_p = <const uint32_t*> np.PyArray_DATA(arr)
 
-    if return_features:
-        use_u32_feat = (total < (<size_t>1 << 32))
-        if use_u32_feat:
-            feat_u32 = np.empty((total,), dtype=np.uint32)
-            feat_u32_p = <uint32_t*> np.PyArray_DATA(feat_u32)
-            with nogil:
-                expand_labels_features_fused[uint32_t, uint32_t](
-                    data_p, lout_p, feat_u32_p,
-                    cshape, canis, <size_t>nd, False, parallel)
-            free(cshape); free(canis)
-            return labels_out.reshape(arr.shape), feat_u32.reshape(arr.shape)
+    try:
+        if return_features:
+            use_u32_feat = (total < (<size_t>1 << 32))
+            if use_u32_feat:
+                feat_u32 = np.empty((total,), dtype=np.uint32)
+                feat_u32_p = <uint32_t*> np.PyArray_DATA(feat_u32)
+                with nogil:
+                    expand_labels_features_fused[uint32_t, uint32_t](
+                        data_p, lout_p, feat_u32_p,
+                        cshape, canis, <size_t>nd, False, parallel)
+            else:
+                feat_sz = np.empty((total,), dtype=np.uintp)
+                feat_sz_p = <size_t*> np.PyArray_DATA(feat_sz)
+                with nogil:
+                    expand_labels_features_fused[uint32_t, size_t](
+                        data_p, lout_p, feat_sz_p,
+                        cshape, canis, <size_t>nd, False, parallel)
         else:
-            feat_sz = np.empty((total,), dtype=np.uintp)
-            feat_sz_p = <size_t*> np.PyArray_DATA(feat_sz)
             with nogil:
-                expand_labels_features_fused[uint32_t, size_t](
-                    data_p, lout_p, feat_sz_p,
-                    cshape, canis, <size_t>nd, False, parallel)
-            free(cshape); free(canis)
-            return labels_out.reshape(arr.shape), feat_sz.reshape(arr.shape)
-    else:
-        with nogil:
-            expand_labels_fused[uint32_t](
-                data_p, lout_p, cshape, canis, <size_t>nd, False, parallel)
-        free(cshape); free(canis)
-        return labels_out.reshape(arr.shape)
+                expand_labels_fused[uint32_t](
+                    data_p, lout_p, cshape, canis, <size_t>nd, False, parallel)
+    finally:
+        free(cshape)
+        free(canis)
+
+    if return_features:
+        if use_u32_feat:
+            return labels_out.reshape(arr.shape), feat_u32.reshape(arr.shape)
+        return labels_out.reshape(arr.shape), feat_sz.reshape(arr.shape)
+    return labels_out.reshape(arr.shape)
 
 
 def configure(
@@ -882,6 +890,7 @@ def feature_transform(data, anisotropy=None, black_border=False, int parallel=1,
         return np.zeros_like(arr, dtype=np.uint64)
 
     dims = arr.ndim
+    _check_dims(dims)
     if anisotropy is None:
         anis = (1.0,) * dims
     else:
