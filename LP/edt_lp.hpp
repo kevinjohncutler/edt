@@ -1529,40 +1529,48 @@ inline void _expand_parabolic_feat_strided(
 // virtual cell at index -1 (and n) as a zero-label seed at distance 0.
 //=============================================================================
 
+template <typename D>
 inline void _expand_l1_pass0(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     const size_t n,
     const size_t num_lines,
-    const float anis,
+    const D anis,
     const bool black_border,
     const int parallel
 ) {
     if (n == 0 || num_lines == 0) return;
     const size_t threads = compute_threads(parallel, num_lines, n);
-    const float HUGE_DIST = std::numeric_limits<float>::max() / 4.0f;
+    constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
 
     auto process_chunk = [&](size_t begin, size_t end) {
         for (size_t line = begin; line < end; ++line) {
             uint32_t* ll = lbl + line * n;
-            float*    dd = dist + line * n;
+            D*        dd = dist + line * n;
 
-            float prev_d = black_border ? 0.0f : HUGE_DIST;
+            // Forward sweep with branchless update: compute both candidates
+            // and select. clang lowers the if/else over locals + uncondit-
+            // ional store to ARM csel + str, avoiding a hard-to-predict
+            // branch in the store path.
+            D prev_d = black_border ? D(0) : HUGE_DIST;
             uint32_t prev_l = 0;
             for (size_t i = 0; i < n; ++i) {
                 const uint32_t init_l = ll[i];
-                const float init_d = (init_l != 0) ? 0.0f : HUGE_DIST;
-                const float cd = prev_d + anis;
-                if (cd < init_d) { dd[i] = cd; ll[i] = prev_l; }
-                else             { dd[i] = init_d; }
-                prev_d = dd[i];
-                prev_l = ll[i];
+                const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
+                const D cd = prev_d + anis;
+                D out_d; uint32_t out_l;
+                if (cd < init_d) { out_d = cd;     out_l = prev_l; }
+                else             { out_d = init_d; out_l = init_l; }
+                dd[i] = out_d;
+                ll[i] = out_l;
+                prev_d = out_d;
+                prev_l = out_l;
             }
             if (black_border) {
                 if (anis < dd[n - 1]) { dd[n - 1] = anis; ll[n - 1] = 0; }
             }
             for (size_t i = n - 1; i-- > 0; ) {
-                const float cd = dd[i + 1] + anis;
+                const D cd = dd[i + 1] + anis;
                 if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i + 1]; }
             }
         }
@@ -1570,12 +1578,13 @@ inline void _expand_l1_pass0(
     dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
 }
 
+template <typename D>
 inline void _expand_l1_propagate(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     const size_t n,
     const size_t num_lines,
-    const float anis,
+    const D anis,
     const bool black_border,
     const int parallel
 ) {
@@ -1585,19 +1594,19 @@ inline void _expand_l1_propagate(
     auto process_chunk = [&](size_t begin, size_t end) {
         for (size_t line = begin; line < end; ++line) {
             uint32_t* ll = lbl + line * n;
-            float*    dd = dist + line * n;
+            D*        dd = dist + line * n;
             if (black_border) {
                 if (anis < dd[0])     { dd[0] = anis;       ll[0] = 0; }
             }
             for (size_t i = 1; i < n; ++i) {
-                const float cd = dd[i - 1] + anis;
+                const D cd = dd[i - 1] + anis;
                 if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i - 1]; }
             }
             if (black_border) {
                 if (anis < dd[n - 1]) { dd[n - 1] = anis;   ll[n - 1] = 0; }
             }
             for (size_t i = n - 1; i-- > 0; ) {
-                const float cd = dd[i + 1] + anis;
+                const D cd = dd[i + 1] + anis;
                 if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i + 1]; }
             }
         }
@@ -1609,11 +1618,12 @@ inline void _expand_l1_propagate(
 // a contiguous range of columns and processes the full forward+backward
 // sweep over those columns row-by-row. Unit-stride reads/writes within
 // the band (vs the per-line strided path's large strides) → up to 3× faster.
+template <typename D>
 inline void _expand_l1_2d_col_stripe(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     const size_t H, const size_t W,
-    const float anis,
+    const D anis,
     const bool black_border,
     const int parallel
 ) {
@@ -1623,23 +1633,23 @@ inline void _expand_l1_2d_col_stripe(
         // Forward (rows 1..H-1)
         for (size_t y = 1; y < H; ++y) {
             uint32_t* lr = lbl  + y * W;
-            float*    dr = dist + y * W;
+            D*        dr = dist + y * W;
             const uint32_t* lt = lbl  + (y - 1) * W;
-            const float*    dt = dist + (y - 1) * W;
+            const D*        dt = dist + (y - 1) * W;
             for (size_t x = x0; x < x1; ++x) {
-                const float cd = dt[x] + anis;
+                const D cd = dt[x] + anis;
                 if (cd < dr[x]) { dr[x] = cd; lr[x] = lt[x]; }
             }
         }
         // black_border: virtual seed at row -1 contributes anis to row 0;
         // virtual seed at row H contributes anis to row H-1.
         if (black_border) {
-            float* dr0 = dist;
+            D*        dr0 = dist;
             uint32_t* lr0 = lbl;
             for (size_t x = x0; x < x1; ++x) {
                 if (anis < dr0[x]) { dr0[x] = anis; lr0[x] = 0; }
             }
-            float* drH = dist + (H - 1) * W;
+            D*        drH = dist + (H - 1) * W;
             uint32_t* lrH = lbl + (H - 1) * W;
             for (size_t x = x0; x < x1; ++x) {
                 if (anis < drH[x]) { drH[x] = anis; lrH[x] = 0; }
@@ -1648,11 +1658,11 @@ inline void _expand_l1_2d_col_stripe(
         // Backward (rows H-2..0)
         for (size_t y = H - 1; y-- > 0; ) {
             uint32_t* lr = lbl  + y * W;
-            float*    dr = dist + y * W;
+            D*        dr = dist + y * W;
             const uint32_t* lb = lbl  + (y + 1) * W;
-            const float*    db = dist + (y + 1) * W;
+            const D*        db = dist + (y + 1) * W;
             for (size_t x = x0; x < x1; ++x) {
-                const float cd = db[x] + anis;
+                const D cd = db[x] + anis;
                 if (cd < dr[x]) { dr[x] = cd; lr[x] = lb[x]; }
             }
         }
@@ -1668,18 +1678,19 @@ inline void _expand_l1_2d_col_stripe(
 // just two raster sweeps with `+anis` per step, so per-row work is
 // trivial — the transpose round-trip dominates and direct strided access
 // wins by 2-5× even though each iteration touches a separate cache line.
+template <typename D>
 inline void _expand_l1_pass0_strided(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     uint32_t* RESTRICT /*ws_lbl*/,
-    float* RESTRICT /*ws_dist*/,
+    D* RESTRICT /*ws_dist*/,
     const size_t B, const size_t C, const size_t A,
-    const float anis, const bool black_border, const int parallel
+    const D anis, const bool black_border, const int parallel
 ) {
     const size_t num_lines = A * C;
     if (B == 0 || num_lines == 0) return;
     const size_t threads = compute_threads(parallel, num_lines, B);
-    const float HUGE_DIST = std::numeric_limits<float>::max() / 4.0f;
+    constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
     const int64_t stride = (int64_t)C;
 
     auto process_chunk = [&](size_t l0, size_t l1) {
@@ -1688,18 +1699,21 @@ inline void _expand_l1_pass0_strided(
             const size_t c = l - a * C;
             const size_t base = a * B * C + c;
             uint32_t* ll = lbl + base;
-            float*    dd = dist + base;
+            D*        dd = dist + base;
 
-            float prev_d = black_border ? 0.0f : HUGE_DIST;
+            D prev_d = black_border ? D(0) : HUGE_DIST;
             uint32_t prev_l = 0;
             for (size_t i = 0; i < B; ++i) {
                 const uint32_t init_l = ll[i * stride];
-                const float init_d = (init_l != 0) ? 0.0f : HUGE_DIST;
-                const float cd = prev_d + anis;
-                if (cd < init_d) { dd[i * stride] = cd; ll[i * stride] = prev_l; }
-                else             { dd[i * stride] = init_d; }
-                prev_d = dd[i * stride];
-                prev_l = ll[i * stride];
+                const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
+                const D cd = prev_d + anis;
+                D out_d; uint32_t out_l;
+                if (cd < init_d) { out_d = cd;     out_l = prev_l; }
+                else             { out_d = init_d; out_l = init_l; }
+                dd[i * stride] = out_d;
+                ll[i * stride] = out_l;
+                prev_d = out_d;
+                prev_l = out_l;
             }
             if (black_border) {
                 if (anis < dd[(B - 1) * stride]) {
@@ -1708,7 +1722,7 @@ inline void _expand_l1_pass0_strided(
                 }
             }
             for (size_t i = B - 1; i-- > 0; ) {
-                const float cd = dd[(i + 1) * stride] + anis;
+                const D cd = dd[(i + 1) * stride] + anis;
                 if (cd < dd[i * stride]) {
                     dd[i * stride] = cd;
                     ll[i * stride] = ll[(i + 1) * stride];
@@ -1719,13 +1733,14 @@ inline void _expand_l1_pass0_strided(
     dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
 }
 
+template <typename D>
 inline void _expand_l1_propagate_strided(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     uint32_t* RESTRICT /*ws_lbl*/,
-    float* RESTRICT /*ws_dist*/,
+    D* RESTRICT /*ws_dist*/,
     const size_t B, const size_t C, const size_t A,
-    const float anis, const bool black_border, const int parallel
+    const D anis, const bool black_border, const int parallel
 ) {
     const size_t num_lines = A * C;
     if (B == 0 || num_lines == 0) return;
@@ -1738,13 +1753,13 @@ inline void _expand_l1_propagate_strided(
             const size_t c = l - a * C;
             const size_t base = a * B * C + c;
             uint32_t* ll = lbl + base;
-            float*    dd = dist + base;
+            D*        dd = dist + base;
 
             if (black_border) {
                 if (anis < dd[0]) { dd[0] = anis; ll[0] = 0; }
             }
             for (size_t i = 1; i < B; ++i) {
-                const float cd = dd[(i - 1) * stride] + anis;
+                const D cd = dd[(i - 1) * stride] + anis;
                 if (cd < dd[i * stride]) {
                     dd[i * stride] = cd;
                     ll[i * stride] = ll[(i - 1) * stride];
@@ -1757,7 +1772,7 @@ inline void _expand_l1_propagate_strided(
                 }
             }
             for (size_t i = B - 1; i-- > 0; ) {
-                const float cd = dd[(i + 1) * stride] + anis;
+                const D cd = dd[(i + 1) * stride] + anis;
                 if (cd < dd[i * stride]) {
                     dd[i * stride] = cd;
                     ll[i * stride] = ll[(i + 1) * stride];
@@ -1823,10 +1838,11 @@ inline void expand_labels_fused(
     float*    ws_dist = (float*)cache.get(3, total * sizeof(float));
 
     // Initial cast/copy data → labels_out. labels_out is fresh np.empty
-    // memory whose pages are unmapped on first touch. Below ~8 MiB the
-    // serial path wins (dispatch overhead dominates); above that, parallel
-    // page-fault servicing + bandwidth aggregation wins.
-    constexpr size_t COPY_PARALLEL_THRESHOLD = (8u << 20) / sizeof(uint32_t);  // 8 MiB
+    // memory whose pages are unmapped on first touch. Below ~16 MiB the
+    // serial path wins (dispatch overhead + serial bandwidth on M-class
+    // memory still beats 20-way parallel for this size). Above that,
+    // parallel page-fault servicing + multi-channel aggregation wins.
+    constexpr size_t COPY_PARALLEL_THRESHOLD = (16u << 20) / sizeof(uint32_t);  // 16 MiB
     if (total < COPY_PARALLEL_THRESHOLD) {
         if constexpr (std::is_same_v<T, uint32_t>) {
             std::memcpy(labels_out, data, total * sizeof(uint32_t));
@@ -1852,11 +1868,60 @@ inline void expand_labels_fused(
     // intersection at p=2 and bisection elsewhere.
     const bool use_l1 = (p == 1.0f);
 
-    // 2D L1 fast path: pass0 over rows (parallel-over-rows on innermost
-    // axis), then a single column-stripe pass on the outer axis. The
-    // stripe pass keeps each thread's working set contiguous within its
-    // column band — ~3× faster than the per-line strided variant for 2D
-    // specifically (where the stride between iterations equals W).
+    // L1 with integer-valued anisotropy → int32 dist buffer. Apple Silicon
+    // FP add has 3-cycle latency vs int's 1-cycle; the forward raster sweep
+    // is a register-dependency chain on prev_d, so int dist runs ~3× faster
+    // through that chain. Common case: anisotropy=1.0 for all axes.
+    bool l1_int = use_l1;
+    if (l1_int) {
+        for (size_t d = 0; d < dims; ++d) {
+            const float a = anisotropy[d];
+            if (a < 1.0f || a > 1e6f || a != std::floor(a)) { l1_int = false; break; }
+        }
+    }
+
+    if (l1_int) {
+        int32_t* dist_i = (int32_t*)cache.get(1, total * sizeof(int32_t));
+
+        // 2D L1 fast path (int32 dist).
+        if (dims == 2 && strides[paxes[0]] == 1) {
+            const size_t inner_axis = paxes[0];
+            const size_t outer_axis = paxes[1];
+            const size_t H = shape[outer_axis];
+            const size_t W = shape[inner_axis];
+            const int32_t inner_anis = (int32_t)anisotropy[inner_axis];
+            const int32_t outer_anis = (int32_t)anisotropy[outer_axis];
+            _expand_l1_pass0<int32_t>(lbl, dist_i, W, H, inner_anis, black_border, parallel);
+            _expand_l1_2d_col_stripe<int32_t>(lbl, dist_i, H, W, outer_anis, black_border, parallel);
+            return;
+        }
+
+        for (size_t pass = 0; pass < dims; ++pass) {
+            const size_t axis     = paxes[pass];
+            const size_t axis_len = shape[axis];
+            const int32_t anis    = (int32_t)anisotropy[axis];
+
+            if (strides[axis] == 1) {
+                const size_t num_lines = total / axis_len;
+                if (pass == 0)
+                    _expand_l1_pass0<int32_t>(lbl, dist_i, axis_len, num_lines, anis, black_border, parallel);
+                else
+                    _expand_l1_propagate<int32_t>(lbl, dist_i, axis_len, num_lines, anis, black_border, parallel);
+            } else {
+                const size_t C = strides[axis];
+                const size_t B = axis_len;
+                const size_t A = total / (B * C);
+                if (pass == 0)
+                    _expand_l1_pass0_strided<int32_t>(lbl, dist_i, ws_lbl, (int32_t*)ws_dist, B, C, A, anis, black_border, parallel);
+                else
+                    _expand_l1_propagate_strided<int32_t>(lbl, dist_i, ws_lbl, (int32_t*)ws_dist, B, C, A, anis, black_border, parallel);
+            }
+        }
+        return;
+    }
+
+    // Float L1 fast path (non-integer anisotropy) — same code paths but
+    // using the original float dist buffer.
     if (use_l1 && dims == 2 && strides[paxes[0]] == 1) {
         const size_t inner_axis = paxes[0];
         const size_t outer_axis = paxes[1];
@@ -1864,9 +1929,9 @@ inline void expand_labels_fused(
         const size_t W = shape[inner_axis];
         const float  inner_anis = anisotropy[inner_axis];
         const float  outer_anis = anisotropy[outer_axis];
-        _expand_l1_pass0(lbl, dist, W, H, inner_anis, black_border, parallel);
-        _expand_l1_2d_col_stripe(lbl, dist, H, W, outer_anis, black_border, parallel);
-        return;  // lbl IS labels_out — no final copy needed
+        _expand_l1_pass0<float>(lbl, dist, W, H, inner_anis, black_border, parallel);
+        _expand_l1_2d_col_stripe<float>(lbl, dist, H, W, outer_anis, black_border, parallel);
+        return;
     }
 
     for (size_t pass = 0; pass < dims; ++pass) {
@@ -1878,12 +1943,12 @@ inline void expand_labels_fused(
             const size_t num_lines = total / axis_len;
             if (pass == 0) {
                 if (use_l1)
-                    _expand_l1_pass0(lbl, dist, axis_len, num_lines, anis, black_border, parallel);
+                    _expand_l1_pass0<float>(lbl, dist, axis_len, num_lines, anis, black_border, parallel);
                 else
                     _expand_pass0(lbl, dist, axis_len, num_lines, anis, p, black_border, parallel);
             } else {
                 if (use_l1)
-                    _expand_l1_propagate(lbl, dist, axis_len, num_lines, anis, black_border, parallel);
+                    _expand_l1_propagate<float>(lbl, dist, axis_len, num_lines, anis, black_border, parallel);
                 else
                     _expand_parabolic(lbl, dist, axis_len, num_lines, anis, p, black_border, parallel);
             }
@@ -1893,12 +1958,12 @@ inline void expand_labels_fused(
             const size_t A = total / (B * C);
             if (pass == 0) {
                 if (use_l1)
-                    _expand_l1_pass0_strided(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, black_border, parallel);
+                    _expand_l1_pass0_strided<float>(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, black_border, parallel);
                 else
                     _expand_pass0_strided(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, p, black_border, parallel);
             } else {
                 if (use_l1)
-                    _expand_l1_propagate_strided(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, black_border, parallel);
+                    _expand_l1_propagate_strided<float>(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, black_border, parallel);
                 else
                     _expand_parabolic_strided(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, p, black_border, parallel);
             }
