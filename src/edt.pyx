@@ -179,17 +179,6 @@ cdef extern from "edt.hpp" namespace "nd":
         int parallel
     ) nogil
 
-    # L1 (Manhattan) variant of expand_labels_fused.
-    cdef void expand_labels_l1_fused[T](
-        const T* data,
-        uint32_t* labels_out,
-        const size_t* shape,
-        const float* anisotropy,
-        size_t dims,
-        native_bool black_border,
-        int parallel
-    ) nogil
-
     cdef void expand_labels_features_fused[T, INDEX](
         const T* data,
         uint32_t* labels_out,
@@ -704,8 +693,8 @@ try:
 except ImportError:
     legacy = None
 
-def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, return_features=False, metric='l2'):
-    """Expand nonzero labels to zeros by nearest-neighbor (ND, separable).
+def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, return_features=False):
+    """Expand nonzero labels to zeros by nearest-neighbor in Euclidean metric (ND).
 
     Parameters
     ----------
@@ -719,13 +708,6 @@ def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, ret
         Number of threads; if <= 0, uses cpu_count().
     return_features : bool, optional
         If True, also return the feature (nearest-seed linear index) array.
-        Only supported for ``metric='l2'``.
-    metric : {'l2', 'l1'}, optional
-        Distance metric for nearest-seed assignment. ``'l2'`` (default) is
-        Euclidean — uses the parabolic-envelope (Felzenszwalb-Huttenlocher)
-        1D pass. ``'l1'`` is Manhattan — uses the simpler raster-sweep 1D
-        pass and is roughly 2× faster, at the cost of producing
-        Manhattan-shaped Voronoi cells instead of Euclidean ones.
 
     Returns
     -------
@@ -734,11 +716,6 @@ def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, ret
     features : ndarray, optional
         If return_features=True, the nearest-seed linear indices.
     """
-    if metric not in ('l2', 'l1'):
-        raise ValueError(f"metric must be 'l2' or 'l1', got {metric!r}")
-    if metric == 'l1' and return_features:
-        raise NotImplementedError(
-            "return_features is only supported for metric='l2'")
     cdef int nd
     cdef size_t total
     cdef size_t* cshape
@@ -812,14 +789,9 @@ def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, ret
                         data_p, lout_p, feat_sz_p,
                         cshape, canis, <size_t>nd, bb, parallel)
         else:
-            if metric == 'l1':
-                with nogil:
-                    expand_labels_l1_fused[uint32_t](
-                        data_p, lout_p, cshape, canis, <size_t>nd, bb, parallel)
-            else:
-                with nogil:
-                    expand_labels_fused[uint32_t](
-                        data_p, lout_p, cshape, canis, <size_t>nd, bb, parallel)
+            with nogil:
+                expand_labels_fused[uint32_t](
+                    data_p, lout_p, cshape, canis, <size_t>nd, bb, parallel)
     finally:
         free(cshape)
         free(canis)
