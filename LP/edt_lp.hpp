@@ -66,6 +66,26 @@ inline ForkJoinPool& shared_pool_for(size_t threads) {
     return *entry;
 }
 
+// Per-call-chain "active pool". Top-level entry points (e.g.
+// expand_labels_fused) install a pool reference here for the duration
+// of one invocation; dispatch_parallel reads it instead of looking up
+// shared_pool_for(threads) on every call. This collapses N pool lookups
+// (one per axis pass / dispatch) down to one per top-level call, which
+// matters on x86 many-core where the mutex+unordered_map cost is
+// non-trivial relative to a small dispatch (≈30-100us total per
+// dispatch on TR PRO 3995WX).
+inline thread_local ForkJoinPool* tls_active_pool = nullptr;
+
+struct ActivePoolGuard {
+    ForkJoinPool* prev;
+    explicit ActivePoolGuard(ForkJoinPool& pool) : prev(tls_active_pool) {
+        tls_active_pool = &pool;
+    }
+    ~ActivePoolGuard() { tls_active_pool = prev; }
+    ActivePoolGuard(const ActivePoolGuard&) = delete;
+    ActivePoolGuard& operator=(const ActivePoolGuard&) = delete;
+};
+
 // Per-pass thread cap: further limits threads based on work in a single EDT axis pass.
 // This is a C++-level inner cap applied per axis pass; the caller-supplied `desired`
 // is already capped at the Python level by _adaptive_thread_limit_nd.
@@ -115,7 +135,9 @@ inline ExpandBufCache& expand_cache() {
 // Distribute [0, total) into up to max_chunks chunks across threads.
 // Calls work(begin, end) directly when threads==1; otherwise via shared pool.
 // Uses atomic work-stealing: each thread claims chunks via fetch_add.
-// Blocks until all chunks complete.
+// Blocks until all chunks complete. The pool is the per-call-chain
+// active pool when set (see ActivePoolGuard), else looked up by
+// thread count.
 template <typename F>
 inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F work) {
     if (threads <= 1 || total == 0) {
@@ -125,7 +147,9 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
     const size_t n_chunks = std::min(max_chunks, total);
     const size_t chunk_sz = (total + n_chunks - 1) / n_chunks;
     std::atomic<size_t> next{0};
-    ForkJoinPool& pool = shared_pool_for(threads);
+    ForkJoinPool& pool = (tls_active_pool != nullptr)
+        ? *tls_active_pool
+        : shared_pool_for(threads);
     pool.parallel([&]() {
         size_t idx;
         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
@@ -1827,6 +1851,14 @@ inline void expand_labels_fused(
     if (total == 0) return;
 
     _expand_sort_axes(paxes, shape, strides, dims);
+
+    // Single pool for the whole call chain — avoids shared_pool_for()
+    // mutex+map lookup on every dispatch. Pool size = user-supplied
+    // `parallel`; per-pass work is limited via chunk count, not pool
+    // size, matching cpp_proto's pattern.
+    const size_t pool_size = (parallel > 0) ? (size_t)parallel : 1;
+    ForkJoinPool& active_pool = shared_pool_for(pool_size);
+    ActivePoolGuard pool_guard(active_pool);
 
     // Use labels_out directly as the lbl work buffer — saves one full pass
     // of memory traffic vs allocating a separate cached lbl + final memcpy.
