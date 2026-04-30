@@ -33,6 +33,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #include "threadpool.h"
@@ -1812,19 +1813,38 @@ inline void expand_labels_fused(
 
     _expand_sort_axes(paxes, shape, strides, dims);
 
-    // Slots: 0=lbl, 1=dist, 2=ws_lbl, 3=ws_dist
+    // Use labels_out directly as the lbl work buffer — saves one full pass
+    // of memory traffic vs allocating a separate cached lbl + final memcpy.
+    // (Slot 0 is no longer needed.)  Slots: 1=dist, 2=ws_lbl, 3=ws_dist.
     auto& cache = expand_cache();
-    uint32_t* lbl     = (uint32_t*)cache.get(0, total * sizeof(uint32_t));
+    uint32_t* lbl     = labels_out;
     float*    dist    = (float*)cache.get(1, total * sizeof(float));
     uint32_t* ws_lbl  = (uint32_t*)cache.get(2, total * sizeof(uint32_t));
     float*    ws_dist = (float*)cache.get(3, total * sizeof(float));
 
-    const size_t par_threads = compute_threads(parallel, total, 1);
-    dispatch_parallel(par_threads, total, par_threads * ND_CHUNKS_PER_THREAD,
-        [&](size_t begin, size_t end) {
-            for (size_t i = begin; i < end; ++i)
-                lbl[i] = (uint32_t)data[i];
-        });
+    // Initial cast/copy data → labels_out. labels_out is fresh np.empty
+    // memory whose pages are unmapped on first touch. Below ~8 MiB the
+    // serial path wins (dispatch overhead dominates); above that, parallel
+    // page-fault servicing + bandwidth aggregation wins.
+    constexpr size_t COPY_PARALLEL_THRESHOLD = (8u << 20) / sizeof(uint32_t);  // 8 MiB
+    if (total < COPY_PARALLEL_THRESHOLD) {
+        if constexpr (std::is_same_v<T, uint32_t>) {
+            std::memcpy(labels_out, data, total * sizeof(uint32_t));
+        } else {
+            for (size_t i = 0; i < total; ++i) lbl[i] = (uint32_t)data[i];
+        }
+    } else {
+        const size_t par_threads = compute_threads(parallel, total, 1);
+        dispatch_parallel(par_threads, total, par_threads * ND_CHUNKS_PER_THREAD,
+            [&](size_t begin, size_t end) {
+                if constexpr (std::is_same_v<T, uint32_t>) {
+                    std::memcpy(labels_out + begin, data + begin, (end - begin) * sizeof(uint32_t));
+                } else {
+                    for (size_t i = begin; i < end; ++i)
+                        lbl[i] = (uint32_t)data[i];
+                }
+            });
+    }
 
     // p=1.0 takes the dedicated raster-sweep path (2-5× faster than the
     // bisection-based parabolic envelope at p=1). For all other p the
@@ -1846,12 +1866,7 @@ inline void expand_labels_fused(
         const float  outer_anis = anisotropy[outer_axis];
         _expand_l1_pass0(lbl, dist, W, H, inner_anis, black_border, parallel);
         _expand_l1_2d_col_stripe(lbl, dist, H, W, outer_anis, black_border, parallel);
-
-        dispatch_parallel(par_threads, total, par_threads * ND_CHUNKS_PER_THREAD,
-            [&](size_t begin, size_t end) {
-                std::memcpy(labels_out + begin, lbl + begin, (end - begin) * sizeof(uint32_t));
-            });
-        return;
+        return;  // lbl IS labels_out — no final copy needed
     }
 
     for (size_t pass = 0; pass < dims; ++pass) {
@@ -1889,11 +1904,7 @@ inline void expand_labels_fused(
             }
         }
     }
-
-    dispatch_parallel(par_threads, total, par_threads * ND_CHUNKS_PER_THREAD,
-        [&](size_t begin, size_t end) {
-            std::memcpy(labels_out + begin, lbl + begin, (end - begin) * sizeof(uint32_t));
-        });
+    // lbl IS labels_out — no final copy needed
 }
 
 // labels + feature indices mode
