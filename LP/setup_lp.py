@@ -11,8 +11,11 @@ extra_link_args = ['-pthread']
 if sys.platform == 'darwin':
     extra_compile_args += ['-Xpreprocessor', '-fopenmp', '-stdlib=libc++']
 elif sys.platform == 'linux':
-    extra_compile_args += ['-fopenmp', '-flto']
-    extra_link_args += ['-fopenmp', '-flto']
+    # Note: -flto disabled — measured >1.5x slowdown at AMD Zen4 T=32
+    # 4096^2 with template-heavy L1 path (likely cross-TU inlining
+    # hurts hot-loop scheduling). -O3 + -march=native is sufficient.
+    extra_compile_args += ['-fopenmp']
+    extra_link_args += ['-fopenmp']
 
 ext = Extension(
     'edt_lp',

@@ -1869,12 +1869,12 @@ inline void expand_labels_fused(
     uint32_t* ws_lbl  = (uint32_t*)cache.get(2, total * sizeof(uint32_t));
     float*    ws_dist = (float*)cache.get(3, total * sizeof(float));
 
-    // Initial cast/copy data → labels_out. labels_out is fresh np.empty
-    // memory whose pages are unmapped on first touch. Below ~16 MiB the
-    // serial path wins (dispatch overhead + serial bandwidth on M-class
-    // memory still beats 20-way parallel for this size). Above that,
-    // parallel page-fault servicing + multi-channel aggregation wins.
-    constexpr size_t COPY_PARALLEL_THRESHOLD = (16u << 20) / sizeof(uint32_t);  // 16 MiB
+    // Initial cast/copy data → labels_out. Always serial: a single
+    // thread saturates 25-50 GB/s on consumer DDR4/5; parallel adds
+    // dispatch + memory-channel contention for no consistent win, and
+    // hurts on AMD Zen4 with oversubscribed SMT (>1.5x slowdown at
+    // T=32 / 4096^2 vs serial). cpp_proto does the same.
+    constexpr size_t COPY_PARALLEL_THRESHOLD = SIZE_MAX;
     if (total < COPY_PARALLEL_THRESHOLD) {
         if constexpr (std::is_same_v<T, uint32_t>) {
             std::memcpy(labels_out, data, total * sizeof(uint32_t));
