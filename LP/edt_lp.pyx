@@ -128,11 +128,13 @@ def _normalize_anisotropy(anisotropy, nd):
     return anis
 
 
+_CPU_COUNT = multiprocessing.cpu_count()  # cached: avoids /proc read per call
+
 def _resolve_parallel(parallel):
     """Cap parallel thread count to cpu_count; 0 or negative means use all CPUs."""
     if parallel <= 0:
-        return multiprocessing.cpu_count()
-    return max(1, min(parallel, multiprocessing.cpu_count()))
+        return _CPU_COUNT
+    return max(1, min(parallel, _CPU_COUNT))
 
 
 cdef extern from "edt_lp.hpp" namespace "lp":

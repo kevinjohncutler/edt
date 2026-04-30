@@ -5,7 +5,7 @@ import numpy as np
 from setuptools import setup, Extension
 from Cython.Build import cythonize
 
-extra_compile_args = ['-std=c++17', '-O3', '-pthread']
+extra_compile_args = ['-std=c++17', '-O3', '-pthread', '-march=native', '-funroll-loops']
 extra_link_args = ['-pthread']
 
 if sys.platform == 'darwin':
