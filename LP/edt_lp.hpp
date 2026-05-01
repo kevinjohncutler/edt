@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -33,6 +34,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -86,15 +88,98 @@ struct ActivePoolGuard {
     ActivePoolGuard& operator=(const ActivePoolGuard&) = delete;
 };
 
+// One-time STREAM-style memcpy probe: returns the thread count beyond
+// which adding more workers stops improving DRAM throughput (the
+// "bandwidth saturation T"). For memory-bandwidth-bound kernels (the
+// L1 chamfer's contiguous & column-stripe sweeps in 2D, especially at
+// sizes that spill L3), launching more threads than T_sat causes cache
+// thrashing and atomic-counter pressure with no compute gain.
+//
+// Methodology — from the roofline model (Williams et al., CACM '09)
+// and STREAM (McCalpin '95): time parallel memcpy at increasing T,
+// stop when adding 2x threads gives <5% additional throughput.
+//
+// First-call cost ~30-100 ms; result cached forever. Bounded by
+// [2, hardware_concurrency()].
+inline size_t bandwidth_saturation_T() {
+    static const size_t cached = []() -> size_t {
+        const unsigned hw = std::thread::hardware_concurrency();
+        if (hw <= 2) return std::max<unsigned>(1, hw);
+
+        // 64 MB buffers — large enough to spill L3 on every host we target.
+        const size_t SIZE = size_t(64) << 20;
+        std::unique_ptr<uint8_t[]> src(new uint8_t[SIZE]);
+        std::unique_ptr<uint8_t[]> dst(new uint8_t[SIZE]);
+        std::memset(src.get(), 0xa5, SIZE);
+        std::memset(dst.get(), 0, SIZE);  // first-touch both buffers
+
+        auto bench = [&](size_t T) -> double {
+            // Warmup
+            for (int i = 0; i < 3; ++i) std::memcpy(dst.get(), src.get(), SIZE);
+            double best = std::numeric_limits<double>::infinity();
+            for (int rep = 0; rep < 5; ++rep) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (T <= 1) {
+                    std::memcpy(dst.get(), src.get(), SIZE);
+                } else {
+                    const size_t N = T * 4;
+                    const size_t chunk = (SIZE + N - 1) / N;
+                    std::atomic<size_t> next{0};
+                    ForkJoinPool& pool = shared_pool_for(T);
+                    pool.parallel([&]() {
+                        size_t idx;
+                        while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < N) {
+                            const size_t b = idx * chunk;
+                            const size_t e = std::min(SIZE, b + chunk);
+                            std::memcpy(dst.get() + b, src.get() + b, e - b);
+                        }
+                    });
+                }
+                const double dt = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (dt < best) best = dt;
+            }
+            return double(SIZE) / best;  // bytes/sec
+        };
+
+        const double bw_1 = bench(1);
+        size_t best_T = 1;
+        double best_bw = bw_1;
+        // Probe at progressively higher T; stop once doubling gives <5% gain.
+        for (size_t T : {size_t(2), size_t(4), size_t(8), size_t(12), size_t(16),
+                         size_t(24), size_t(32), size_t(48), size_t(64)}) {
+            if (T > hw) break;
+            const double bw = bench(T);
+            if (bw > best_bw * 1.05) {
+                best_T = T;
+                best_bw = bw;
+            } else {
+                break;
+            }
+        }
+        return std::max<size_t>(2, best_T);
+    }();
+    return cached;
+}
+
 // Per-pass thread cap: further limits threads based on work in a single EDT axis pass.
 // This is a C++-level inner cap applied per axis pass; the caller-supplied `desired`
 // is already capped at the Python level by _adaptive_thread_limit_nd.
-inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len) {
+//
+// `bw_bound`: pass true for kernels that are memory-bandwidth-bound at large
+// sizes (e.g. the L1 chamfer's contiguous + 2D column-stripe sweeps). When
+// total_work exceeds the L3 cache spillover point, we additionally cap T at
+// the platform's bandwidth saturation point. This avoids the "+137% slower
+// than optimal" pathology we measured on TR PRO 3995WX at 2D 4096^2 where
+// calibrated T=64 was 2.4× worse than T=12 — a known roofline-model
+// consequence of bandwidth-bound code on many-channel-DRAM hosts.
+inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len,
+                              bool bw_bound = false) {
     if (desired <= 1 || total_lines <= 1) return 1;
 
     size_t threads = std::min<size_t>(desired, total_lines);
 
-    // Further cap based on work per pass (total_work = voxels along this axis sweep)
+    // Per-pass workload caps (small workloads — dispatch overhead dominates)
     const size_t total_work = axis_len * total_lines;
     if (total_work <= 60000) {
         threads = std::min<size_t>(threads, 4);   // small pass: diminishing returns above 4T
@@ -102,6 +187,13 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
         threads = std::min<size_t>(threads, 8);   // medium pass: cap at 8T
     } else if (total_work <= 400000) {
         threads = std::min<size_t>(threads, 12);  // large pass: cap at 12T
+    }
+
+    // Bandwidth-saturation cap for large bw-bound passes (>~4 MB, comfortably
+    // above L1/L2 per-core working set; avoids penalising small bandwidth-bound
+    // calls that fit in cache and benefit from more threads).
+    if (bw_bound && total_work > 1000000) {
+        threads = std::min<size_t>(threads, bandwidth_saturation_T());
     }
 
     return std::max<size_t>(1, threads);
@@ -1000,85 +1092,137 @@ inline bool _expand_1d_setup(
 }
 
 //-----------------------------------------------------------------------------
-// Pass 0: seed-skipping + midpoint optimization
-// All seeds have dist=0, so all intersections are midpoints (a+b)/2.
-// Build is O(n_seeds), output is O(n).
+// Unified pass 0 across all p (any-D, any-P_FIXED).
+//   P_FIXED == 1: L1 raster sweep (init+forward+backward fused). D may be
+//                 int32_t (faster on x86 — int add 1-cycle vs FP add 3-cycle)
+//                 or float (when anisotropy is non-integer).
+//   P_FIXED == 2: parabolic envelope, closed-form intersections (one
+//                 instantiation of lp_cost<2>). D=float.
+//   P_FIXED == 0: parabolic envelope, general bisection-based intersection.
+//                 D=float, runtime p used.
+//
+// Pass 0 specialization: for the FIRST axis, all seeds have dist=0 and the
+// envelope reduces to midpoints. For L1 this is identical to the raster sweep
+// outcome (faster path). For parabolic, the simplification holds for any p.
 //-----------------------------------------------------------------------------
 
+template <typename D, int P_FIXED>
 inline void _expand_pass0(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     const size_t n,
     const size_t num_lines,
-    const float anis,
+    const D anis,
     const float p,
     const bool black_border,
     const int parallel
 ) {
     if (n == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, n);
-    const float wp = wp_from_anisotropy(anis, p);
-    const float HUGE_DIST = std::numeric_limits<float>::max() / 4.0f;
+    const size_t threads = compute_threads(parallel, num_lines, n,
+                                           /*bw_bound=*/(P_FIXED == 1));
 
-    auto process_chunk = [&](size_t begin, size_t end) {
-        std::vector<int> v(n);
-        std::vector<uint32_t> lbl_save(n);
+    if constexpr (P_FIXED == 1) {
+        // L1 raster sweep: fused init + forward + backward. D is int32_t
+        // (integer anisotropy) or float. anis is the per-step increment.
+        constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
+        auto process_chunk = [&](size_t begin, size_t end) {
+            for (size_t line = begin; line < end; ++line) {
+                uint32_t* ll = lbl + line * n;
+                D*        dd = dist + line * n;
 
-        for (size_t line = begin; line < end; ++line) {
-            uint32_t* ll = lbl + line * n;
-            float*    dd = dist + line * n;
-
-            // Collect seed positions and init dist
-            int n_seeds = 0;
-            bool any_nonseed = false;
-            for (size_t j = 0; j < n; ++j) {
-                if (ll[j] != 0) {
-                    dd[j] = 0.0f;
-                    v[n_seeds++] = (int)j;
-                } else {
-                    dd[j] = HUGE_DIST;
-                    any_nonseed = true;
+                // Forward sweep with branchless update: compute both
+                // candidates and select. clang/gcc + MSVC all lower the
+                // if/else over locals + unconditional store to csel/cmov +
+                // store, avoiding a hard-to-predict branch in the store path.
+                D prev_d = black_border ? D(0) : HUGE_DIST;
+                uint32_t prev_l = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const uint32_t init_l = ll[i];
+                    const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
+                    const D cd = prev_d + anis;
+                    D out_d; uint32_t out_l;
+                    if (cd < init_d) { out_d = cd;     out_l = prev_l; }
+                    else             { out_d = init_d; out_l = init_l; }
+                    dd[i] = out_d;
+                    ll[i] = out_l;
+                    prev_d = out_d;
+                    prev_l = out_l;
                 }
-            }
-            if (!any_nonseed) continue;  // all seeds
-            if (n_seeds == 0) {
-                // No seeds: with black_border, fill dist with border distances
-                // so subsequent passes see realistic distances. Labels stay 0.
                 if (black_border) {
-                    for (size_t i = 0; i < n; ++i)
-                        dd[i] = std::fminf(
-                            lp_cost_pos(wp, float(i + 1), p),
-                            lp_cost_pos(wp, float(n - i), p));
+                    if (anis < dd[n - 1]) { dd[n - 1] = anis; ll[n - 1] = 0; }
                 }
-                continue;
-            }
-
-            std::memcpy(lbl_save.data(), ll, n * sizeof(uint32_t));
-
-            // Output: scan left-to-right using midpoint boundaries
-            int k = 0;
-            if (black_border) {
-                for (size_t i = 0; i < n; ++i) {
-                    while (k + 1 < n_seeds &&
-                           (double)i > (double)(v[k] + v[k + 1]) * 0.5) ++k;
-                    const float envelope = lp_cost(wp, float((int)i - v[k]), p);
-                    const float border = std::fminf(
-                        lp_cost_pos(wp, float(i + 1), p),
-                        lp_cost_pos(wp, float(n - i), p));
-                    dd[i] = std::fminf(border, envelope);
-                    ll[i] = lbl_save[v[k]];
-                }
-            } else {
-                for (size_t i = 0; i < n; ++i) {
-                    while (k + 1 < n_seeds &&
-                           (double)i > (double)(v[k] + v[k + 1]) * 0.5) ++k;
-                    dd[i] = lp_cost(wp, float((int)i - v[k]), p);
-                    ll[i] = lbl_save[v[k]];
+                for (size_t i = n - 1; i-- > 0; ) {
+                    const D cd = dd[i + 1] + anis;
+                    if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i + 1]; }
                 }
             }
-        }
-    };
-    dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+        };
+        dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+    } else {
+        // P_FIXED == 2 (closed-form) or 0 (general): parabolic envelope.
+        static_assert(std::is_same_v<D, float>,
+                      "Parabolic envelope requires D=float");
+        const float wp = wp_from_anisotropy((float)anis, p);
+        constexpr float HUGE_DIST_F = std::numeric_limits<float>::max() / 4.0f;
+        float* dist_f = reinterpret_cast<float*>(dist);
+
+        auto process_chunk = [&](size_t begin, size_t end) {
+            std::vector<int> v(n);
+            std::vector<uint32_t> lbl_save(n);
+
+            for (size_t line = begin; line < end; ++line) {
+                uint32_t* ll = lbl + line * n;
+                float*    dd = dist_f + line * n;
+
+                // Collect seed positions and init dist
+                int n_seeds = 0;
+                bool any_nonseed = false;
+                for (size_t j = 0; j < n; ++j) {
+                    if (ll[j] != 0) {
+                        dd[j] = 0.0f;
+                        v[n_seeds++] = (int)j;
+                    } else {
+                        dd[j] = HUGE_DIST_F;
+                        any_nonseed = true;
+                    }
+                }
+                if (!any_nonseed) continue;  // all seeds
+                if (n_seeds == 0) {
+                    if (black_border) {
+                        for (size_t i = 0; i < n; ++i)
+                            dd[i] = std::fminf(
+                                lp_cost_pos<P_FIXED>(wp, float(i + 1), p),
+                                lp_cost_pos<P_FIXED>(wp, float(n - i), p));
+                    }
+                    continue;
+                }
+
+                std::memcpy(lbl_save.data(), ll, n * sizeof(uint32_t));
+
+                int k = 0;
+                if (black_border) {
+                    for (size_t i = 0; i < n; ++i) {
+                        while (k + 1 < n_seeds &&
+                               (double)i > (double)(v[k] + v[k + 1]) * 0.5) ++k;
+                        const float envelope = lp_cost<P_FIXED>(wp, float((int)i - v[k]), p);
+                        const float border = std::fminf(
+                            lp_cost_pos<P_FIXED>(wp, float(i + 1), p),
+                            lp_cost_pos<P_FIXED>(wp, float(n - i), p));
+                        dd[i] = std::fminf(border, envelope);
+                        ll[i] = lbl_save[v[k]];
+                    }
+                } else {
+                    for (size_t i = 0; i < n; ++i) {
+                        while (k + 1 < n_seeds &&
+                               (double)i > (double)(v[k] + v[k + 1]) * 0.5) ++k;
+                        dd[i] = lp_cost<P_FIXED>(wp, float((int)i - v[k]), p);
+                        ll[i] = lbl_save[v[k]];
+                    }
+                }
+            }
+        };
+        dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+    }
 }
 
 template <typename INDEX>
@@ -1165,29 +1309,63 @@ inline void _expand_pass0_feat(
 // All entries participate (accumulated distances are finite).
 //-----------------------------------------------------------------------------
 
-inline void _expand_parabolic(
+// Subsequent-axis pass (renamed from _expand_parabolic): unified across all p.
+//   P_FIXED == 1: L1 raster sweep propagate (forward + backward, +anis steps).
+//                 No envelope build needed; dist already has valid 1D-L1
+//                 distances from the previous axis.
+//   P_FIXED == 2 / 0: parabolic envelope, accumulated dist values participate.
+template <typename D, int P_FIXED>
+inline void _expand_propagate(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     const size_t n,
     const size_t num_lines,
-    const float anis,
+    const D anis,
     const float p,
     const bool black_border,
     const int parallel
 ) {
     if (n == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, n);
-    const float wp = wp_from_anisotropy(anis, p);
-    const int nn = (int)n;
+    const size_t threads = compute_threads(parallel, num_lines, n,
+                                           /*bw_bound=*/(P_FIXED == 1));
 
-    auto process_chunk = [&](size_t begin, size_t end) {
-        std::vector<int>      v(n);
-        std::vector<float>    ff(n), ranges(n + 1);
-        std::vector<uint32_t> lbl_save(n);
+    if constexpr (P_FIXED == 1) {
+        auto process_chunk = [&](size_t begin, size_t end) {
+            for (size_t line = begin; line < end; ++line) {
+                uint32_t* ll = lbl + line * n;
+                D*        dd = dist + line * n;
+                if (black_border) {
+                    if (anis < dd[0])     { dd[0] = anis;       ll[0] = 0; }
+                }
+                for (size_t i = 1; i < n; ++i) {
+                    const D cd = dd[i - 1] + anis;
+                    if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i - 1]; }
+                }
+                if (black_border) {
+                    if (anis < dd[n - 1]) { dd[n - 1] = anis;   ll[n - 1] = 0; }
+                }
+                for (size_t i = n - 1; i-- > 0; ) {
+                    const D cd = dd[i + 1] + anis;
+                    if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i + 1]; }
+                }
+            }
+        };
+        dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+    } else {
+        static_assert(std::is_same_v<D, float>,
+                      "Parabolic envelope requires D=float");
+        const float wp = wp_from_anisotropy((float)anis, p);
+        const int nn = (int)n;
+        float* dist_f = reinterpret_cast<float*>(dist);
 
-        for (size_t line = begin; line < end; ++line) {
-            uint32_t* ll = lbl + line * n;
-            float*    dd = dist + line * n;
+        auto process_chunk = [&](size_t begin, size_t end) {
+            std::vector<int>      v(n);
+            std::vector<float>    ff(n), ranges(n + 1);
+            std::vector<uint32_t> lbl_save(n);
+
+            for (size_t line = begin; line < end; ++line) {
+                uint32_t* ll = lbl + line * n;
+                float*    dd = dist_f + line * n;
 
             // Quick check: if all dist==0 (all seeds), labels won't change
             bool any_nonzero = false;
@@ -1196,11 +1374,10 @@ inline void _expand_parabolic(
             }
             if (!any_nonzero) continue;
 
-            // Save originals
             std::memcpy(ff.data(), dd, n * sizeof(float));
             std::memcpy(lbl_save.data(), ll, n * sizeof(uint32_t));
 
-            // Build lower envelope (standard F&H, all entries participate)
+            // Build lower envelope (F&H, all entries participate)
             int k = 0;
             v[0] = 0;
             ranges[0] = -std::numeric_limits<float>::infinity();
@@ -1228,24 +1405,24 @@ inline void _expand_parabolic(
             if (black_border) {
                 for (int i = 0; i < nn; i++) {
                     while (ranges[k + 1] < i) k++;
-                    const float envelope = lp_cost(wp, float(i - v[k]), p) + ff[v[k]];
+                    const float envelope = lp_cost<P_FIXED>(wp, float(i - v[k]), p) + ff[v[k]];
                     const float border = std::fminf(
-                        lp_cost_pos(wp, float(i + 1), p),
-                        lp_cost_pos(wp, float(nn - i), p));
+                        lp_cost_pos<P_FIXED>(wp, float(i + 1), p),
+                        lp_cost_pos<P_FIXED>(wp, float(nn - i), p));
                     dd[i] = std::fminf(border, envelope);
                     ll[i] = lbl_save[v[k]];
                 }
             } else {
-                // No borders — parabolic result only
                 for (int i = 0; i < nn; i++) {
                     while (ranges[k + 1] < i) k++;
-                    dd[i] = lp_cost(wp, float(i - v[k]), p) + ff[v[k]];
+                    dd[i] = lp_cost<P_FIXED>(wp, float(i - v[k]), p) + ff[v[k]];
                     ll[i] = lbl_save[v[k]];
                 }
             }
         }
-    };
-    dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+        };
+        dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+    }
 }
 
 template <typename INDEX>
@@ -1454,40 +1631,157 @@ inline void _transpose_planes_3_nt(
 // Strided variants: streaming transpose → contiguous process → streaming transpose back.
 //-----------------------------------------------------------------------------
 
+// Strided pass-0 / propagate, unified across p.
+//   P_FIXED == 1: direct strided access (no transpose). L1's per-element
+//                 work (+anis) is so cheap that the transpose round-trip
+//                 dominates — direct strided wins by 2-5x.
+//   P_FIXED == 2 / 0: transpose-then-contiguous. Parabolic envelope's
+//                     per-row work (intersection arithmetic, stack
+//                     management) is heavy enough to amortize the round-trip.
+template <typename D, int P_FIXED>
 inline void _expand_pass0_strided(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     uint32_t* RESTRICT ws_lbl,
-    float* RESTRICT ws_dist,
+    D* RESTRICT ws_dist,
     const size_t B, const size_t C, const size_t A,
-    const float anis, const float p,
+    const D anis, const float p,
     const bool black_border, const int parallel
 ) {
     const size_t num_lines = A * C;
     if (B == 0 || num_lines == 0) return;
     const size_t threads = compute_threads(parallel, num_lines, B);
 
-    _transpose_planes_nt(lbl, ws_lbl, A, B, C, threads);
-    _expand_pass0(ws_lbl, ws_dist, B, num_lines, anis, p, black_border, parallel);
-    _transpose_planes_2_nt(ws_lbl, lbl, ws_dist, dist, A, C, B, threads);
+    if constexpr (P_FIXED == 1) {
+        // Direct strided access — no transpose round-trip.
+        constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
+        const int64_t stride = (int64_t)C;
+
+        auto process_chunk = [&](size_t l0, size_t l1) {
+            for (size_t l = l0; l < l1; ++l) {
+                const size_t a = l / C;
+                const size_t c = l - a * C;
+                const size_t base = a * B * C + c;
+                uint32_t* ll = lbl + base;
+                D*        dd = dist + base;
+
+                // Pointer-walk forward sweep — clang/gcc strength-reduce
+                // automatically; MSVC's loop optimizer is weaker for templated
+                // `D*` accessors so explicit pointer-walk produces tighter code.
+                D prev_d = black_border ? D(0) : HUGE_DIST;
+                uint32_t prev_l = 0;
+                uint32_t* ll_p = ll;
+                D*        dd_p = dd;
+                for (size_t i = 0; i < B; ++i) {
+                    const uint32_t init_l = *ll_p;
+                    const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
+                    const D cd = prev_d + anis;
+                    D out_d; uint32_t out_l;
+                    if (cd < init_d) { out_d = cd;     out_l = prev_l; }
+                    else             { out_d = init_d; out_l = init_l; }
+                    *dd_p = out_d;
+                    *ll_p = out_l;
+                    prev_d = out_d;
+                    prev_l = out_l;
+                    ll_p += stride;
+                    dd_p += stride;
+                }
+                uint32_t* ll_back = ll + (B - 1) * stride;
+                D*        dd_back = dd + (B - 1) * stride;
+                if (black_border) {
+                    if (anis < *dd_back) { *dd_back = anis; *ll_back = 0; }
+                }
+                uint32_t* ll_next = ll_back;
+                D*        dd_next = dd_back;
+                for (size_t i = B - 1; i-- > 0; ) {
+                    ll_back -= stride; dd_back -= stride;
+                    const D cd = *dd_next + anis;
+                    if (cd < *dd_back) { *dd_back = cd; *ll_back = *ll_next; }
+                    ll_next = ll_back; dd_next = dd_back;
+                }
+            }
+        };
+        dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+    } else {
+        // Parabolic envelope: transpose-then-contiguous round-trip amortizes.
+        // Cast through `void*` so the discarded branch type-checks against
+        // float* even when D=int32_t (this branch is never instantiated for
+        // the int32 path because `if constexpr` discards it).
+        static_assert(std::is_same_v<D, float>,
+                      "Parabolic envelope strided requires D=float");
+        float* dist_f    = reinterpret_cast<float*>(dist);
+        float* ws_dist_f = reinterpret_cast<float*>(ws_dist);
+        _transpose_planes_nt(lbl, ws_lbl, A, B, C, threads);
+        _expand_pass0<float, P_FIXED>(ws_lbl, ws_dist_f, B, num_lines,
+                                      (float)anis, p, black_border, parallel);
+        _transpose_planes_2_nt(ws_lbl, lbl, ws_dist_f, dist_f, A, C, B, threads);
+    }
 }
 
-inline void _expand_parabolic_strided(
+template <typename D, int P_FIXED>
+inline void _expand_propagate_strided(
     uint32_t* RESTRICT lbl,
-    float* RESTRICT dist,
+    D* RESTRICT dist,
     uint32_t* RESTRICT ws_lbl,
-    float* RESTRICT ws_dist,
+    D* RESTRICT ws_dist,
     const size_t B, const size_t C, const size_t A,
-    const float anis, const float p,
+    const D anis, const float p,
     const bool black_border, const int parallel
 ) {
     const size_t num_lines = A * C;
     if (B == 0 || num_lines == 0) return;
     const size_t threads = compute_threads(parallel, num_lines, B);
 
-    _transpose_planes_2_nt(lbl, ws_lbl, dist, ws_dist, A, B, C, threads);
-    _expand_parabolic(ws_lbl, ws_dist, B, num_lines, anis, p, black_border, parallel);
-    _transpose_planes_2_nt(ws_lbl, lbl, ws_dist, dist, A, C, B, threads);
+    if constexpr (P_FIXED == 1) {
+        const int64_t stride = (int64_t)C;
+
+        auto process_chunk = [&](size_t l0, size_t l1) {
+            for (size_t l = l0; l < l1; ++l) {
+                const size_t a = l / C;
+                const size_t c = l - a * C;
+                const size_t base = a * B * C + c;
+                uint32_t* ll = lbl + base;
+                D*        dd = dist + base;
+
+                if (black_border) {
+                    if (anis < dd[0]) { dd[0] = anis; ll[0] = 0; }
+                }
+                uint32_t* ll_prev = ll;
+                D*        dd_prev = dd;
+                uint32_t* ll_p = ll + stride;
+                D*        dd_p = dd + stride;
+                for (size_t i = 1; i < B; ++i) {
+                    const D cd = *dd_prev + anis;
+                    if (cd < *dd_p) { *dd_p = cd; *ll_p = *ll_prev; }
+                    ll_prev = ll_p; dd_prev = dd_p;
+                    ll_p += stride; dd_p += stride;
+                }
+                uint32_t* ll_back = ll + (B - 1) * stride;
+                D*        dd_back = dd + (B - 1) * stride;
+                if (black_border) {
+                    if (anis < *dd_back) { *dd_back = anis; *ll_back = 0; }
+                }
+                uint32_t* ll_next = ll_back;
+                D*        dd_next = dd_back;
+                for (size_t i = B - 1; i-- > 0; ) {
+                    ll_back -= stride; dd_back -= stride;
+                    const D cd = *dd_next + anis;
+                    if (cd < *dd_back) { *dd_back = cd; *ll_back = *ll_next; }
+                    ll_next = ll_back; dd_next = dd_back;
+                }
+            }
+        };
+        dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
+    } else {
+        static_assert(std::is_same_v<D, float>,
+                      "Parabolic envelope strided requires D=float");
+        float* dist_f    = reinterpret_cast<float*>(dist);
+        float* ws_dist_f = reinterpret_cast<float*>(ws_dist);
+        _transpose_planes_2_nt(lbl, ws_lbl, dist_f, ws_dist_f, A, B, C, threads);
+        _expand_propagate<float, P_FIXED>(ws_lbl, ws_dist_f, B, num_lines,
+                                          (float)anis, p, black_border, parallel);
+        _transpose_planes_2_nt(ws_lbl, lbl, ws_dist_f, dist_f, A, C, B, threads);
+    }
 }
 
 template <typename INDEX>
@@ -1538,106 +1832,6 @@ inline void _expand_parabolic_feat_strided(
 
 // labels-only mode
 //=============================================================================
-// L1 (Manhattan, p=1) fast-path kernels — raster sweep, label-tracking.
-//
-// The general parabolic-envelope path with bisection-based intersection
-// finding is correct for any p including p=1, but for L1 specifically the
-// 1D pass reduces to two raster sweeps with `+anis` propagation. That's
-// a 2-5× win on label expansion at p=1 vs the bisection path. P_FIXED=2
-// already gets a closed-form parabola intersection fast path; this
-// extends the same idea to P_FIXED=1.
-//
-// First-axis kernel (pass0) fuses init + forward + backward. Subsequent
-// axes (propagate) reuse dist values from prior passes — only forward +
-// backward propagation along this axis. ``black_border`` treats the
-// virtual cell at index -1 (and n) as a zero-label seed at distance 0.
-//=============================================================================
-
-template <typename D>
-inline void _expand_l1_pass0(
-    uint32_t* RESTRICT lbl,
-    D* RESTRICT dist,
-    const size_t n,
-    const size_t num_lines,
-    const D anis,
-    const bool black_border,
-    const int parallel
-) {
-    if (n == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, n);
-    constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
-
-    auto process_chunk = [&](size_t begin, size_t end) {
-        for (size_t line = begin; line < end; ++line) {
-            uint32_t* ll = lbl + line * n;
-            D*        dd = dist + line * n;
-
-            // Forward sweep with branchless update: compute both candidates
-            // and select. clang lowers the if/else over locals + uncondit-
-            // ional store to ARM csel + str, avoiding a hard-to-predict
-            // branch in the store path.
-            D prev_d = black_border ? D(0) : HUGE_DIST;
-            uint32_t prev_l = 0;
-            for (size_t i = 0; i < n; ++i) {
-                const uint32_t init_l = ll[i];
-                const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
-                const D cd = prev_d + anis;
-                D out_d; uint32_t out_l;
-                if (cd < init_d) { out_d = cd;     out_l = prev_l; }
-                else             { out_d = init_d; out_l = init_l; }
-                dd[i] = out_d;
-                ll[i] = out_l;
-                prev_d = out_d;
-                prev_l = out_l;
-            }
-            if (black_border) {
-                if (anis < dd[n - 1]) { dd[n - 1] = anis; ll[n - 1] = 0; }
-            }
-            for (size_t i = n - 1; i-- > 0; ) {
-                const D cd = dd[i + 1] + anis;
-                if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i + 1]; }
-            }
-        }
-    };
-    dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
-}
-
-template <typename D>
-inline void _expand_l1_propagate(
-    uint32_t* RESTRICT lbl,
-    D* RESTRICT dist,
-    const size_t n,
-    const size_t num_lines,
-    const D anis,
-    const bool black_border,
-    const int parallel
-) {
-    if (n == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, n);
-
-    auto process_chunk = [&](size_t begin, size_t end) {
-        for (size_t line = begin; line < end; ++line) {
-            uint32_t* ll = lbl + line * n;
-            D*        dd = dist + line * n;
-            if (black_border) {
-                if (anis < dd[0])     { dd[0] = anis;       ll[0] = 0; }
-            }
-            for (size_t i = 1; i < n; ++i) {
-                const D cd = dd[i - 1] + anis;
-                if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i - 1]; }
-            }
-            if (black_border) {
-                if (anis < dd[n - 1]) { dd[n - 1] = anis;   ll[n - 1] = 0; }
-            }
-            for (size_t i = n - 1; i-- > 0; ) {
-                const D cd = dd[i + 1] + anis;
-                if (cd < dd[i]) { dd[i] = cd; ll[i] = ll[i + 1]; }
-            }
-        }
-    };
-    dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
-}
-
 // 2D L1 stripe-band pass — fastest for 2D specifically. Each thread takes
 // a contiguous range of columns and processes the full forward+backward
 // sweep over those columns row-by-row. Unit-stride reads/writes within
@@ -1652,7 +1846,7 @@ inline void _expand_l1_2d_col_stripe(
     const int parallel
 ) {
     if (H <= 1 || W == 0) return;
-    const size_t threads = compute_threads(parallel, W, H);
+    const size_t threads = compute_threads(parallel, W, H, /*bw_bound=*/true);
     auto process_band = [&](size_t x0, size_t x1) {
         // Forward (rows 1..H-1)
         for (size_t y = 1; y < H; ++y) {
@@ -1692,132 +1886,6 @@ inline void _expand_l1_2d_col_stripe(
         }
     };
     dispatch_parallel(threads, W, threads * ND_CHUNKS_PER_THREAD, process_band);
-}
-
-// Strided variants for L1 — DIRECT strided access, no transpose.
-//
-// The L2 parabolic envelope path uses transpose-then-contiguous because
-// the per-row work (parabolic intersection arithmetic, stack management)
-// is heavy enough to amortize the transpose round-trip. L1's 1D pass is
-// just two raster sweeps with `+anis` per step, so per-row work is
-// trivial — the transpose round-trip dominates and direct strided access
-// wins by 2-5× even though each iteration touches a separate cache line.
-template <typename D>
-inline void _expand_l1_pass0_strided(
-    uint32_t* RESTRICT lbl,
-    D* RESTRICT dist,
-    uint32_t* RESTRICT /*ws_lbl*/,
-    D* RESTRICT /*ws_dist*/,
-    const size_t B, const size_t C, const size_t A,
-    const D anis, const bool black_border, const int parallel
-) {
-    const size_t num_lines = A * C;
-    if (B == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, B);
-    constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
-    const int64_t stride = (int64_t)C;
-
-    auto process_chunk = [&](size_t l0, size_t l1) {
-        for (size_t l = l0; l < l1; ++l) {
-            const size_t a = l / C;
-            const size_t c = l - a * C;
-            const size_t base = a * B * C + c;
-            uint32_t* ll = lbl + base;
-            D*        dd = dist + base;
-
-            // Pointer-walk form. clang/gcc strength-reduce indexed access
-            // automatically; MSVC's loop optimizer is weaker for templated
-            // `D*` accessors so explicit pointer-walk consistently produces
-            // tighter code on all three compilers (measured: closes ~half
-            // the Windows 3D regression vs `dd[i*stride]` indexed form).
-            D prev_d = black_border ? D(0) : HUGE_DIST;
-            uint32_t prev_l = 0;
-            uint32_t* ll_p = ll;
-            D*        dd_p = dd;
-            for (size_t i = 0; i < B; ++i) {
-                const uint32_t init_l = *ll_p;
-                const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
-                const D cd = prev_d + anis;
-                D out_d; uint32_t out_l;
-                if (cd < init_d) { out_d = cd;     out_l = prev_l; }
-                else             { out_d = init_d; out_l = init_l; }
-                *dd_p = out_d;
-                *ll_p = out_l;
-                prev_d = out_d;
-                prev_l = out_l;
-                ll_p += stride;
-                dd_p += stride;
-            }
-            uint32_t* ll_back = ll + (B - 1) * stride;
-            D*        dd_back = dd + (B - 1) * stride;
-            if (black_border) {
-                if (anis < *dd_back) { *dd_back = anis; *ll_back = 0; }
-            }
-            uint32_t* ll_next = ll_back;
-            D*        dd_next = dd_back;
-            for (size_t i = B - 1; i-- > 0; ) {
-                ll_back -= stride; dd_back -= stride;
-                const D cd = *dd_next + anis;
-                if (cd < *dd_back) { *dd_back = cd; *ll_back = *ll_next; }
-                ll_next = ll_back; dd_next = dd_back;
-            }
-        }
-    };
-    dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
-}
-
-template <typename D>
-inline void _expand_l1_propagate_strided(
-    uint32_t* RESTRICT lbl,
-    D* RESTRICT dist,
-    uint32_t* RESTRICT /*ws_lbl*/,
-    D* RESTRICT /*ws_dist*/,
-    const size_t B, const size_t C, const size_t A,
-    const D anis, const bool black_border, const int parallel
-) {
-    const size_t num_lines = A * C;
-    if (B == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, B);
-    const int64_t stride = (int64_t)C;
-
-    auto process_chunk = [&](size_t l0, size_t l1) {
-        for (size_t l = l0; l < l1; ++l) {
-            const size_t a = l / C;
-            const size_t c = l - a * C;
-            const size_t base = a * B * C + c;
-            uint32_t* ll = lbl + base;
-            D*        dd = dist + base;
-
-            // Pointer-walk forward sweep.
-            if (black_border) {
-                if (anis < dd[0]) { dd[0] = anis; ll[0] = 0; }
-            }
-            uint32_t* ll_prev = ll;
-            D*        dd_prev = dd;
-            uint32_t* ll_p = ll + stride;
-            D*        dd_p = dd + stride;
-            for (size_t i = 1; i < B; ++i) {
-                const D cd = *dd_prev + anis;
-                if (cd < *dd_p) { *dd_p = cd; *ll_p = *ll_prev; }
-                ll_prev = ll_p; dd_prev = dd_p;
-                ll_p += stride; dd_p += stride;
-            }
-            uint32_t* ll_back = ll + (B - 1) * stride;
-            D*        dd_back = dd + (B - 1) * stride;
-            if (black_border) {
-                if (anis < *dd_back) { *dd_back = anis; *ll_back = 0; }
-            }
-            uint32_t* ll_next = ll_back;
-            D*        dd_next = dd_back;
-            for (size_t i = B - 1; i-- > 0; ) {
-                ll_back -= stride; dd_back -= stride;
-                const D cd = *dd_next + anis;
-                if (cd < *dd_back) { *dd_back = cd; *ll_back = *ll_next; }
-                ll_next = ll_back; dd_next = dd_back;
-            }
-        }
-    };
-    dispatch_parallel(threads, num_lines, threads * ND_CHUNKS_PER_THREAD, process_chunk);
 }
 
 template <typename T>
@@ -1925,94 +1993,110 @@ inline void expand_labels_fused(
         }
     }
 
-    if (l1_int) {
-        int32_t* dist_i = (int32_t*)cache.get(1, total * sizeof(int32_t));
+    // Helper: a small per-axis dispatcher that picks the unified template
+    // instantiation by P_FIXED. The L1 path uses int32 dist when l1_int is
+    // true (integer anisotropy) for tighter codegen on the dependency-chain
+    // forward sweep; otherwise uses float dist.
+    //
+    // Templated callable rather than a single big switch so each P_FIXED
+    // path is compile-time selected and inlined.
+    auto run_axes = [&](auto p_tag) {
+        constexpr int P_FIXED = decltype(p_tag)::value;
+        using D = std::conditional_t<P_FIXED == 1, int32_t, float>;
+        D* dist_typed;
+        if constexpr (P_FIXED == 1) {
+            dist_typed = (int32_t*)cache.get(1, total * sizeof(int32_t));
+        } else {
+            dist_typed = dist;
+        }
 
-        // 2D L1 fast path (int32 dist).
-        if (dims == 2 && strides[paxes[0]] == 1) {
-            const size_t inner_axis = paxes[0];
-            const size_t outer_axis = paxes[1];
-            const size_t H = shape[outer_axis];
-            const size_t W = shape[inner_axis];
-            const int32_t inner_anis = (int32_t)anisotropy[inner_axis];
-            const int32_t outer_anis = (int32_t)anisotropy[outer_axis];
-            _expand_l1_pass0<int32_t>(lbl, dist_i, W, H, inner_anis, black_border, parallel);
-            _expand_l1_2d_col_stripe<int32_t>(lbl, dist_i, H, W, outer_anis, black_border, parallel);
-            return;
+        // 2D L1 fast path: pass0 over rows + column-stripe over outer axis.
+        // Only applicable for L1 — L2 envelope construction can't be done
+        // column-band-parallel because each row's envelope depends on the
+        // whole row at once.
+        if constexpr (P_FIXED == 1) {
+            if (dims == 2 && strides[paxes[0]] == 1) {
+                const size_t inner_axis = paxes[0];
+                const size_t outer_axis = paxes[1];
+                const size_t H = shape[outer_axis];
+                const size_t W = shape[inner_axis];
+                const D inner_anis = (D)anisotropy[inner_axis];
+                const D outer_anis = (D)anisotropy[outer_axis];
+                _expand_pass0<D, P_FIXED>(lbl, dist_typed, W, H, inner_anis, /*p=*/1.0f, black_border, parallel);
+                _expand_l1_2d_col_stripe<D>(lbl, dist_typed, H, W, outer_anis, black_border, parallel);
+                return;
+            }
         }
 
         for (size_t pass = 0; pass < dims; ++pass) {
             const size_t axis     = paxes[pass];
             const size_t axis_len = shape[axis];
-            const int32_t anis    = (int32_t)anisotropy[axis];
+            const D anis = (D)anisotropy[axis];
 
             if (strides[axis] == 1) {
                 const size_t num_lines = total / axis_len;
                 if (pass == 0)
-                    _expand_l1_pass0<int32_t>(lbl, dist_i, axis_len, num_lines, anis, black_border, parallel);
+                    _expand_pass0<D, P_FIXED>(lbl, dist_typed, axis_len, num_lines, anis, p, black_border, parallel);
                 else
-                    _expand_l1_propagate<int32_t>(lbl, dist_i, axis_len, num_lines, anis, black_border, parallel);
+                    _expand_propagate<D, P_FIXED>(lbl, dist_typed, axis_len, num_lines, anis, p, black_border, parallel);
             } else {
                 const size_t C = strides[axis];
                 const size_t B = axis_len;
                 const size_t A = total / (B * C);
                 if (pass == 0)
-                    _expand_l1_pass0_strided<int32_t>(lbl, dist_i, ws_lbl, (int32_t*)ws_dist, B, C, A, anis, black_border, parallel);
+                    _expand_pass0_strided<D, P_FIXED>(lbl, dist_typed,
+                        ws_lbl, (D*)ws_dist, B, C, A, anis, p, black_border, parallel);
                 else
-                    _expand_l1_propagate_strided<int32_t>(lbl, dist_i, ws_lbl, (int32_t*)ws_dist, B, C, A, anis, black_border, parallel);
+                    _expand_propagate_strided<D, P_FIXED>(lbl, dist_typed,
+                        ws_lbl, (D*)ws_dist, B, C, A, anis, p, black_border, parallel);
             }
         }
-        return;
-    }
+    };
 
-    // Float L1 fast path (non-integer anisotropy) — same code paths but
-    // using the original float dist buffer.
-    if (use_l1 && dims == 2 && strides[paxes[0]] == 1) {
-        const size_t inner_axis = paxes[0];
-        const size_t outer_axis = paxes[1];
-        const size_t H = shape[outer_axis];
-        const size_t W = shape[inner_axis];
-        const float  inner_anis = anisotropy[inner_axis];
-        const float  outer_anis = anisotropy[outer_axis];
-        _expand_l1_pass0<float>(lbl, dist, W, H, inner_anis, black_border, parallel);
-        _expand_l1_2d_col_stripe<float>(lbl, dist, H, W, outer_anis, black_border, parallel);
-        return;
-    }
-
-    for (size_t pass = 0; pass < dims; ++pass) {
-        const size_t axis     = paxes[pass];
-        const size_t axis_len = shape[axis];
-        const float  anis     = anisotropy[axis];
-
-        if (strides[axis] == 1) {
-            const size_t num_lines = total / axis_len;
-            if (pass == 0) {
-                if (use_l1)
-                    _expand_l1_pass0<float>(lbl, dist, axis_len, num_lines, anis, black_border, parallel);
-                else
-                    _expand_pass0(lbl, dist, axis_len, num_lines, anis, p, black_border, parallel);
-            } else {
-                if (use_l1)
-                    _expand_l1_propagate<float>(lbl, dist, axis_len, num_lines, anis, black_border, parallel);
-                else
-                    _expand_parabolic(lbl, dist, axis_len, num_lines, anis, p, black_border, parallel);
-            }
+    if (l1_int) {
+        run_axes(std::integral_constant<int, 1>{});
+    } else if (use_l1) {
+        // L1 with non-integer anisotropy → still raster sweep, but using
+        // float dist to preserve the fractional anis correctly. P_FIXED==1
+        // selects raster; D==float keeps fractional-anis arithmetic.
+        // (Reachable only when anisotropy has non-integer entries.)
+        // Same dispatch as l1_int but with float dist.
+        // Inline the equivalent here to avoid making run_axes type-flexible.
+        if (dims == 2 && strides[paxes[0]] == 1) {
+            const size_t inner_axis = paxes[0];
+            const size_t outer_axis = paxes[1];
+            const size_t H = shape[outer_axis];
+            const size_t W = shape[inner_axis];
+            const float inner_anis = anisotropy[inner_axis];
+            const float outer_anis = anisotropy[outer_axis];
+            _expand_pass0<float, 1>(lbl, dist, W, H, inner_anis, /*p=*/1.0f, black_border, parallel);
+            _expand_l1_2d_col_stripe<float>(lbl, dist, H, W, outer_anis, black_border, parallel);
         } else {
-            const size_t C = strides[axis];
-            const size_t B = axis_len;
-            const size_t A = total / (B * C);
-            if (pass == 0) {
-                if (use_l1)
-                    _expand_l1_pass0_strided<float>(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, black_border, parallel);
-                else
-                    _expand_pass0_strided(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, p, black_border, parallel);
-            } else {
-                if (use_l1)
-                    _expand_l1_propagate_strided<float>(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, black_border, parallel);
-                else
-                    _expand_parabolic_strided(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, p, black_border, parallel);
+            for (size_t pass = 0; pass < dims; ++pass) {
+                const size_t axis     = paxes[pass];
+                const size_t axis_len = shape[axis];
+                const float anis = anisotropy[axis];
+                if (strides[axis] == 1) {
+                    const size_t num_lines = total / axis_len;
+                    if (pass == 0)
+                        _expand_pass0<float, 1>(lbl, dist, axis_len, num_lines, anis, 1.0f, black_border, parallel);
+                    else
+                        _expand_propagate<float, 1>(lbl, dist, axis_len, num_lines, anis, 1.0f, black_border, parallel);
+                } else {
+                    const size_t C = strides[axis];
+                    const size_t B = axis_len;
+                    const size_t A = total / (B * C);
+                    if (pass == 0)
+                        _expand_pass0_strided<float, 1>(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, 1.0f, black_border, parallel);
+                    else
+                        _expand_propagate_strided<float, 1>(lbl, dist, ws_lbl, ws_dist, B, C, A, anis, 1.0f, black_border, parallel);
+                }
             }
         }
+    } else if (p == 2.0f) {
+        run_axes(std::integral_constant<int, 2>{});
+    } else {
+        run_axes(std::integral_constant<int, 0>{});
     }
     // lbl IS labels_out — no final copy needed
 }
