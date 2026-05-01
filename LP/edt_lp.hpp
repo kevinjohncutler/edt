@@ -1725,32 +1725,41 @@ inline void _expand_l1_pass0_strided(
             uint32_t* ll = lbl + base;
             D*        dd = dist + base;
 
+            // Pointer-walk form. clang/gcc strength-reduce indexed access
+            // automatically; MSVC's loop optimizer is weaker for templated
+            // `D*` accessors so explicit pointer-walk consistently produces
+            // tighter code on all three compilers (measured: closes ~half
+            // the Windows 3D regression vs `dd[i*stride]` indexed form).
             D prev_d = black_border ? D(0) : HUGE_DIST;
             uint32_t prev_l = 0;
+            uint32_t* ll_p = ll;
+            D*        dd_p = dd;
             for (size_t i = 0; i < B; ++i) {
-                const uint32_t init_l = ll[i * stride];
+                const uint32_t init_l = *ll_p;
                 const D init_d = (init_l != 0) ? D(0) : HUGE_DIST;
                 const D cd = prev_d + anis;
                 D out_d; uint32_t out_l;
                 if (cd < init_d) { out_d = cd;     out_l = prev_l; }
                 else             { out_d = init_d; out_l = init_l; }
-                dd[i * stride] = out_d;
-                ll[i * stride] = out_l;
+                *dd_p = out_d;
+                *ll_p = out_l;
                 prev_d = out_d;
                 prev_l = out_l;
+                ll_p += stride;
+                dd_p += stride;
             }
+            uint32_t* ll_back = ll + (B - 1) * stride;
+            D*        dd_back = dd + (B - 1) * stride;
             if (black_border) {
-                if (anis < dd[(B - 1) * stride]) {
-                    dd[(B - 1) * stride] = anis;
-                    ll[(B - 1) * stride] = 0;
-                }
+                if (anis < *dd_back) { *dd_back = anis; *ll_back = 0; }
             }
+            uint32_t* ll_next = ll_back;
+            D*        dd_next = dd_back;
             for (size_t i = B - 1; i-- > 0; ) {
-                const D cd = dd[(i + 1) * stride] + anis;
-                if (cd < dd[i * stride]) {
-                    dd[i * stride] = cd;
-                    ll[i * stride] = ll[(i + 1) * stride];
-                }
+                ll_back -= stride; dd_back -= stride;
+                const D cd = *dd_next + anis;
+                if (cd < *dd_back) { *dd_back = cd; *ll_back = *ll_next; }
+                ll_next = ll_back; dd_next = dd_back;
             }
         }
     };
@@ -1779,28 +1788,32 @@ inline void _expand_l1_propagate_strided(
             uint32_t* ll = lbl + base;
             D*        dd = dist + base;
 
+            // Pointer-walk forward sweep.
             if (black_border) {
                 if (anis < dd[0]) { dd[0] = anis; ll[0] = 0; }
             }
+            uint32_t* ll_prev = ll;
+            D*        dd_prev = dd;
+            uint32_t* ll_p = ll + stride;
+            D*        dd_p = dd + stride;
             for (size_t i = 1; i < B; ++i) {
-                const D cd = dd[(i - 1) * stride] + anis;
-                if (cd < dd[i * stride]) {
-                    dd[i * stride] = cd;
-                    ll[i * stride] = ll[(i - 1) * stride];
-                }
+                const D cd = *dd_prev + anis;
+                if (cd < *dd_p) { *dd_p = cd; *ll_p = *ll_prev; }
+                ll_prev = ll_p; dd_prev = dd_p;
+                ll_p += stride; dd_p += stride;
             }
+            uint32_t* ll_back = ll + (B - 1) * stride;
+            D*        dd_back = dd + (B - 1) * stride;
             if (black_border) {
-                if (anis < dd[(B - 1) * stride]) {
-                    dd[(B - 1) * stride] = anis;
-                    ll[(B - 1) * stride] = 0;
-                }
+                if (anis < *dd_back) { *dd_back = anis; *ll_back = 0; }
             }
+            uint32_t* ll_next = ll_back;
+            D*        dd_next = dd_back;
             for (size_t i = B - 1; i-- > 0; ) {
-                const D cd = dd[(i + 1) * stride] + anis;
-                if (cd < dd[i * stride]) {
-                    dd[i * stride] = cd;
-                    ll[i * stride] = ll[(i + 1) * stride];
-                }
+                ll_back -= stride; dd_back -= stride;
+                const D cd = *dd_next + anis;
+                if (cd < *dd_back) { *dd_back = cd; *ll_back = *ll_next; }
+                ll_next = ll_back; dd_next = dd_back;
             }
         }
     };

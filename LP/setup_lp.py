@@ -5,14 +5,22 @@ import numpy as np
 from setuptools import setup, Extension
 from Cython.Build import cythonize
 
-extra_compile_args = ['-std=c++17', '-O3', '-pthread', '-march=native', '-funroll-loops']
-extra_link_args = ['-pthread']
-
-if sys.platform == 'darwin':
-    extra_compile_args += ['-Xpreprocessor', '-fopenmp', '-stdlib=libc++']
-elif sys.platform == 'linux':
-    extra_compile_args += ['-fopenmp', '-flto']
-    extra_link_args += ['-fopenmp', '-flto']
+if sys.platform == 'win32':
+    # MSVC flags. Matches ncolor cpp_proto's setup.py exactly:
+    # /GL (whole-program opt) and /openmp omitted — both measured to hurt
+    # 3D strided perf vs cpp_proto, likely because /GL defers template-
+    # instantiation optimization to link time where loop strength reduction
+    # doesn't get applied.
+    extra_compile_args = ['/std:c++17', '/O2', '/EHsc', '/arch:AVX2']
+    extra_link_args = []
+else:
+    extra_compile_args = ['-std=c++17', '-O3', '-pthread', '-march=native', '-funroll-loops']
+    extra_link_args = ['-pthread']
+    if sys.platform == 'darwin':
+        extra_compile_args += ['-Xpreprocessor', '-fopenmp', '-stdlib=libc++']
+    elif sys.platform == 'linux':
+        extra_compile_args += ['-fopenmp', '-flto']
+        extra_link_args += ['-fopenmp', '-flto']
 
 ext = Extension(
     'edt_lp',
