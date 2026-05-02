@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -88,74 +89,121 @@ struct ActivePoolGuard {
     ActivePoolGuard& operator=(const ActivePoolGuard&) = delete;
 };
 
-// One-time STREAM-style memcpy probe: returns the thread count beyond
-// which adding more workers stops improving DRAM throughput (the
-// "bandwidth saturation T"). For memory-bandwidth-bound kernels (the
-// L1 chamfer's contiguous & column-stripe sweeps in 2D, especially at
-// sizes that spill L3), launching more threads than T_sat causes cache
-// thrashing and atomic-counter pressure with no compute gain.
+// Forward declarations needed by kernel_saturation_T<P_FIXED>().
+template <typename D, int P_FIXED>
+inline void _expand_pass0(uint32_t* RESTRICT lbl, D* RESTRICT dist,
+                          size_t n, size_t num_lines, D anis, float p,
+                          bool black_border, int parallel);
+
+// Thread-local guard: when true, kernel saturation probes are running
+// and the cap inside compute_threads / pass functions must be skipped
+// to prevent infinite recursion.
+inline thread_local bool tls_probe_active = false;
+
+// Per-(P_FIXED) kernel saturation probe. Runs the actual axis-pass
+// kernel at a workload size where saturation is observable, finds the
+// T at which doubling no longer reduces wall time by ≥5%.
 //
-// Methodology — from the roofline model (Williams et al., CACM '09)
-// and STREAM (McCalpin '95): time parallel memcpy at increasing T,
-// stop when adding 2x threads gives <5% additional throughput.
+// Why kernel-specific (not memcpy-based)?
+//   memcpy is the most bandwidth-bound code possible — pure load+store,
+//   zero compute. Real kernels have at least some compute per byte and
+//   read-after-write dependencies (the L1 chamfer's prev_d carry
+//   especially), so their saturation point is *different* from memcpy's.
+//   Empirically: AMD Zen4 memcpy saturates at T≈8, but L1 chamfer at
+//   2D 4096² saturates at T=2 — coherency traffic from the dependency
+//   chain forces tighter limits.
 //
-// First-call cost ~30-100 ms; result cached forever. Bounded by
-// [2, hardware_concurrency()].
-inline size_t bandwidth_saturation_T() {
+// Per-p classification:
+//   P_FIXED == 1 (L1 raster):       few FLOPs/byte → low T_sat
+//   P_FIXED == 2 (L2 closed-form):  many FLOPs/byte → high T_sat (≈SMT)
+//   P_FIXED == 0 (general bisection): even more FLOPs/byte → high T_sat
+//
+// First-call cost: ~50-300 ms depending on P_FIXED. Cached forever.
+template <int P_FIXED>
+inline size_t kernel_saturation_T() {
     static const size_t cached = []() -> size_t {
         const unsigned hw = std::thread::hardware_concurrency();
         if (hw <= 2) return std::max<unsigned>(1, hw);
 
-        // 64 MB buffers — large enough to spill L3 on every host we target.
-        const size_t SIZE = size_t(64) << 20;
-        std::unique_ptr<uint8_t[]> src(new uint8_t[SIZE]);
-        std::unique_ptr<uint8_t[]> dst(new uint8_t[SIZE]);
-        std::memset(src.get(), 0xa5, SIZE);
-        std::memset(dst.get(), 0, SIZE);  // first-touch both buffers
+        // L1 needs a workload that spills L3 (16+ MB) for bandwidth
+        // saturation to manifest. L2/general are compute-bound at small
+        // sizes already; probe smaller to keep install time bounded.
+        const size_t H = (P_FIXED == 1) ? 4096 : 1024;
+        const size_t W = H;
+        const size_t total = H * W;
 
-        auto bench = [&](size_t T) -> double {
-            // Warmup
-            for (int i = 0; i < 3; ++i) std::memcpy(dst.get(), src.get(), SIZE);
+        using D = std::conditional_t<P_FIXED == 1, int32_t, float>;
+
+        // Synthetic seed pattern. ~50 well-spaced seeds is enough to
+        // exercise the algorithm without being all-seeds (which would
+        // skip the inner loop).
+        std::unique_ptr<uint32_t[]> lbl_template(new uint32_t[total]);
+        std::memset(lbl_template.get(), 0, total * sizeof(uint32_t));
+        for (size_t i = 0; i < 50; ++i) {
+            const size_t y = (i * 31u + 100) % (H - 40) + 20;
+            const size_t x = (i * 47u + 200) % (W - 40) + 20;
+            lbl_template[y * W + x] = (uint32_t)(i + 1);
+        }
+
+        std::unique_ptr<uint32_t[]> lbl(new uint32_t[total]);
+        std::unique_ptr<D[]> dist(new D[total]);
+        std::memset(dist.get(), 0, total * sizeof(D));  // first-touch
+
+        // Disable kernel cap during probing (prevent infinite recursion
+        // when _expand_pass0 calls back into compute_threads → kernel
+        // probe → _expand_pass0 → ...).
+        struct ProbeGuard {
+            ProbeGuard()  { tls_probe_active = true; }
+            ~ProbeGuard() { tls_probe_active = false; }
+        } _guard;
+
+        auto bench_T = [&](size_t T) -> double {
+            // Warmup: 3 reps
+            for (int i = 0; i < 3; ++i) {
+                std::memcpy(lbl.get(), lbl_template.get(), total * sizeof(uint32_t));
+                _expand_pass0<D, P_FIXED>(lbl.get(), dist.get(), W, H,
+                                          D(1), 1.0f, false, (int)T);
+            }
+            // Best of 5
             double best = std::numeric_limits<double>::infinity();
             for (int rep = 0; rep < 5; ++rep) {
+                std::memcpy(lbl.get(), lbl_template.get(), total * sizeof(uint32_t));
                 const auto t0 = std::chrono::steady_clock::now();
-                if (T <= 1) {
-                    std::memcpy(dst.get(), src.get(), SIZE);
-                } else {
-                    const size_t N = T * 4;
-                    const size_t chunk = (SIZE + N - 1) / N;
-                    std::atomic<size_t> next{0};
-                    ForkJoinPool& pool = shared_pool_for(T);
-                    pool.parallel([&]() {
-                        size_t idx;
-                        while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < N) {
-                            const size_t b = idx * chunk;
-                            const size_t e = std::min(SIZE, b + chunk);
-                            std::memcpy(dst.get() + b, src.get() + b, e - b);
-                        }
-                    });
-                }
+                _expand_pass0<D, P_FIXED>(lbl.get(), dist.get(), W, H,
+                                          D(1), 1.0f, false, (int)T);
                 const double dt = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0).count();
                 if (dt < best) best = dt;
             }
-            return double(SIZE) / best;  // bytes/sec
+            return best;
         };
 
-        const double bw_1 = bench(1);
+        const double t_1 = bench_T(1);
         size_t best_T = 1;
-        double best_bw = bw_1;
-        // Probe at progressively higher T; stop once doubling gives <5% gain.
+        double best_t = t_1;
+        // Probe at progressively higher T; stop once doubling gives <5% improvement.
+        if (const char* dbg = std::getenv("EDT_LP_PROBE_DEBUG")) {
+            std::fprintf(stderr, "[edt_lp probe P=%d H=%zu] T=1: %.2f ms\n",
+                         (int)P_FIXED, H, t_1 * 1000);
+        }
         for (size_t T : {size_t(2), size_t(4), size_t(8), size_t(12), size_t(16),
-                         size_t(24), size_t(32), size_t(48), size_t(64)}) {
+                         size_t(24), size_t(32), size_t(48), size_t(64), size_t(96), size_t(128)}) {
             if (T > hw) break;
-            const double bw = bench(T);
-            if (bw > best_bw * 1.05) {
+            const double t = bench_T(T);
+            if (std::getenv("EDT_LP_PROBE_DEBUG")) {
+                std::fprintf(stderr, "[edt_lp probe P=%d] T=%zu: %.2f ms (best=%.2f at T=%zu)\n",
+                             (int)P_FIXED, T, t * 1000, best_t * 1000, best_T);
+            }
+            if (t < best_t * 0.95) {
                 best_T = T;
-                best_bw = bw;
+                best_t = t;
             } else {
                 break;
             }
+        }
+        if (std::getenv("EDT_LP_PROBE_DEBUG")) {
+            std::fprintf(stderr, "[edt_lp probe P=%d] FINAL T_sat = %zu\n",
+                         (int)P_FIXED, best_T);
         }
         return std::max<size_t>(2, best_T);
     }();
@@ -173,8 +221,7 @@ inline size_t bandwidth_saturation_T() {
 // than optimal" pathology we measured on TR PRO 3995WX at 2D 4096^2 where
 // calibrated T=64 was 2.4× worse than T=12 — a known roofline-model
 // consequence of bandwidth-bound code on many-channel-DRAM hosts.
-inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len,
-                              bool bw_bound = false) {
+inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len) {
     if (desired <= 1 || total_lines <= 1) return 1;
 
     size_t threads = std::min<size_t>(desired, total_lines);
@@ -189,14 +236,22 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
         threads = std::min<size_t>(threads, 12);  // large pass: cap at 12T
     }
 
-    // Bandwidth-saturation cap for large bw-bound passes (>~4 MB, comfortably
-    // above L1/L2 per-core working set; avoids penalising small bandwidth-bound
-    // calls that fit in cache and benefit from more threads).
-    if (bw_bound && total_work > 1000000) {
-        threads = std::min<size_t>(threads, bandwidth_saturation_T());
-    }
-
     return std::max<size_t>(1, threads);
+}
+
+// Kernel-aware variant: applies the per-(P_FIXED) saturation cap on top
+// of the per-pass workload caps. For L1 the probe finds a tight T_sat
+// that closes the calibration mismatch; for L2/general it returns full
+// SMT and effectively no-ops. The cap only fires for workloads larger
+// than ~4 MB working set, since small workloads benefit from more threads.
+template <int P_FIXED>
+inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len) {
+    size_t threads = compute_threads(desired, total_lines, axis_len);
+    const size_t total_work = axis_len * total_lines;
+    if (total_work > 1000000 && !tls_probe_active) {
+        threads = std::min<size_t>(threads, kernel_saturation_T<P_FIXED>());
+    }
+    return threads;
 }
 
 // Static buffer cache for expand_labels — avoids repeated allocation/page-fault
@@ -1118,8 +1173,7 @@ inline void _expand_pass0(
     const int parallel
 ) {
     if (n == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, n,
-                                           /*bw_bound=*/(P_FIXED == 1));
+    const size_t threads = compute_threads<P_FIXED>(parallel, num_lines, n);
 
     if constexpr (P_FIXED == 1) {
         // L1 raster sweep: fused init + forward + backward. D is int32_t
@@ -1326,8 +1380,7 @@ inline void _expand_propagate(
     const int parallel
 ) {
     if (n == 0 || num_lines == 0) return;
-    const size_t threads = compute_threads(parallel, num_lines, n,
-                                           /*bw_bound=*/(P_FIXED == 1));
+    const size_t threads = compute_threads<P_FIXED>(parallel, num_lines, n);
 
     if constexpr (P_FIXED == 1) {
         auto process_chunk = [&](size_t begin, size_t end) {
@@ -1846,7 +1899,8 @@ inline void _expand_l1_2d_col_stripe(
     const int parallel
 ) {
     if (H <= 1 || W == 0) return;
-    const size_t threads = compute_threads(parallel, W, H, /*bw_bound=*/true);
+    // 2D L1 col-stripe is only invoked for L1 (no L2 analog), so always P_FIXED=1.
+    const size_t threads = compute_threads<1>(parallel, W, H);
     auto process_band = [&](size_t x0, size_t x1) {
         // Forward (rows 1..H-1)
         for (size_t y = 1; y < H; ++y) {
