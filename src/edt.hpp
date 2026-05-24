@@ -29,6 +29,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include "threadpool.h"
@@ -41,6 +42,12 @@
 #endif
 
 namespace nd {
+
+// Maximum dimensionality supported by the ND path. Limited by the bit-encoded
+// graph type (uint64 covers 2*(dims-1)+1 bits, so dims<=32) and by the fixed
+// stack arrays in the typed implementation (strides[32], shape64[32], etc.).
+// Inputs above this throw std::invalid_argument from _edtsq_fused.
+static constexpr size_t EDT_MAX_DIMS = 32;
 
 // Tuning parameter: more chunks = better load balancing with atomic work-stealing
 static size_t ND_CHUNKS_PER_THREAD = 4;
@@ -136,8 +143,8 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
 // exposes for_each_line() to iterate every scanline in a slice range.
 struct AxisPassInfo {
     size_t num_other = 0;   // number of non-axis dims
-    size_t other_extents[32];   // extents of non-axis dims (in shape order)
-    size_t other_strides[32];   // strides of non-axis dims
+    size_t other_extents[EDT_MAX_DIMS];   // extents of non-axis dims (in shape order)
+    size_t other_strides[EDT_MAX_DIMS];   // strides of non-axis dims
     size_t total_lines = 1; // product of all other extents
     size_t first_extent  = 1;  // extent of first other dim  (parallelized over)
     size_t first_stride  = 0;  // stride of first other dim
@@ -175,7 +182,7 @@ struct AxisPassInfo {
         } else {
             // ND path: iterate the inner dims with a multi-dim counter.
             // coords reused across i0 rows; invariant: all-zero at start of each row.
-            size_t coords[32] = {};
+            size_t coords[EDT_MAX_DIMS] = {};
             for (size_t i0 = begin; i0 < end; i0++) {
                 size_t base = i0 * first_stride;
                 for (size_t i = 0; i < rest_prod; i++) {
@@ -532,9 +539,12 @@ inline void edtsq_from_graph(
 ) {
     if (dims == 0) return;
 
-    // Compute total voxels and C-order strides (stack array, supports up to 32D)
+    if (dims > EDT_MAX_DIMS) {
+        throw std::invalid_argument("EDT supports at most 32 dimensions");
+    }
+    // Compute total voxels and C-order strides (stack array sized EDT_MAX_DIMS)
     size_t total = 1;
-    size_t strides[32];
+    size_t strides[EDT_MAX_DIMS];
     for (size_t d = dims; d-- > 0;) {
         strides[d] = total;
         total *= shape[d];
@@ -621,9 +631,9 @@ inline void build_connectivity_graph(
     // Unified ND path for 2D+ - parallelize over first dimension with
     // chunk-based background skipping on the inner loop
     //-------------------------------------------------------------------------
-    int64_t strides[32];
-    int64_t shape64[32];
-    GRAPH_T axis_bits[32];
+    int64_t strides[EDT_MAX_DIMS];
+    int64_t shape64[EDT_MAX_DIMS];
+    GRAPH_T axis_bits[EDT_MAX_DIMS];
     {
         int64_t s = 1;
         for (size_t d = dims; d-- > 0;) {
@@ -775,6 +785,11 @@ inline void edtsq_from_labels_fused(
     const int parallel
 ) {
     if (dims == 0) return;
+    // Stack arrays in the typed implementation are sized [EDT_MAX_DIMS=32];
+    // beyond that the bit-encoded graph type (uint64 max) overflows too.
+    if (dims > EDT_MAX_DIMS) {
+        throw std::invalid_argument("EDT supports at most 32 dimensions");
+    }
     size_t total = 1;
     for (size_t d = 0; d < dims; d++) total *= shape[d];
     if (total == 0) return;
@@ -1374,9 +1389,12 @@ inline void expand_labels_fused(
         return;
     }
 
+    if (dims > EDT_MAX_DIMS) {
+        throw std::invalid_argument("expand_labels supports at most 32 dimensions");
+    }
     // ND path: blocked-transpose pipeline with cached buffers
     size_t total = 1;
-    size_t strides[32], paxes[32];
+    size_t strides[EDT_MAX_DIMS], paxes[EDT_MAX_DIMS];
     for (size_t d = dims; d-- > 0;) { strides[d] = total; total *= shape[d]; }
     if (total == 0) return;
 
@@ -1468,9 +1486,12 @@ inline void expand_labels_features_fused(
         return;
     }
 
+    if (dims > EDT_MAX_DIMS) {
+        throw std::invalid_argument("feature_transform supports at most 32 dimensions");
+    }
     // ND path: blocked-transpose pipeline with feature tracking
     size_t total = 1;
-    size_t strides[32], paxes[32];
+    size_t strides[EDT_MAX_DIMS], paxes[EDT_MAX_DIMS];
     for (size_t d = dims; d-- > 0;) { strides[d] = total; total *= shape[d]; }
     if (total == 0) return;
 
