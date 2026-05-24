@@ -71,11 +71,15 @@ inline void set_tuning(size_t chunks_per_thread) {
     if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
 }
 
-// Shared fork-join pool keyed by thread count; created lazily on first use
+// Shared fork-join pool keyed by thread count; created lazily on first use.
+// Same thread-safety contract as src/edt.hpp::shared_pool_for: static
+// mutex serializes the map operations; references into the static map
+// stay valid for the process lifetime; the pool itself is safe for
+// concurrent parallel() calls.
 inline edt::ForkJoinPool& shared_pool_for(size_t threads) {
-    static std::mutex mutex;
+    static std::mutex pool_mu;
     static std::unordered_map<size_t, std::unique_ptr<edt::ForkJoinPool>> pools;
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(pool_mu);
     auto& entry = pools[threads];
     if (!entry) {
         entry = std::make_unique<edt::ForkJoinPool>(threads);

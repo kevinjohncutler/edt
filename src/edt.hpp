@@ -56,11 +56,21 @@ inline void set_tuning(size_t chunks_per_thread) {
     if (chunks_per_thread > 0) ND_CHUNKS_PER_THREAD = chunks_per_thread;
 }
 
-// Shared fork-join pool keyed by thread count; created lazily on first use
+// Shared fork-join pool keyed by thread count; created lazily on first use.
+//
+// Thread-safety: the static mutex serializes map insert/lookup. The
+// returned reference remains valid after the function returns because
+// (a) std::unordered_map does not invalidate references to mapped values
+//     on rehash (only iterators), and
+// (b) the unique_ptrs live in the static map for the whole process,
+//     so the underlying ForkJoinPool object is never destroyed while
+//     callers hold a reference.
+// The ForkJoinPool itself is internally thread-safe (designed for
+// concurrent parallel() calls from multiple users of the same pool).
 inline edt::ForkJoinPool& shared_pool_for(size_t threads) {
-    static std::mutex mutex;
+    static std::mutex pool_mu;
     static std::unordered_map<size_t, std::unique_ptr<edt::ForkJoinPool>> pools;
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(pool_mu);
     auto& entry = pools[threads];
     if (!entry) {
         entry = std::make_unique<edt::ForkJoinPool>(threads);
