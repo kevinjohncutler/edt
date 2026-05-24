@@ -143,7 +143,7 @@ This creates a temporary uint8 array (1N bytes), but avoids the grid doubling re
 | Transform on doubled grid | - | 16N | 32N |
 | Output (float32) | 4N | 4N | 4N | 
 | **Peak** | **6N** | **23N** | **43N** |
-| **Theoretical savings** | 1× | 3.8× | 7.2× |
+| **Theoretical savings** | 1x | 3.8x | 7.2x |
 
 ## Implementation Details
 

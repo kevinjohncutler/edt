@@ -8,14 +8,14 @@ Sense-reversing centralized barrier with platform-specific idle fallback:
       - On **Linux/Windows**: interspersed spin + ``sched_yield``
         (matches pre-patch behavior). ``sched_yield`` is cheap here, so
         an idle pool burns low single-digit %% CPU and a warm pool
-        wakes in ~µs.
+        wakes in ~us.
       - On **macOS**: ``std::this_thread::sleep_for(FORKJOIN_SLEEP_US)``
         in a loop. macOS ``yield()`` was causing a ``swtch_pri`` storm
         (~1700-1800 %% CPU across 19 idle workers); sleep avoids that.
 
 Why ifdef-scoped rather than uniform: the original macOS storm is a
 macOS-scheduler-specific behavior. A uniform sleep fallback regresses
-Linux fork-join workloads 50–200 %% at multi-T (measured on threadripper,
+Linux fork-join workloads 50-200 %% at multi-T (measured on threadripper,
 2026-05-23) because ``sleep_for`` is too coarse for tight loops. A
 uniform condvar park (alternative also tested) costs ~25 %% on
 nd_profile p=16. Pre-patch ``yield()`` was already perf-correct on
@@ -51,7 +51,7 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #endif
 
 // How many CPU pauses to spin before falling back to the platform
-// idle path. ~10 ns/pause on Apple Silicon, ~30 ns on x86_64 —
+// idle path. ~10 ns/pause on Apple Silicon, ~30 ns on x86_64 --
 // long enough to cover tight back-to-back fork-join cycles, short
 // enough that an idle pool quickly hands off to the OS scheduler.
 // Swept {4096, 8192, 16384} on AMD + Intel (2026-05-23); all within
@@ -63,7 +63,7 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #if defined(__APPLE__)
 // macOS-only: sleep granularity once the spin window expires. 5 ms
 // keeps idle 19-worker pools at < 1 %% total CPU. nanosleep below
-// ~500 µs degrades into a kernel busy-wait on macOS, so 5 ms is the
+// ~500 us degrades into a kernel busy-wait on macOS, so 5 ms is the
 // practical floor. Swept {500, 1000, 5000, 10000} (2026-05-23); macOS
 // clamps sleeps below the ~10 ms scheduler tick to the same wake-up
 // latency, so 1000 and 5000 are equivalent.
@@ -137,7 +137,7 @@ private:
 
     // Sense-reversing centralized barrier with platform-scoped idle path.
     // Spin window is cross-platform; the post-spin idle behavior differs
-    // because Linux/macOS scheduler costs for ``yield`` differ by ~100×.
+    // because Linux/macOS scheduler costs for ``yield`` differ by ~100x.
     void barrier_wait_() {
         const int local_sense = 1 - bar_sense_.load(std::memory_order_relaxed);
         const size_t arrived = bar_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -168,9 +168,9 @@ private:
         }
 #else
         // Linux/Windows: interspersed spin + yield (matches pre-patch
-        // behavior). ``sched_yield`` is cheap on Linux (~1 µs syscall,
-        // no swtch_pri equivalent), so unbounded yielding is fine —
-        // idle pools tick at low CPU and a warm pool wakes in ~µs.
+        // behavior). ``sched_yield`` is cheap on Linux (~1 us syscall,
+        // no swtch_pri equivalent), so unbounded yielding is fine --
+        // idle pools tick at low CPU and a warm pool wakes in ~us.
         // Sleep-based or cv-based fallbacks both regress real workloads
         // (sleep: 50-200 %% on nd_profile p=8/16/32; cv: 20-35 %% same)
         // because their fixed per-wait overhead is large relative to

@@ -8,7 +8,7 @@
  *        (bit-encoded uint8 for 1-4D, uint16 for 5-8D, uint32 for 9-16D, uint64 for 17-32D).
  *
  * Pipeline (edtp / edtp_from_labels_fused):
- *   1. Build a compact connectivity graph (same as L2 version — metric-independent).
+ *   1. Build a compact connectivity graph (same as L2 version -- metric-independent).
  *   2. Run all EDT passes directly from the graph:
  *      - Pass 0 (innermost axis): forward/backward scan with |d|^p cost.
  *      - Passes 1..N-1: lower envelope with bisection-based intersection finding.
@@ -18,7 +18,7 @@
  *
  * Algorithm reference:
  *   Felzenszwalb & Huttenlocher, "Distance Transforms of Sampled Functions" (2012)
- *   — Section on generalization to convex cost functions with bisection.
+ *   -- Section on generalization to convex cost functions with bisection.
  */
 
 #ifndef EDT_LP_HPP
@@ -105,7 +105,7 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
 
     size_t threads = std::min<size_t>(desired, total_lines);
 
-    // Per-pass workload caps (small workloads — dispatch overhead dominates)
+    // Per-pass workload caps (small workloads -- dispatch overhead dominates)
     const size_t total_work = axis_len * total_lines;
     if (total_work <= 60000) {
         threads = std::min<size_t>(threads, 4);   // small pass: diminishing returns above 4T
@@ -132,7 +132,7 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
 //       *sufficient* lower bound. Real kernels need extra threads to hide
 //       memory-access latency (RAW hazards, irregular strides, coherency
 //       traffic) that pure memcpy doesn't have.
-//     - Memory channel count (would let us derive T_sat ≈ K × channels) is
+//     - Memory channel count (would let us derive T_sat ≈ K x channels) is
 //       not reliably readable without root (dmidecode) or per-CPU lookup
 //       tables, and the multiplier K varies by kernel anyway.
 //   The honest answer is to measure the actual kernel.
@@ -150,9 +150,9 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
 //
 // What's deliberately NOT done:
 //   - No memory channel detection / lookup tables / per-platform constants.
-//   - No fitted multipliers (no "K=6 × T_mem" magic).
+//   - No fitted multipliers (no "K=6 x T_mem" magic).
 //   - No online adaptation (one probe per host; if the workload is far from
-//     the probe's representative size, calib_T may be sub-optimal — that's
+//     the probe's representative size, calib_T may be sub-optimal -- that's
 //     a known limitation, fixable later by per-size-class wisdom files).
 
 // Forward declaration so the probe can call the public 2D entry point.
@@ -242,8 +242,8 @@ inline void write_T(const std::filesystem::path& f, size_t T) {
 }  // namespace probe_cache
 
 // Pick a representative probe shape from (p_class, ndim). Sizes chosen so
-// the working set exceeds L3 (forcing real DRAM traffic) for L1 — which
-// is bandwidth-bound — while keeping probe time bounded for L2/general,
+// the working set exceeds L3 (forcing real DRAM traffic) for L1 -- which
+// is bandwidth-bound -- while keeping probe time bounded for L2/general,
 // which are compute-heavier and saturate at smaller sizes.
 inline void probe_shape_for(int p_class, int ndim, size_t shape[3], size_t& pdims) {
     if (ndim == 3) {
@@ -259,7 +259,7 @@ inline void probe_shape_for(int p_class, int ndim, size_t shape[3], size_t& pdim
 }
 
 // Empirical per-(p_class, ndim) saturation probe. Single function with
-// runtime parameters — mirrors the unified compute path that already
+// runtime parameters -- mirrors the unified compute path that already
 // runs ND for any (D, P_FIXED). Result cached on disk; an in-memory
 // memo deduplicates repeat lookups within one process.
 inline size_t kernel_saturation_T(int p_class, int ndim) {
@@ -371,7 +371,7 @@ inline size_t kernel_saturation_T(int p_class, int ndim) {
     return T;
 }
 
-// Static buffer cache for expand_labels — avoids repeated allocation/page-fault
+// Static buffer cache for expand_labels -- avoids repeated allocation/page-fault
 // overhead on repeated calls (like ncolor's module-level np.empty() globals).
 // Each slot independently tracks its allocation size and reuses if sufficient.
 struct ExpandBufCache {
@@ -487,7 +487,7 @@ struct AxisPassInfo {
 };
 
 //=============================================================================
-// Lp cost helpers — templated for compile-time specialization
+// Lp cost helpers -- templated for compile-time specialization
 //
 // P_FIXED: 0 = general (runtime p), 2 = L2 specialization, etc.
 // When P_FIXED != 0, the compiler eliminates all branches and the p
@@ -1009,7 +1009,7 @@ inline void edtp_from_graph(
 //-----------------------------------------------------------------------------
 // Build connectivity graph from labels (single-pass, unified ND algorithm)
 //
-// The graph is metric-independent — identical to the src/ L2 implementation.
+// The graph is metric-independent -- identical to the src/ L2 implementation.
 // 1D: dedicated linear scan.
 // 2D+: unified ND path (chunk-based background skipping on innermost dim).
 // Fixed internal arrays support up to 32D.
@@ -1266,7 +1266,7 @@ inline bool _expand_1d_setup(
 //-----------------------------------------------------------------------------
 // Unified pass 0 across all p (any-D, any-P_FIXED).
 //   P_FIXED == 1: L1 raster sweep (init+forward+backward fused). D may be
-//                 int32_t (faster on x86 — int add 1-cycle vs FP add 3-cycle)
+//                 int32_t (faster on x86 -- int add 1-cycle vs FP add 3-cycle)
 //                 or float (when anisotropy is non-integer).
 //   P_FIXED == 2: parabolic envelope, closed-form intersections (one
 //                 instantiation of lp_cost<2>). D=float.
@@ -1670,7 +1670,7 @@ inline void _expand_parabolic_feat(
                     ft[i] = feat_save[v[k]];
                 }
             } else {
-                // No borders — parabolic result only
+                // No borders -- parabolic result only
                 for (int i = 0; i < nn; i++) {
                     while (ranges[k + 1] < i) k++;
                     dd[i] = lp_cost(wp, float(i - v[k]), p) + ff[v[k]];
@@ -1692,7 +1692,7 @@ inline void _expand_parabolic_feat(
 
 constexpr size_t TRANSPOSE_BLOCK = 64;
 
-// Transpose A planes of (rows × cols) → (cols × rows), one array.
+// Transpose A planes of (rows x cols) → (cols x rows), one array.
 // Read-sequential (inner loop over c) with strided writes using a small
 // register-resident tile to amortize write-combining. Block size 64.
 template <typename T>
@@ -1804,7 +1804,7 @@ inline void _transpose_planes_3_nt(
 // Strided pass-0 / propagate, unified across p.
 //   P_FIXED == 1: direct strided access (no transpose). L1's per-element
 //                 work (+anis) is so cheap that the transpose round-trip
-//                 dominates — direct strided wins by 2-5x.
+//                 dominates -- direct strided wins by 2-5x.
 //   P_FIXED == 2 / 0: transpose-then-contiguous. Parabolic envelope's
 //                     per-row work (intersection arithmetic, stack
 //                     management) is heavy enough to amortize the round-trip.
@@ -1823,7 +1823,7 @@ inline void _expand_pass0_strided(
     const size_t threads = compute_threads(parallel, num_lines, B);
 
     if constexpr (P_FIXED == 1) {
-        // Direct strided access — no transpose round-trip.
+        // Direct strided access -- no transpose round-trip.
         constexpr D HUGE_DIST = std::numeric_limits<D>::max() / 4;
         const int64_t stride = (int64_t)C;
 
@@ -1835,7 +1835,7 @@ inline void _expand_pass0_strided(
                 uint32_t* ll = lbl + base;
                 D*        dd = dist + base;
 
-                // Pointer-walk forward sweep — clang/gcc strength-reduce
+                // Pointer-walk forward sweep -- clang/gcc strength-reduce
                 // automatically; MSVC's loop optimizer is weaker for templated
                 // `D*` accessors so explicit pointer-walk produces tighter code.
                 D prev_d = black_border ? D(0) : HUGE_DIST;
@@ -2002,10 +2002,10 @@ inline void _expand_parabolic_feat_strided(
 
 // labels-only mode
 //=============================================================================
-// 2D L1 stripe-band pass — fastest for 2D specifically. Each thread takes
+// 2D L1 stripe-band pass -- fastest for 2D specifically. Each thread takes
 // a contiguous range of columns and processes the full forward+backward
 // sweep over those columns row-by-row. Unit-stride reads/writes within
-// the band (vs the per-line strided path's large strides) → up to 3× faster.
+// the band (vs the per-line strided path's large strides) → up to 3x faster.
 template <typename D>
 inline void _expand_l1_2d_col_stripe(
     uint32_t* RESTRICT lbl,
@@ -2126,7 +2126,7 @@ inline void expand_labels_fused(
     edt::ForkJoinPool& active_pool = shared_pool_for(pool_size);
     ActivePoolGuard pool_guard(active_pool);
 
-    // Use labels_out directly as the lbl work buffer — saves one full pass
+    // Use labels_out directly as the lbl work buffer -- saves one full pass
     // of memory traffic vs allocating a separate cached lbl + final memcpy.
     // (Slot 0 is no longer needed.)  Slots: 1=dist, 2=ws_lbl, 3=ws_dist.
     auto& cache = expand_cache();
@@ -2160,7 +2160,7 @@ inline void expand_labels_fused(
             });
     }
 
-    // p=1.0 takes the dedicated raster-sweep path (2-5× faster than the
+    // p=1.0 takes the dedicated raster-sweep path (2-5x faster than the
     // bisection-based parabolic envelope at p=1). For all other p the
     // parabolic-envelope code handles things, with closed-form
     // intersection at p=2 and bisection elsewhere.
@@ -2168,7 +2168,7 @@ inline void expand_labels_fused(
 
     // L1 with integer-valued anisotropy → int32 dist buffer. Apple Silicon
     // FP add has 3-cycle latency vs int's 1-cycle; the forward raster sweep
-    // is a register-dependency chain on prev_d, so int dist runs ~3× faster
+    // is a register-dependency chain on prev_d, so int dist runs ~3x faster
     // through that chain. Common case: anisotropy=1.0 for all axes.
     bool l1_int = use_l1;
     if (l1_int) {
@@ -2196,7 +2196,7 @@ inline void expand_labels_fused(
         }
 
         // 2D L1 fast path: pass0 over rows + column-stripe over outer axis.
-        // Only applicable for L1 — L2 envelope construction can't be done
+        // Only applicable for L1 -- L2 envelope construction can't be done
         // column-band-parallel because each row's envelope depends on the
         // whole row at once.
         if constexpr (P_FIXED == 1) {
@@ -2283,7 +2283,7 @@ inline void expand_labels_fused(
     } else {
         run_axes(std::integral_constant<int, 0>{});
     }
-    // lbl IS labels_out — no final copy needed
+    // lbl IS labels_out -- no final copy needed
 }
 
 // labels + feature indices mode

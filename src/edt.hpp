@@ -7,7 +7,7 @@
  * Pipeline (edtsq / edtsq_from_labels_fused):
  *   1. Build a compact connectivity graph: each voxel stores a bitmask of
  *      forward edges plus a foreground marker at bit 0.
- *   2. Run all EDT passes directly from the graph — no intermediate segment label array:
+ *   2. Run all EDT passes directly from the graph -- no intermediate segment label array:
  *      - Pass 0 (innermost axis): Rosenfeld-Pfaltz scan detects boundaries from graph
  *        edge bits and writes squared 1D distances.
  *      - Passes 1..N-1: parabolic envelope reads graph edge bits per scanline in-place.
@@ -82,7 +82,7 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
     return std::max<size_t>(1, threads);
 }
 
-// Static buffer cache for expand_labels — avoids repeated allocation/page-fault
+// Static buffer cache for expand_labels -- avoids repeated allocation/page-fault
 // overhead on repeated calls (like ncolor's module-level np.empty() globals).
 // Each slot independently tracks its allocation size and reuses if sufficient.
 struct ExpandBufCache {
@@ -329,7 +329,7 @@ inline void squared_edt_1d_parabolic_from_graph_ws(
     constexpr int SMALL_THRESHOLD = 8;
     const float wsq = anisotropy * anisotropy;
 
-    // Fast path for small segments: O(n²) brute force
+    // Fast path for small segments: O(n^2) brute force
     auto process_small_run = [&](int start, int len, bool left_border, bool right_border) {
         float original[SMALL_THRESHOLD];
         for (int q = 0; q < len; ++q) {
@@ -1150,7 +1150,7 @@ inline void _expand_parabolic_feat(
 
 constexpr size_t TRANSPOSE_BLOCK = 64;
 
-// Transpose A planes of (rows × cols) → (cols × rows), one array.
+// Transpose A planes of (rows x cols) → (cols x rows), one array.
 // Read-sequential (inner loop over c) with strided writes using a small
 // register-resident tile to amortize write-combining. Block size 64.
 template <typename T>
