@@ -704,6 +704,28 @@ def test_3d_lopsided(size):
   fres = edt.edt(gen(size[0], size[1], size[2], 'F'))
   assert np.all(np.isclose(cres, fres))
 
+def test_3d_high_anisotropy():
+  shape = (256, 256, 256)
+  anisotropy = (1000000, 1200000, 40)
+
+  labels = np.ones( shape, dtype=np.uint8)
+  labels[0, 0, 0] = 0
+  labels[-1, -1, -1] = 0
+
+  resedt = edt.edt(labels, anisotropy=anisotropy, black_border=False)
+
+  mx = np.max(resedt)
+  assert np.isfinite(mx)
+  assert mx <= (1e6 * 256) ** 2 + (1e6 * 256) ** 2 + (666 * 256) ** 2
+
+  resscipy = ndimage.distance_transform_edt(labels, sampling=anisotropy)
+
+  print("min difference:", np.min(np.abs(resscipy - resedt)))
+  print("max difference:", np.max(np.abs(resscipy - resedt)))
+
+  assert np.all(np.isclose(resscipy, resedt))
+
+
 def test_all_inf():
   # Single-label array with black_border=False has no boundaries anywhere
   # Result should be very large (1e18f from barrier algorithm, sqrt = 1e9)

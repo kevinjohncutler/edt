@@ -1,54 +1,45 @@
 name: Build Wheels
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   push:
     tags:
       - '*'
 env:
-  # Supported stable CPython versions (adjust as versions EOL).
-  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
-  CIBW_SKIP: "*-musllinux*"
+  CIBW_SKIP: pp38* pp39* pp310* *-musllinux*
 
 jobs:
   build_wheels:
-    name: Build ${{ matrix.archs_linux }}${{ matrix.archs_windows }}${{ matrix.archs_macos }} on ${{ matrix.os }}
+    name: Build wheels on ${{matrix.arch}} for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        arch: [auto]
         include:
           - os: ubuntu-latest
-            archs_linux: "x86_64"
-          - os: ubuntu-24.04-arm
-            archs_linux: "aarch64"
-          - os: windows-latest
-            archs_windows: "AMD64"
-          - os: windows-11-arm
-            archs_windows: "ARM64"
-            cibw_build: "cp311-* cp312-* cp313-* cp314-*"  # cp310 lacks win_arm64 support
-          - os: macos-15-intel
-            archs_macos: "x86_64"
-          - os: macos-latest
-            archs_macos: "arm64"
+            arch: aarch64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v2
+
+      - name: Set up QEMU
+        if:  ${{ matrix.arch == 'aarch64' }}
+        uses: docker/setup-qemu-action@v1
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.3.1
+        uses: pypa/cibuildwheel@v3.2.0
         with:
           output-dir: ./wheelhouse
+        # to supply options, put them in 'env', like:
         env:
-          CIBW_BUILD: ${{ matrix.cibw_build || env.CIBW_BUILD }}
-          CIBW_ARCHS_LINUX: ${{ matrix.archs_linux }}
-          CIBW_ARCHS_WINDOWS: ${{ matrix.archs_windows }}
-          CIBW_ARCHS_MACOS: ${{ matrix.archs_macos }}
-          # Avoid date-stamped local versions that can cause wheel filename mismatch.
-          CIBW_ENVIRONMENT: "SETUPTOOLS_SCM_LOCAL_SCHEME=no-local-version EDT_MARCH_NATIVE=0"
+          CIBW_ARCHS_LINUX: ${{matrix.arch}}
+          CIBW_BEFORE_BUILD: pip install numpy setuptools wheel
+          CIBW_ARCHS_MACOS: "x86_64 arm64"
 
       - name: Upload built wheels
         uses: actions/upload-artifact@v4
         with:
-          name: built-wheels-${{ matrix.os }}-${{ matrix.archs_linux }}${{ matrix.archs_windows }}${{ matrix.archs_macos }}
+          name: built-wheels-${{ matrix.os }}-${{ matrix.arch }}
           path: ./wheelhouse/*.whl
           if-no-files-found: warn
