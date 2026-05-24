@@ -1559,4 +1559,66 @@ inline void expand_labels_features_fused(
 
 } // namespace nd
 
+//=============================================================================
+// Backwards-compatibility shims: namespace edt {} wrappers matching the
+// legacy/edt.hpp signatures. Thin overloads that forward to the ND graph-first
+// path; caller owns the returned float* (allocated with new[]). For new code
+// prefer the explicit build_graph() + edtsq_graph() API exposed from Python.
+//=============================================================================
+
+namespace edt {
+
+template <typename T>
+inline float* edt(
+    T* labels,
+    const int sx,
+    const float wx,
+    const bool black_border = false
+) {
+    const size_t shape[1]    = { static_cast<size_t>(sx) };
+    const float  anisotropy[1] = { wx };
+    float* out = new float[sx]();
+    nd::edtsq_from_labels_fused<T>(labels, out, shape, anisotropy, 1, black_border, 1);
+    for (int i = 0; i < sx; i++) out[i] = std::sqrt(out[i]);
+    return out;
+}
+
+template <typename T>
+inline float* edt(
+    T* labels,
+    const int sx, const int sy,
+    const float wx, const float wy,
+    const bool black_border = false,
+    const int parallel = 1,
+    float* output = nullptr
+) {
+    const size_t total       = static_cast<size_t>(sx) * static_cast<size_t>(sy);
+    const size_t shape[2]    = { static_cast<size_t>(sx), static_cast<size_t>(sy) };
+    const float  anisotropy[2] = { wx, wy };
+    if (output == nullptr) output = new float[total]();
+    nd::edtsq_from_labels_fused<T>(labels, output, shape, anisotropy, 2, black_border, parallel);
+    for (size_t i = 0; i < total; i++) output[i] = std::sqrt(output[i]);
+    return output;
+}
+
+template <typename T>
+inline float* edt(
+    T* labels,
+    const int sx, const int sy, const int sz,
+    const float wx, const float wy, const float wz,
+    const bool black_border = false,
+    const int parallel = 1,
+    float* output = nullptr
+) {
+    const size_t total       = static_cast<size_t>(sx) * static_cast<size_t>(sy) * static_cast<size_t>(sz);
+    const size_t shape[3]    = { static_cast<size_t>(sx), static_cast<size_t>(sy), static_cast<size_t>(sz) };
+    const float  anisotropy[3] = { wx, wy, wz };
+    if (output == nullptr) output = new float[total]();
+    nd::edtsq_from_labels_fused<T>(labels, output, shape, anisotropy, 3, black_border, parallel);
+    for (size_t i = 0; i < total; i++) output[i] = std::sqrt(output[i]);
+    return output;
+}
+
+} // namespace edt
+
 #endif // EDT_HPP
