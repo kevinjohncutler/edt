@@ -658,7 +658,7 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
 
 
 def expand_labels(data, p=2.0, anisotropy=None, black_border=False,
-                  int parallel=1, return_features=False):
+                  int parallel=0, return_features=False):
     """Expand nonzero labels to zeros by nearest-neighbor in Lp metric (ND).
 
     Parameters
@@ -781,7 +781,7 @@ def expand_labels(data, p=2.0, anisotropy=None, black_border=False,
 
 
 def feature_transform(data, p=2.0, anisotropy=None, black_border=False,
-                      int parallel=1, return_distances=False):
+                      int parallel=0, return_distances=False):
     """ND feature transform (nearest seed) with optional Lp distances.
 
     Parameters

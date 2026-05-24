@@ -25,8 +25,8 @@ Original ThreadPool: Copyright (c) 2012 Jakob Progsch, Václav Zeman (zlib licen
 Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 */
 
-#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
+#ifndef EDT_THREADPOOL_H
+#define EDT_THREADPOOL_H
 
 #include <atomic>
 #include <chrono>
@@ -54,6 +54,8 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 // idle path. ~10 ns/pause on Apple Silicon, ~30 ns on x86_64 —
 // long enough to cover tight back-to-back fork-join cycles, short
 // enough that an idle pool quickly hands off to the OS scheduler.
+// Swept {4096, 8192, 16384} on AMD + Intel (2026-05-23); all within
+// ~5 %% of optimal, default stays.
 #ifndef FORKJOIN_SPIN_PAUSES
 #define FORKJOIN_SPIN_PAUSES 8192
 #endif
@@ -62,18 +64,24 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 // macOS-only: sleep granularity once the spin window expires. 5 ms
 // keeps idle 19-worker pools at < 1 %% total CPU. nanosleep below
 // ~500 µs degrades into a kernel busy-wait on macOS, so 5 ms is the
-// practical floor.
+// practical floor. Swept {500, 1000, 5000, 10000} (2026-05-23); macOS
+// clamps sleeps below the ~10 ms scheduler tick to the same wake-up
+// latency, so 1000 and 5000 are equivalent.
 #ifndef FORKJOIN_SLEEP_US
 #define FORKJOIN_SLEEP_US 5000
 #endif
 #else
 // Linux/Windows: yield is cheap, so we use the pre-patch interspersed
 // spin + yield loop (unbounded, exits as soon as sense flips).
-// FORKJOIN_INNER_SPIN sets pauses-per-yield in that loop.
+// FORKJOIN_INNER_SPIN sets pauses-per-yield in that loop. Swept
+// {256, 1024, 4096} on AMD + Intel (2026-05-23); all within ~5 %% of
+// each other on real and synthetic 2D/3D workloads, default stays.
 #ifndef FORKJOIN_INNER_SPIN
 #define FORKJOIN_INNER_SPIN 1024
 #endif
 #endif
+
+namespace edt {
 
 class ForkJoinPool {
 public:
@@ -193,4 +201,6 @@ private:
     std::vector<std::thread> workers_;
 };
 
-#endif // THREAD_POOL_H
+}  // namespace edt
+
+#endif // EDT_THREADPOOL_H

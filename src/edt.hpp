@@ -50,13 +50,13 @@ inline void set_tuning(size_t chunks_per_thread) {
 }
 
 // Shared fork-join pool keyed by thread count; created lazily on first use
-inline ForkJoinPool& shared_pool_for(size_t threads) {
+inline edt::ForkJoinPool& shared_pool_for(size_t threads) {
     static std::mutex mutex;
-    static std::unordered_map<size_t, std::unique_ptr<ForkJoinPool>> pools;
+    static std::unordered_map<size_t, std::unique_ptr<edt::ForkJoinPool>> pools;
     std::lock_guard<std::mutex> lock(mutex);
     auto& entry = pools[threads];
     if (!entry) {
-        entry = std::make_unique<ForkJoinPool>(threads);
+        entry = std::make_unique<edt::ForkJoinPool>(threads);
     }
     return *entry;
 }
@@ -120,7 +120,7 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
     const size_t n_chunks = std::min(max_chunks, total);
     const size_t chunk_sz = (total + n_chunks - 1) / n_chunks;
     std::atomic<size_t> next{0};
-    ForkJoinPool& pool = shared_pool_for(threads);
+    edt::ForkJoinPool& pool = shared_pool_for(threads);
     pool.parallel([&]() {
         size_t idx;
         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
