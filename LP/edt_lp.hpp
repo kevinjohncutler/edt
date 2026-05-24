@@ -105,8 +105,14 @@ struct ActivePoolGuard {
 
 // Per-pass thread cap. Limits threads based on work in a single EDT axis pass.
 // This is a C++-level inner cap; the caller-supplied `desired` is already
-// capped at the Python level by _adaptive_thread_limit_nd, and at the
-// ncolor-cpp_proto layer by per-host calibration in smt_threads.json.
+// capped at the Python level, and at the calibration layer by per-host
+// kernel-saturation probes (see probe_cache).
+//
+// Thresholds (60000 / 120000 / 400000 voxels per pass) come from a sweep on
+// AMD Threadripper PRO 3995WX (128c Zen 3) and Apple M-series; below each
+// break-point, additional threads stop reducing wall time because cache
+// thrash + dispatch overhead exceed the parallelizable work. The caps are
+// conservative on Intel and on smaller core counts. Mirrored from src/edt.hpp.
 inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len) {
     if (desired <= 1 || total_lines <= 1) return 1;
 
@@ -2124,6 +2130,9 @@ inline void expand_labels_fused(
     //   (1) small-workload cap (dispatch overhead dominates)
     //   (2) kernel-saturation cap (empirical probe, runtime (p, ndim) lookup)
     // Both target the active pool used by dispatch_parallel.
+    //
+    // The 60000 / 120000 / 400000 thresholds match compute_threads() above;
+    // see the comment there for sweep provenance (TR PRO 3995WX + M-series).
     size_t pool_size = (parallel > 0) ? (size_t)parallel : 1;
     if (!tls_probe_active) {
         if      (total <= 60000)   pool_size = std::min<size_t>(pool_size, 4);

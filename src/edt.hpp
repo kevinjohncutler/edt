@@ -71,6 +71,15 @@ inline edt::ForkJoinPool& shared_pool_for(size_t threads) {
 // Per-pass thread cap: further limits threads based on work in a single EDT axis pass.
 // This is a C++-level inner cap applied per axis pass; the caller-supplied `desired`
 // is already capped at the Python level by _adaptive_thread_limit_nd.
+//
+// Thresholds (60000 / 120000 / 400000 voxels per pass) come from a sweep on
+// AMD Threadripper PRO 3995WX (128c Zen 3) and Apple M-series, measuring
+// per-pass wall time vs thread count for shapes from 96² up to 384³. Below
+// these break-points, adding more threads stops improving wall time (cache
+// thrash + dispatch overhead > parallelizable work). The caps roughly match
+// 1, 1.5, and 4 KB of work per worker assuming float per-element. See
+// PERF_PATCHED_VS_BASELINE_threadripper.md for the full bench data;
+// they are conservative on Intel and on smaller core counts.
 inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len) {
     if (desired <= 1 || total_lines <= 1) return 1;
 
