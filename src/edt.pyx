@@ -35,7 +35,6 @@ ND connectivity graph EDT: Kevin Cutler, February 2026
 """
 
 from libc.stdint cimport uint8_t, uint16_t, uint32_t, uint64_t
-from libc.stdlib cimport malloc, free
 from libcpp cimport bool as native_bool
 cimport numpy as np
 np.import_array()
@@ -349,14 +348,11 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
             'parallel_used': parallel,
         }
 
-    cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
-    cdef float* canis = <float*> malloc(nd * sizeof(float))
-    if cshape == NULL or canis == NULL:
-        if cshape != NULL:
-            free(cshape)
-        if canis != NULL:
-            free(canis)
-        raise MemoryError('Allocation failure')
+    # numpy-backed scratch arrays (automatic memory management; freed when out of scope)
+    cdef np.ndarray cshape_arr = np.empty(nd, dtype=np.uintp)
+    cdef np.ndarray canis_arr = np.empty(nd, dtype=np.float32)
+    cdef size_t* cshape = <size_t*> np.PyArray_DATA(cshape_arr)
+    cdef float* canis = <float*> np.PyArray_DATA(canis_arr)
 
     cdef int i
     for i in range(nd):
@@ -382,26 +378,22 @@ def edtsq(labels=None, anisotropy=None, black_border=False, parallel=0, voxel_gr
     cdef uint32_t* labelsp32
     cdef uint64_t* labelsp64
 
-    try:
-        if dtype_code == 0:
-            labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
-            with nogil:
-                edtsq_from_labels_fused[uint8_t](labelsp8, outp, cshape, canis, nd, bb, par)
-        elif dtype_code == 1:
-            labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
-            with nogil:
-                edtsq_from_labels_fused[uint16_t](labelsp16, outp, cshape, canis, nd, bb, par)
-        elif dtype_code == 2:
-            labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
-            with nogil:
-                edtsq_from_labels_fused[uint32_t](labelsp32, outp, cshape, canis, nd, bb, par)
-        else:  # uint64
-            labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
-            with nogil:
-                edtsq_from_labels_fused[uint64_t](labelsp64, outp, cshape, canis, nd, bb, par)
-    finally:
-        free(cshape)
-        free(canis)
+    if dtype_code == 0:
+        labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+        with nogil:
+            edtsq_from_labels_fused[uint8_t](labelsp8, outp, cshape, canis, nd, bb, par)
+    elif dtype_code == 1:
+        labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+        with nogil:
+            edtsq_from_labels_fused[uint16_t](labelsp16, outp, cshape, canis, nd, bb, par)
+    elif dtype_code == 2:
+        labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+        with nogil:
+            edtsq_from_labels_fused[uint32_t](labelsp32, outp, cshape, canis, nd, bb, par)
+    else:  # uint64
+        labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+        with nogil:
+            edtsq_from_labels_fused[uint64_t](labelsp64, outp, cshape, canis, nd, bb, par)
 
     if is_fortran:
         return output.T
@@ -474,14 +466,10 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
             'parallel_used': parallel,
         }
 
-    cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
-    cdef float* canis = <float*> malloc(nd * sizeof(float))
-    if cshape == NULL or canis == NULL:
-        if cshape != NULL:
-            free(cshape)
-        if canis != NULL:
-            free(canis)
-        raise MemoryError('Allocation failure')
+    cdef np.ndarray cshape_arr = np.empty(nd, dtype=np.uintp)
+    cdef np.ndarray canis_arr = np.empty(nd, dtype=np.float32)
+    cdef size_t* cshape = <size_t*> np.PyArray_DATA(cshape_arr)
+    cdef float* canis = <float*> np.PyArray_DATA(canis_arr)
 
     cdef int i
     for i in range(nd):
@@ -497,22 +485,18 @@ def edtsq_graph(graph, anisotropy=None, black_border=False, parallel=0):
     # Get graph pointer before nogil (dispatch based on dtype)
     cdef void* graphp = np.PyArray_DATA(graph)
 
-    try:
-        if nd <= 4:
-            with nogil:
-                edtsq_from_graph[uint8_t](<uint8_t*>graphp, outp, cshape, canis, nd, bb, par)
-        elif nd <= 8:
-            with nogil:
-                edtsq_from_graph[uint16_t](<uint16_t*>graphp, outp, cshape, canis, nd, bb, par)
-        elif nd <= 16:
-            with nogil:
-                edtsq_from_graph[uint32_t](<uint32_t*>graphp, outp, cshape, canis, nd, bb, par)
-        else:
-            with nogil:
-                edtsq_from_graph[uint64_t](<uint64_t*>graphp, outp, cshape, canis, nd, bb, par)
-    finally:
-        free(cshape)
-        free(canis)
+    if nd <= 4:
+        with nogil:
+            edtsq_from_graph[uint8_t](<uint8_t*>graphp, outp, cshape, canis, nd, bb, par)
+    elif nd <= 8:
+        with nogil:
+            edtsq_from_graph[uint16_t](<uint16_t*>graphp, outp, cshape, canis, nd, bb, par)
+    elif nd <= 16:
+        with nogil:
+            edtsq_from_graph[uint32_t](<uint32_t*>graphp, outp, cshape, canis, nd, bb, par)
+    else:
+        with nogil:
+            edtsq_from_graph[uint64_t](<uint64_t*>graphp, outp, cshape, canis, nd, bb, par)
 
     return output
 
@@ -560,9 +544,8 @@ def build_graph(labels, parallel=0):
 
     graph_dtype = _graph_dtype(nd)
 
-    cdef size_t* cshape = <size_t*> malloc(nd * sizeof(size_t))
-    if cshape == NULL:
-        raise MemoryError('Allocation failure')
+    cdef np.ndarray cshape_arr = np.empty(nd, dtype=np.uintp)
+    cdef size_t* cshape = <size_t*> np.PyArray_DATA(cshape_arr)
 
     cdef int i
     for i in range(nd):
@@ -589,81 +572,78 @@ def build_graph(labels, parallel=0):
     cdef uint32_t* graphp32
     cdef uint64_t* graphp64
 
-    try:
-        if nd <= 4:
-            graphp8 = <uint8_t*> np.PyArray_DATA(graph)
-            if dtype_code == 0:
-                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint8_t, uint8_t](labelsp8, graphp8, cshape, nd, par)
-            elif dtype_code == 1:
-                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint16_t, uint8_t](labelsp16, graphp8, cshape, nd, par)
-            elif dtype_code == 2:
-                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint32_t, uint8_t](labelsp32, graphp8, cshape, nd, par)
-            else:
-                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint64_t, uint8_t](labelsp64, graphp8, cshape, nd, par)
-        elif nd <= 8:
-            graphp16 = <uint16_t*> np.PyArray_DATA(graph)
-            if dtype_code == 0:
-                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint8_t, uint16_t](labelsp8, graphp16, cshape, nd, par)
-            elif dtype_code == 1:
-                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint16_t, uint16_t](labelsp16, graphp16, cshape, nd, par)
-            elif dtype_code == 2:
-                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint32_t, uint16_t](labelsp32, graphp16, cshape, nd, par)
-            else:
-                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint64_t, uint16_t](labelsp64, graphp16, cshape, nd, par)
-        elif nd <= 16:
-            graphp32 = <uint32_t*> np.PyArray_DATA(graph)
-            if dtype_code == 0:
-                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint8_t, uint32_t](labelsp8, graphp32, cshape, nd, par)
-            elif dtype_code == 1:
-                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint16_t, uint32_t](labelsp16, graphp32, cshape, nd, par)
-            elif dtype_code == 2:
-                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint32_t, uint32_t](labelsp32, graphp32, cshape, nd, par)
-            else:
-                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint64_t, uint32_t](labelsp64, graphp32, cshape, nd, par)
+    if nd <= 4:
+        graphp8 = <uint8_t*> np.PyArray_DATA(graph)
+        if dtype_code == 0:
+            labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint8_t, uint8_t](labelsp8, graphp8, cshape, nd, par)
+        elif dtype_code == 1:
+            labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint16_t, uint8_t](labelsp16, graphp8, cshape, nd, par)
+        elif dtype_code == 2:
+            labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint32_t, uint8_t](labelsp32, graphp8, cshape, nd, par)
         else:
-            graphp64 = <uint64_t*> np.PyArray_DATA(graph)
-            if dtype_code == 0:
-                labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint8_t, uint64_t](labelsp8, graphp64, cshape, nd, par)
-            elif dtype_code == 1:
-                labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint16_t, uint64_t](labelsp16, graphp64, cshape, nd, par)
-            elif dtype_code == 2:
-                labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint32_t, uint64_t](labelsp32, graphp64, cshape, nd, par)
-            else:
-                labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
-                with nogil:
-                    build_connectivity_graph[uint64_t, uint64_t](labelsp64, graphp64, cshape, nd, par)
-    finally:
-        free(cshape)
+            labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint64_t, uint8_t](labelsp64, graphp8, cshape, nd, par)
+    elif nd <= 8:
+        graphp16 = <uint16_t*> np.PyArray_DATA(graph)
+        if dtype_code == 0:
+            labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint8_t, uint16_t](labelsp8, graphp16, cshape, nd, par)
+        elif dtype_code == 1:
+            labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint16_t, uint16_t](labelsp16, graphp16, cshape, nd, par)
+        elif dtype_code == 2:
+            labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint32_t, uint16_t](labelsp32, graphp16, cshape, nd, par)
+        else:
+            labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint64_t, uint16_t](labelsp64, graphp16, cshape, nd, par)
+    elif nd <= 16:
+        graphp32 = <uint32_t*> np.PyArray_DATA(graph)
+        if dtype_code == 0:
+            labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint8_t, uint32_t](labelsp8, graphp32, cshape, nd, par)
+        elif dtype_code == 1:
+            labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint16_t, uint32_t](labelsp16, graphp32, cshape, nd, par)
+        elif dtype_code == 2:
+            labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint32_t, uint32_t](labelsp32, graphp32, cshape, nd, par)
+        else:
+            labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint64_t, uint32_t](labelsp64, graphp32, cshape, nd, par)
+    else:
+        graphp64 = <uint64_t*> np.PyArray_DATA(graph)
+        if dtype_code == 0:
+            labelsp8 = <uint8_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint8_t, uint64_t](labelsp8, graphp64, cshape, nd, par)
+        elif dtype_code == 1:
+            labelsp16 = <uint16_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint16_t, uint64_t](labelsp16, graphp64, cshape, nd, par)
+        elif dtype_code == 2:
+            labelsp32 = <uint32_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint32_t, uint64_t](labelsp32, graphp64, cshape, nd, par)
+        else:
+            labelsp64 = <uint64_t*> np.PyArray_DATA(labels)
+            with nogil:
+                build_connectivity_graph[uint64_t, uint64_t](labelsp64, graphp64, cshape, nd, par)
 
     return graph
 
@@ -775,12 +755,10 @@ def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, ret
 
     bb = black_border
 
-    cshape = <size_t*> malloc(nd * sizeof(size_t))
-    canis = <float*> malloc(nd * sizeof(float))
-    if cshape == NULL or canis == NULL:
-        if cshape != NULL: free(cshape)
-        if canis != NULL: free(canis)
-        raise MemoryError('Allocation failure')
+    cshape_arr = np.empty(nd, dtype=np.uintp)
+    canis_arr = np.empty(nd, dtype=np.float32)
+    cshape = <size_t*> np.PyArray_DATA(cshape_arr)
+    canis = <float*> np.PyArray_DATA(canis_arr)
 
     total = 1
     for i in range(nd):
@@ -792,30 +770,26 @@ def expand_labels(data, anisotropy=None, black_border=False, int parallel=1, ret
     lout_p = <uint32_t*> np.PyArray_DATA(labels_out)
     data_p = <const uint32_t*> np.PyArray_DATA(arr)
 
-    try:
-        if return_features:
-            use_u32_feat = (total < (<size_t>1 << 32))
-            if use_u32_feat:
-                feat_u32 = np.empty((total,), dtype=np.uint32)
-                feat_u32_p = <uint32_t*> np.PyArray_DATA(feat_u32)
-                with nogil:
-                    expand_labels_features_fused[uint32_t, uint32_t](
-                        data_p, lout_p, feat_u32_p,
-                        cshape, canis, <size_t>nd, bb, parallel)
-            else:
-                feat_sz = np.empty((total,), dtype=np.uintp)
-                feat_sz_p = <size_t*> np.PyArray_DATA(feat_sz)
-                with nogil:
-                    expand_labels_features_fused[uint32_t, size_t](
-                        data_p, lout_p, feat_sz_p,
-                        cshape, canis, <size_t>nd, bb, parallel)
-        else:
+    if return_features:
+        use_u32_feat = (total < (<size_t>1 << 32))
+        if use_u32_feat:
+            feat_u32 = np.empty((total,), dtype=np.uint32)
+            feat_u32_p = <uint32_t*> np.PyArray_DATA(feat_u32)
             with nogil:
-                expand_labels_fused[uint32_t](
-                    data_p, lout_p, cshape, canis, <size_t>nd, bb, parallel)
-    finally:
-        free(cshape)
-        free(canis)
+                expand_labels_features_fused[uint32_t, uint32_t](
+                    data_p, lout_p, feat_u32_p,
+                    cshape, canis, <size_t>nd, bb, parallel)
+        else:
+            feat_sz = np.empty((total,), dtype=np.uintp)
+            feat_sz_p = <size_t*> np.PyArray_DATA(feat_sz)
+            with nogil:
+                expand_labels_features_fused[uint32_t, size_t](
+                    data_p, lout_p, feat_sz_p,
+                    cshape, canis, <size_t>nd, bb, parallel)
+    else:
+        with nogil:
+            expand_labels_fused[uint32_t](
+                data_p, lout_p, cshape, canis, <size_t>nd, bb, parallel)
 
     if return_features:
         if is_fortran:
