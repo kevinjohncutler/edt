@@ -107,21 +107,35 @@ Note: Bit 0 is reserved for the foreground marker, so 4D is the maximum for uint
 
 ## Memory Usage
 
-Let N = number of voxels. The graph-first architecture minimizes memory by:
+Let N = number of voxels. The graph-first architecture minimizes peak
+working-set memory when the caller can release the labels array before
+the EDT runs.
 
-1. Preserving input dtype (no forced uint32 conversion)
-2. When building from labels: graph is allocated in C++ and freed before return
-3. Output is float32 (4N bytes)
+- Graph: 1N bytes (uint8) for 2D-4D, 2N bytes (uint16) for 5D+.
+- Output: 4N bytes (float32).
+- When building from labels: graph is allocated inside C++ and freed
+  before the call returns; only the output remains.
 
-Graph size: 1N bytes (uint8) for 2D-4D, 2N bytes (uint16) for 5D+.
+| Input label dtype | Graph-first minimum peak | Label-segment peak |
+|---|---|---|
+| uint8  | 5N (1N graph + 4N output) | 5N (1N labels + 4N output) |
+| uint16 | 5N | 6N |
+| uint32 | 5N | 8N |
 
-**Peak memory during `edtsq()` (2D-4D)**: ~5N bytes (4N output + 1N graph)
+**Caveat (`edtsq(labels)` fused path)**: the Python labels array remains
+held by the caller for the duration of the call, so the actual peak is
+the labels-array size plus the graph (1-2N) plus the output (4N) -- i.e.
+roughly (K + 5)N where K = label dtype bytes. To realize the minimum
+peak above, use the explicit two-step pattern:
 
-| Input label dtype | Graph-first | Label-segment | Savings |
-|-------------|-------------|---------------|---------|
-| uint8  | 5N | 5N | 0.0% |
-| uint16 | 5N | 6N | 16.7% |
-| uint32 | 5N | 8N | 37.5% |
+```python
+graph = edt.build_graph(labels, parallel=...)
+del labels  # release before EDT
+dist = edt.edtsq_graph(graph, parallel=...)
+```
+
+The label-segment approach does not benefit from this pattern because
+its algorithm requires the labels array throughout.
 
 ### Voxel Graph Input
 
