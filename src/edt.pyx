@@ -136,6 +136,8 @@ def _resolve_parallel(parallel):
 cdef extern from "edt.hpp" namespace "nd":
     # Tuning
     cdef void _nd_set_tuning "nd::set_tuning"(size_t chunks_per_thread) nogil
+    # Release per-thread expand_labels workspace buffers (calling thread only)
+    cdef void _nd_clear_expand_cache "nd::clear_expand_cache"() nogil
 
     # EDT from voxel graph
     cdef void edtsq_from_graph[GRAPH_T](
@@ -202,6 +204,25 @@ def set_tuning(chunks_per_thread=1):
         Default 1 (matches ND_CHUNKS_PER_THREAD C++ default of 4 set at module init).
     """
     _nd_set_tuning(chunks_per_thread)
+
+
+def clear_expand_cache():
+    """Release the calling thread's expand_labels workspace buffers.
+
+    ``expand_labels`` keeps a thread-local cache of intermediate buffers
+    (sized to the largest array seen) so repeated calls avoid the
+    malloc/page-fault cost of fresh allocations. The cache is released
+    automatically when the thread exits.
+
+    Call this function from the main thread to free those buffers
+    immediately -- useful in long-running processes that have finished
+    a batch of expand_labels work and want to return the memory.
+
+    Note: only clears the calling thread's cache. Worker threads in
+    the internal fork-join pool keep their own caches (small overhead)
+    until process exit.
+    """
+    _nd_clear_expand_cache()
 
 
 def _voxel_graph_to_nd(voxel_graph, labels=None):

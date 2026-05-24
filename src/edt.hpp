@@ -98,9 +98,14 @@ inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_le
     return std::max<size_t>(1, threads);
 }
 
-// Static buffer cache for expand_labels -- avoids repeated allocation/page-fault
-// overhead on repeated calls (like ncolor's module-level np.empty() globals).
-// Each slot independently tracks its allocation size and reuses if sufficient.
+// Per-thread buffer cache for expand_labels -- avoids repeated allocation /
+// page-fault overhead on repeated calls (like ncolor's module-level
+// np.empty() globals). Each slot independently tracks its allocation size
+// and reuses if sufficient. Stored thread_local so two Python threads
+// calling expand_labels concurrently each see their own cache; the cache
+// is naturally freed when the thread exits (process exit for the main
+// thread). For expert users who want to release the buffers earlier,
+// expand_cache().clear() is exposed from Python as edt.clear_expand_cache().
 struct ExpandBufCache {
     static constexpr int N_SLOTS = 8;
     void* bufs[N_SLOTS] = {};
@@ -113,14 +118,26 @@ struct ExpandBufCache {
         sizes[slot] = bytes;
         return bufs[slot];
     }
+    void clear() {
+        for (int i = 0; i < N_SLOTS; i++) {
+            std::free(bufs[i]);
+            bufs[i] = nullptr;
+            sizes[i] = 0;
+        }
+    }
     ~ExpandBufCache() {
-        for (int i = 0; i < N_SLOTS; i++) std::free(bufs[i]);
+        clear();
     }
 };
 
 inline ExpandBufCache& expand_cache() {
-    static ExpandBufCache cache;
+    thread_local ExpandBufCache cache;
     return cache;
+}
+
+// Public hook so Python can free the calling thread's cache on demand.
+inline void clear_expand_cache() {
+    expand_cache().clear();
 }
 
 // Distribute [0, total) into up to max_chunks chunks across threads.

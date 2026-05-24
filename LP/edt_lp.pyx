@@ -140,6 +140,8 @@ def _resolve_parallel(parallel):
 cdef extern from "edt_lp.hpp" namespace "lp":
     # Tuning
     cdef void _lp_set_tuning "lp::set_tuning"(size_t chunks_per_thread) nogil
+    # Release per-thread expand_labels workspace buffers (calling thread only)
+    cdef void _lp_clear_expand_cache "lp::clear_expand_cache"() nogil
 
     # EDT from voxel graph
     cdef void edtp_from_graph[GRAPH_T](
@@ -202,6 +204,14 @@ cdef extern from "edt_lp.hpp" namespace "lp":
 def set_tuning(chunks_per_thread=1):
     """Set tuning parameters for ND EDT."""
     _lp_set_tuning(chunks_per_thread)
+
+
+def clear_expand_cache():
+    """Release the calling thread's expand_labels workspace buffers.
+
+    Mirrors edt.clear_expand_cache(). See its docstring for details.
+    """
+    _lp_clear_expand_cache()
 
 
 def _voxel_graph_to_nd(voxel_graph, labels=None):
