@@ -79,7 +79,9 @@ extensions = [
 ]
 
 setuptools.setup(
-  setup_requires=['cython', 'setuptools_scm'],
+  # Build deps live in pyproject.toml [build-system].requires (modern
+  # isolated builds). The legacy setup_requires path was triggering
+  # broken egg-fetch of setuptools_scm 10.x on Python 3.13.
   python_requires=">=3.8,<4",
   use_scm_version=True,
   ext_modules=extensions,
