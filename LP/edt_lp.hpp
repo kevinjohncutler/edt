@@ -112,11 +112,11 @@ struct ActivePoolGuard {
 // capped at the Python level, and at the calibration layer by per-host
 // kernel-saturation probes (see probe_cache).
 //
-// Thresholds (60000 / 120000 / 400000 voxels per pass) come from a sweep on
-// AMD Threadripper PRO 3995WX (128c Zen 3) and Apple M-series; below each
-// break-point, additional threads stop reducing wall time because cache
-// thrash + dispatch overhead exceed the parallelizable work. The caps are
-// conservative on Intel and on smaller core counts. Mirrored from src/edt.hpp.
+// The 60000 / 120000 / 400000 voxel break-points come from per-pass wall-time
+// sweeps on three hosts: AMD Threadripper PRO 3995WX (128c Zen 3), Intel Core
+// i9-9900K (8c/16t Coffee Lake), and Apple M1 Ultra. Below each threshold,
+// cache thrash and dispatch overhead exceed the parallelizable work, so adding
+// threads stops helping. Conservative on smaller core counts.
 inline size_t compute_threads(size_t desired, size_t total_lines, size_t axis_len) {
     if (desired <= 1 || total_lines <= 1) return 1;
 
@@ -2150,7 +2150,7 @@ inline void expand_labels_fused(
     // Both target the active pool used by dispatch_parallel.
     //
     // The 60000 / 120000 / 400000 thresholds match compute_threads() above;
-    // see the comment there for sweep provenance (TR PRO 3995WX + M-series).
+    // see the comment there for sweep provenance.
     size_t pool_size = (parallel > 0) ? (size_t)parallel : 1;
     if (!tls_probe_active) {
         if      (total <= 60000)   pool_size = std::min<size_t>(pool_size, 4);
