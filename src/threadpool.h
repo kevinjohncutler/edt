@@ -99,7 +99,7 @@ inline void wake_all(int* addr) {
     ::syscall(SYS_futex, reinterpret_cast<int*>(addr),
               FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
 #elif defined(_WIN32)
-    WakeByAddressAll(reinterpret_cast<volatile void*>(addr));
+    WakeByAddressAll(reinterpret_cast<void*>(addr));
 #endif
 }
 
