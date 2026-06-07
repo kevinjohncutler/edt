@@ -65,8 +65,9 @@ inline void set_tuning(size_t chunks_per_thread) {
 // (b) the unique_ptrs live in the static map for the whole process,
 //     so the underlying ForkJoinPool object is never destroyed while
 //     callers hold a reference.
-// The ForkJoinPool itself is internally thread-safe (designed for
-// concurrent parallel() calls from multiple users of the same pool).
+// The ForkJoinPool serializes concurrent parallel() calls from multiple
+// driver threads via an internal per-pool mutex (see ForkJoinPool::parallel),
+// so sharing one pool across Python threads is safe.
 inline edt::ForkJoinPool& shared_pool_for(size_t threads) {
     static std::mutex pool_mu;
     static std::unordered_map<size_t, std::unique_ptr<edt::ForkJoinPool>> pools;

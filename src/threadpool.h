@@ -32,6 +32,7 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -157,6 +158,15 @@ public:
             fn();
             return;
         }
+        // Serialize driver threads. The shared work_fn_ slot and the
+        // centralized barrier (sized to exactly num_participants_) tolerate
+        // only ONE thread driving a fork-join cycle at a time. This pool is a
+        // process-global singleton keyed by thread count, so two Python
+        // threads running a parallel op (edtsq / expand_labels) concurrently
+        // would otherwise race on work_fn_ and corrupt the barrier count ->
+        // SIGSEGV. Within-call parallelism (the workers running fn) is
+        // unaffected; only cross-thread overlap of parallel() is serialized.
+        std::lock_guard<std::mutex> drive(driver_mu_);
         work_fn_ = std::forward<F>(fn);
         barrier_wait_();   // release workers (they're waiting at start barrier)
         work_fn_();        // main thread participates
@@ -240,6 +250,10 @@ private:
 
     // Current work function (set by parallel(), read by workers)
     std::function<void()> work_fn_;
+
+    // Serializes external driver threads (see parallel()). One mutex per pool,
+    // so pools of different thread counts never contend with each other.
+    std::mutex driver_mu_;
 
     std::vector<std::thread> workers_;
 };
