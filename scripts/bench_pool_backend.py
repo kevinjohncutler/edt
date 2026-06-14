@@ -13,9 +13,16 @@ the threading model's contribution, with the algorithm held constant -- unlike
 ``edt`` vs ``edt_legacy``, which also changes the algorithm.
 
 Backend is chosen once per process (static init from the env var), so each
-backend runs in its own subprocess. Run with no args to drive all backends:
+backend runs in its own subprocess.
 
+The alternate backends are gated out of production builds, so first rebuild the
+extension with them enabled, then run:
+
+    EDT_BENCH_BACKENDS=1 python setup.py build_ext --inplace
     python scripts/bench_pool_backend.py
+
+If the extension was NOT built with EDT_BENCH_BACKENDS=1, EDT_POOL_BACKEND is
+ignored (every backend silently runs forkjoin) and the script warns.
 """
 import json
 import os
@@ -126,6 +133,20 @@ def drive():
             burst[(int(t), backend)] = secs
 
     cpu = os.cpu_count() or 4
+
+    # Guard: if the extension lacks the bench backends, EDT_POOL_BACKEND is a
+    # no-op and "serial" actually ran forkjoin -- so serial ~ forkjoin even on a
+    # large array at max threads (where true serial would be many-fold slower).
+    label0, tmax = CASES[0][0], thread_counts()[-1]
+    fj0 = results.get((label0, tmax, "forkjoin"))
+    se0 = results.get((label0, tmax, "serial"))
+    if fj0 and se0 and se0 < 1.5 * fj0:
+        print("WARNING: 'serial' is not slower than 'forkjoin' at "
+              f"{tmax} threads -- the extension was likely NOT built with "
+              "EDT_BENCH_BACKENDS=1, so EDT_POOL_BACKEND is a no-op and every\n"
+              "row below is really forkjoin. Rebuild:\n"
+              "  EDT_BENCH_BACKENDS=1 python setup.py build_ext --inplace\n")
+
     print(f"\n# Threading backend A/B  ({platform.system()} {platform.machine()}, "
           f"{cpu} cores)\n")
     for label, shape, _ in CASES:

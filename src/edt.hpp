@@ -31,14 +31,17 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
-#include <future>
-#include <thread>
 #include <vector>
 #include "threadpool.h"
-// The actual pre-PR pool (classic mutex+condvar queue + packaged_task), used
-// verbatim for the EDT_POOL_BACKEND=taskqueue A/B baseline so it is provably
-// identical to the old threading model. Header-only; included in this single TU.
+#ifdef EDT_ENABLE_BENCH_BACKENDS
+// Benchmark-only (the EDT_POOL_BACKEND switch): alternate worker backends for
+// the new-vs-old A/B. The taskqueue baseline includes the actual pre-PR pool
+// verbatim -- the only coupling to legacy/ -- so it is gated out of production
+// builds (enable with `EDT_BENCH_BACKENDS=1 python setup.py build_ext`).
+#include <future>
+#include <thread>
 #include "../legacy/threadpool.h"
+#endif
 
 // MSVC uses __restrict (no trailing underscores); GCC/Clang use __restrict__
 #ifdef _MSC_VER
@@ -154,7 +157,9 @@ inline void clear_expand_cache() {
     expand_cache().clear();
 }
 
-// Thread-backend selection, for A/B benchmarking the threading model.
+#ifdef EDT_ENABLE_BENCH_BACKENDS
+// Thread-backend selection, for A/B benchmarking the threading model. Gated out
+// of production builds; enable with EDT_BENCH_BACKENDS=1 at build time.
 //
 // The production path is the persistent fork-join pool (ForkJoinPool). The env
 // var EDT_POOL_BACKEND routes the SAME algorithm and SAME chunk decomposition
@@ -181,6 +186,7 @@ inline PoolBackend pool_backend() {
     }();
     return backend;
 }
+#endif  // EDT_ENABLE_BENCH_BACKENDS
 
 // Distribute [0, total) into up to max_chunks chunks across threads.
 // Calls work(begin, end) directly when threads==1; otherwise dispatches the
@@ -195,6 +201,7 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
     const size_t n_chunks = std::min(max_chunks, total);
     const size_t chunk_sz = (total + n_chunks - 1) / n_chunks;
 
+#ifdef EDT_ENABLE_BENCH_BACKENDS
     const PoolBackend backend = pool_backend();
 
     if (backend == PoolBackend::Serial) {
@@ -221,6 +228,7 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
         pool.join();
         return;
     }
+#endif  // EDT_ENABLE_BENCH_BACKENDS
 
     std::atomic<size_t> next{0};
     auto steal = [&]() {
@@ -232,6 +240,7 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
         }
     };
 
+#ifdef EDT_ENABLE_BENCH_BACKENDS
     if (backend == PoolBackend::StdThread) {
         // No persistent pool: pay thread create/join on every dispatch.
         std::vector<std::thread> workers;
@@ -241,6 +250,7 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
         for (auto& w : workers) w.join();
         return;
     }
+#endif  // EDT_ENABLE_BENCH_BACKENDS
 
     // ForkJoin (default, production): persistent workers, no per-call spawn.
     edt::ForkJoinPool& pool = shared_pool_for(threads);

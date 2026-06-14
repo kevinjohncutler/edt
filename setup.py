@@ -54,6 +54,13 @@ extra_link_args_legacy = []
 if sys.platform != 'win32':
   extra_link_args_nd += ['-flto']
 
+# Benchmark-only: the EDT_POOL_BACKEND A/B switch (its taskqueue baseline pulls
+# in the legacy ThreadPool). Off by default so production builds of `edt` do not
+# depend on legacy/. Enable with `EDT_BENCH_BACKENDS=1 python setup.py build_ext`.
+define_macros_nd = [("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
+if os.environ.get("EDT_BENCH_BACKENDS", "").strip().lower() not in ("", "0", "false", "no", "off"):
+  define_macros_nd.append(("EDT_ENABLE_BENCH_BACKENDS", "1"))
+
 
 extensions = [
   # Main EDT module (graph-first ND v2 architecture)
@@ -64,7 +71,7 @@ extensions = [
     include_dirs=['src', str(NumpyImport())],
     extra_compile_args=extra_compile_args_nd,
     extra_link_args=extra_link_args_nd,
-    define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
+    define_macros=define_macros_nd,
   ),
   # Legacy upstream implementation (for comparison)
   setuptools.Extension(
