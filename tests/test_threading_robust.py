@@ -41,17 +41,28 @@ CPU = os.cpu_count() or 4
 # runner can never reproduce.
 THREAD_SWEEP = sorted({1, 2, 3, 5, 8, 16, CPU, 2 * CPU})
 
+# Heavy concurrent stress on large (4000^2) images is too slow/RAM-hungry for
+# 2-core CI runners. Gate it behind EDT_STRESS=1 so it runs locally / on big
+# boxes but is skipped by default (including in CI).
+stress_only = pytest.mark.skipif(
+    not os.environ.get("EDT_STRESS"),
+    reason="heavy large-image concurrent stress; set EDT_STRESS=1 to run",
+)
+
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 def make_labels(shape, n_seeds, seed=0):
-    """Random segmented labels: n_seeds small blobs over a zero background."""
+    """Random segmented labels: n_seeds *unique* single-pixel seeds -- distinct
+    positions (no two seeds collide) and distinct labels -- over a zero
+    background."""
     rng = np.random.default_rng(seed)
     a = np.zeros(shape, dtype=np.uint32)
     flat = a.reshape(-1)
-    idx = rng.integers(0, flat.size, n_seeds)
-    flat[idx] = rng.integers(1, 2000, n_seeds)
+    n = min(n_seeds, flat.size)
+    idx = rng.choice(flat.size, size=n, replace=False)      # unique positions
+    flat[idx] = rng.permutation(n).astype(np.uint32) + 1    # unique labels 1..n
     return a
 
 
@@ -265,6 +276,62 @@ def test_concurrent_mixed_thread_counts():
     assert rc is not None, "concurrent mixed-pool drivers HUNG (timed out)"
     assert rc == 0, (
         f"concurrent mixed-pool drivers crashed/errored rc={rc} "
+        f"(negative => signal, -11 == SIGSEGV)\n"
+        + err.decode(errors="replace")[-2500:]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 8. heavy: concurrent drivers on LARGE images (opt-in, EDT_STRESS=1)
+# --------------------------------------------------------------------------- #
+@stress_only
+def test_concurrent_large_images_stress():
+    """Concurrent threads each run edtsq + expand_labels on a large 4000^2
+    image with unique seeds, at *different* thread counts (different keyed
+    pools), all verified against a serial reference. This is the realistic
+    high-contention case: several heavy transforms driving the shared pools at
+    once, with real per-call work (unlike the tiny-image concurrency test).
+
+    Opt-in via EDT_STRESS=1 -- too slow / RAM-hungry for 2-core CI runners.
+    Runs in a subprocess so a segfault is a failure, not a killed session."""
+    snippet = """
+        import sys, threading
+        import numpy as np
+        import edt
+
+        def make_labels(shape, n_seeds, seed):
+            rng = np.random.default_rng(seed)
+            a = np.zeros(shape, dtype=np.uint32)
+            flat = a.reshape(-1)
+            n = min(n_seeds, flat.size)
+            idx = rng.choice(flat.size, size=n, replace=False)   # unique pos
+            flat[idx] = rng.permutation(n).astype(np.uint32) + 1 # unique labels
+            return a
+
+        a = make_labels((4000, 4000), 20000, 7)
+        ref = np.asarray(edt.edtsq(a, parallel=1))
+        errs = []
+
+        def work(par):
+            try:
+                for _ in range(5):
+                    d = np.asarray(edt.edtsq(a, parallel=par))
+                    assert np.array_equal(d, ref), f"edtsq mismatch par={par}"
+                    lbl = np.asarray(edt.expand_labels(a, parallel=par))
+                    assert lbl.shape == a.shape
+            except BaseException as e:  # noqa: BLE001
+                errs.append(repr(e))
+
+        # distinct thread counts => distinct keyed pools, driven concurrently
+        ts = [threading.Thread(target=work, args=(p,)) for p in (2, 4, 8, 16)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        sys.exit(1 if errs else 0)
+    """
+    rc, out, err = run_snippet(snippet, timeout=600)
+    assert rc is not None, "large-image concurrent stress HUNG (timed out)"
+    assert rc == 0, (
+        f"large-image concurrent stress crashed/errored rc={rc} "
         f"(negative => signal, -11 == SIGSEGV)\n"
         + err.decode(errors="replace")[-2500:]
     )

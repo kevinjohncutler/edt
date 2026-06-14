@@ -38,11 +38,13 @@ BACKENDS = ["forkjoin", "stdthread", "serial"]
 
 
 def make_labels(shape, n_seeds, seed=0):
+    # unique seeds: distinct positions (no collisions) and distinct labels
     rng = np.random.default_rng(seed)
     a = np.zeros(shape, dtype=np.uint32)
     flat = a.reshape(-1)
-    idx = rng.integers(0, flat.size, n_seeds)
-    flat[idx] = rng.integers(1, 5000, n_seeds)
+    n = min(n_seeds, flat.size)
+    idx = rng.choice(flat.size, size=n, replace=False)
+    flat[idx] = rng.permutation(n).astype(np.uint32) + 1
     return a
 
 
