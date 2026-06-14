@@ -31,9 +31,14 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <future>
 #include <thread>
 #include <vector>
 #include "threadpool.h"
+// The actual pre-PR pool (classic mutex+condvar queue + packaged_task), used
+// verbatim for the EDT_POOL_BACKEND=taskqueue A/B baseline so it is provably
+// identical to the old threading model. Header-only; included in this single TU.
+#include "../legacy/threadpool.h"
 
 // MSVC uses __restrict (no trailing underscores); GCC/Clang use __restrict__
 #ifdef _MSC_VER
@@ -156,15 +161,19 @@ inline void clear_expand_cache() {
 // through a different worker mechanism, so the pool's contribution can be
 // measured in isolation rather than conflated with algorithm changes:
 //   (unset) / "forkjoin" : persistent spinning pool, work-stealing  [default]
+//   "taskqueue"          : the actual pre-PR ThreadPool (mutex+condvar queue +
+//                          packaged_task), created+destroyed per dispatch --
+//                          identical to the old threading model
 //   "stdthread"          : spawn std::thread per dispatch, join each call
 //   "serial"             : run all chunks on the calling thread (baseline)
 // Read once into a static, so there is no per-call getenv on the hot path.
-enum class PoolBackend { ForkJoin, StdThread, Serial };
+enum class PoolBackend { ForkJoin, TaskQueue, StdThread, Serial };
 
 inline PoolBackend pool_backend() {
     static const PoolBackend backend = []() {
         const char* e = std::getenv("EDT_POOL_BACKEND");
         if (e) {
+            if (std::strcmp(e, "taskqueue") == 0) return PoolBackend::TaskQueue;
             if (std::strcmp(e, "stdthread") == 0) return PoolBackend::StdThread;
             if (std::strcmp(e, "serial") == 0)    return PoolBackend::Serial;
         }
@@ -194,6 +203,22 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
             const size_t end = std::min(total, begin + chunk_sz);
             work(begin, end);
         }
+        return;
+    }
+
+    if (backend == PoolBackend::TaskQueue) {
+        // Identical to the pre-PR threading model: the legacy mutex+condvar
+        // queue + packaged_task ThreadPool, created and torn down per dispatch,
+        // mirroring the old code's per-pass start()/join() that destroyed and
+        // recreated worker threads on every axis pass. One task per chunk;
+        // join() drains the queue, runs remaining tasks, and joins the workers.
+        ThreadPool pool(threads);
+        for (size_t idx = 0; idx < n_chunks; ++idx) {
+            const size_t begin = idx * chunk_sz;
+            const size_t end = std::min(total, begin + chunk_sz);
+            pool.enqueue([&work, begin, end]() { work(begin, end); });
+        }
+        pool.join();
         return;
     }
 

@@ -34,7 +34,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-BACKENDS = ["forkjoin", "stdthread", "serial"]
+BACKENDS = ["forkjoin", "taskqueue", "stdthread", "serial"]
 
 
 def make_labels(shape, n_seeds, seed=0):
@@ -130,31 +130,36 @@ def drive():
           f"{cpu} cores)\n")
     for label, shape, _ in CASES:
         print(f"## {label}")
-        print("| threads | forkjoin (ms) | stdthread (ms) | serial (ms) | "
-              "forkjoin vs stdthread |")
-        print("|--------:|--------------:|---------------:|------------:|"
-              ":---------------------:|")
+        print("| threads | forkjoin/new (ms) | taskqueue/old (ms) | "
+              "stdthread (ms) | serial (ms) | new vs old |")
+        print("|--------:|------------------:|-------------------:|"
+              "---------------:|------------:|:----------:|")
         for t in thread_counts():
             fj = results.get((label, t, "forkjoin"))
+            tq = results.get((label, t, "taskqueue"))
             st = results.get((label, t, "stdthread"))
             se = results.get((label, t, "serial"))
-            ratio = (f"{st / fj:.2f}x faster" if (fj and st and fj > 0) else "-")
-            row = (f"| {t} | {fj if fj is not None else '-'} | "
-                   f"{st if st is not None else '-'} | "
-                   f"{se if se is not None else '-'} | {ratio} |")
-            print(row)
+            ratio = (f"{tq / fj:.2f}x" if (fj and tq and fj > 0) else "-")
+            print(f"| {t} | {fj if fj is not None else '-'} | "
+                  f"{tq if tq is not None else '-'} | "
+                  f"{st if st is not None else '-'} | "
+                  f"{se if se is not None else '-'} | {ratio} |")
         print()
 
     burst_threads = sorted({t for (t, _b) in burst})
     if burst_threads:
         print(f"## Burst: {BURST_CALLS} x edtsq({BURST_SHAPE[0]}^2) total seconds")
-        print("| threads | forkjoin (s) | stdthread (s) | forkjoin speedup |")
-        print("|--------:|-------------:|--------------:|:----------------:|")
+        print("| threads | forkjoin/new (s) | taskqueue/old (s) | "
+              "stdthread (s) | new vs old |")
+        print("|--------:|-----------------:|------------------:|"
+              "--------------:|:----------:|")
         for t in burst_threads:
             fj = burst.get((t, "forkjoin"))
+            tq = burst.get((t, "taskqueue"))
             st = burst.get((t, "stdthread"))
-            ratio = (f"{st / fj:.1f}x" if (fj and st and fj > 0) else "-")
+            ratio = (f"{tq / fj:.1f}x" if (fj and tq and fj > 0) else "-")
             print(f"| {t} | {fj if fj is not None else '-'} | "
+                  f"{tq if tq is not None else '-'} | "
                   f"{st if st is not None else '-'} | {ratio} |")
         print()
 
