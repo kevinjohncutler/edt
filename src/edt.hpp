@@ -31,6 +31,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 #include "threadpool.h"
 
@@ -148,10 +149,34 @@ inline void clear_expand_cache() {
     expand_cache().clear();
 }
 
+// Thread-backend selection, for A/B benchmarking the threading model.
+//
+// The production path is the persistent fork-join pool (ForkJoinPool). The env
+// var EDT_POOL_BACKEND routes the SAME algorithm and SAME chunk decomposition
+// through a different worker mechanism, so the pool's contribution can be
+// measured in isolation rather than conflated with algorithm changes:
+//   (unset) / "forkjoin" : persistent spinning pool, work-stealing  [default]
+//   "stdthread"          : spawn std::thread per dispatch, join each call
+//   "serial"             : run all chunks on the calling thread (baseline)
+// Read once into a static, so there is no per-call getenv on the hot path.
+enum class PoolBackend { ForkJoin, StdThread, Serial };
+
+inline PoolBackend pool_backend() {
+    static const PoolBackend backend = []() {
+        const char* e = std::getenv("EDT_POOL_BACKEND");
+        if (e) {
+            if (std::strcmp(e, "stdthread") == 0) return PoolBackend::StdThread;
+            if (std::strcmp(e, "serial") == 0)    return PoolBackend::Serial;
+        }
+        return PoolBackend::ForkJoin;
+    }();
+    return backend;
+}
+
 // Distribute [0, total) into up to max_chunks chunks across threads.
-// Calls work(begin, end) directly when threads==1; otherwise via shared pool.
-// Uses atomic work-stealing: each thread claims chunks via fetch_add.
-// Blocks until all chunks complete.
+// Calls work(begin, end) directly when threads==1; otherwise dispatches the
+// same atomic work-stealing loop onto the selected backend. Blocks until all
+// chunks complete.
 template <typename F>
 inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F work) {
     if (threads <= 1 || total == 0) {
@@ -160,16 +185,41 @@ inline void dispatch_parallel(size_t threads, size_t total, size_t max_chunks, F
     }
     const size_t n_chunks = std::min(max_chunks, total);
     const size_t chunk_sz = (total + n_chunks - 1) / n_chunks;
+
+    const PoolBackend backend = pool_backend();
+
+    if (backend == PoolBackend::Serial) {
+        for (size_t idx = 0; idx < n_chunks; ++idx) {
+            const size_t begin = idx * chunk_sz;
+            const size_t end = std::min(total, begin + chunk_sz);
+            work(begin, end);
+        }
+        return;
+    }
+
     std::atomic<size_t> next{0};
-    edt::ForkJoinPool& pool = shared_pool_for(threads);
-    pool.parallel([&]() {
+    auto steal = [&]() {
         size_t idx;
         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
             const size_t begin = idx * chunk_sz;
             const size_t end = std::min(total, begin + chunk_sz);
             work(begin, end);
         }
-    });
+    };
+
+    if (backend == PoolBackend::StdThread) {
+        // No persistent pool: pay thread create/join on every dispatch.
+        std::vector<std::thread> workers;
+        workers.reserve(threads - 1);
+        for (size_t t = 1; t < threads; ++t) workers.emplace_back(steal);
+        steal();  // calling thread participates too
+        for (auto& w : workers) w.join();
+        return;
+    }
+
+    // ForkJoin (default, production): persistent workers, no per-call spawn.
+    edt::ForkJoinPool& pool = shared_pool_for(threads);
+    pool.parallel(steal);
 }
 
 // Precomputed per-pass iteration layout for an EDT axis pass.
