@@ -6,6 +6,10 @@ and capture detailed ND profiling data.
 Usage examples:
   ./scripts/bench_nd_profile.py --parallels 4,8,16 --output benchmarks/nd_profile_runs.csv
 """
+# PEP 563: keep PEP 604 (X | None) and PEP 585 (list[...]) annotations as lazy
+# strings so this module imports under Python 3.8/3.9 (CI runs the full matrix).
+from __future__ import annotations
+
 import argparse
 import csv
 import os
