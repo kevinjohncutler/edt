@@ -1,3 +1,7 @@
+# Lazy annotations so the PEP 585 generics in the type hints below (e.g.
+# tuple[int, ...]) import on Python 3.8, which CI still tests. Must be first.
+from __future__ import annotations
+
 import numpy as np
 
 
